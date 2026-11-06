@@ -1,0 +1,27 @@
+[package]
+name = "first"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gpui-kit = { version = "0.9", features = ["tree-sitter", "tree-sitter-rust"] }
+# gpui-kit 已经带了 gpui（发布包名为 gpui-pre，库名是 gpui），
+# 显式声明一次后，代码里可以直接写 `use gpui::...`，与 `gpui_kit::*` 是同一个 crate。
+gpui = { package = "gpui-pre", version = "0.3.11" }
+raw-window-handle = "0.6"
+# VB 脚本高亮需要 tree-sitter 的类型（语法本身由 gpui-component 提供）。
+tree-sitter = "0.26"
+# 编辑器的补全接口按 LSP 类型定义（gpui-base 已经依赖同一版本）。
+lsp-types = { version = "0.97", features = ["proposed"] }
+anyhow = "1"
+# 打开老脚本时探测编码：UTF-8 / UTF-16 / GBK。
+encoding_rs = "0.8"
+# Dock 布局的序列化（DockAreaState 实现了 Serialize/Deserialize）。
+serde_json = "1"
+
+[patch.crates-io]
+# 上游补全菜单将类型标签样式写死；本地补丁用于缩小字号并取消斜体。
+gpui-component = { path = "vendor/gpui-component" }
+
+[build-dependencies]
+embed-resource = "3.0.12"

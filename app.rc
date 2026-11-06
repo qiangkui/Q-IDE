@@ -1,0 +1,6 @@
+// Windows 资源脚本。
+//
+// gpui 的 Windows 后端在启动时用 `LoadImageW(模块句柄, MAKEINTRESOURCE(1), IMAGE_ICON, ...)`
+// 取窗口与任务栏图标，所以图标组必须是资源 id 1（下面这一行就是）。
+// 编译由 build.rs 调 embed-resource 完成；换图标只需替换 assets/app.ico。
+1 ICON "assets/app.ico"
