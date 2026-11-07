@@ -1,4 +1,4 @@
-﻿//! GPUI Kit 代码编辑器示例。
+//! GPUI Kit 代码编辑器示例。
 //!
 //! 代码按职责拆分：
 //! - [`app`]：主窗口布局与标签页状态；
@@ -20,9 +20,11 @@
 // 资源管理器的模型测试放在独立文件里：写在 explorer.rs 的 tests 子模块中会
 // 触发 rustc 的宏展开递归上限。
 mod app;
+mod assets;
 mod brackets;
 mod commands;
 mod completion;
+mod custom_theme;
 mod editor_pane;
 mod editing;
 mod encoding;
@@ -46,6 +48,12 @@ mod workspace;
 
 #[cfg(test)]
 mod editor_pane_tests;
+
+#[cfg(test)]
+mod assets_tests;
+
+#[cfg(test)]
+mod custom_theme_tests;
 
 #[cfg(test)]
 mod explorer_tests;
@@ -108,19 +116,24 @@ use gpui_kit::*;
 
 fn main() {
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(assets::Assets)
         .run(|cx| {
             // Must be called before using any GPUI Kit / Component features.
             gpui_kit::init(cx);
             app::init(cx);
 
-            // 先建立全局设置，再按设置初始化主题（默认深色）。
-            let settings = settings::SettingsStore::init(cx);
-            let mode = settings.read(cx).appearance.theme.mode();
-            theme::apply(mode, cx);
+            // 先建立全局设置与自定义主题库，并用布局文件里记住的主题开窗，
+            // 这样窗口外框的第一帧就是上次的主题底色（自定义主题也包括在内）。
+            settings::SettingsStore::init(cx);
+            custom_theme::ThemeStore::init(cx);
+            let layout = layout::Layout::load();
+            settings::SettingsStore::update(cx, |settings| {
+                settings.appearance.theme = settings::ThemeChoice::from_str(&layout.theme);
+            });
+            theme::apply_from_settings(cx);
 
             // 上次关闭时的窗口位置与大小；没有记录或数据不合理时用默认值。
-            let window_bounds = layout::Layout::load()
+            let window_bounds = layout
                 .window_bounds
                 .map(|(x, y, width, height)| {
                     WindowBounds::Windowed(Bounds::new(

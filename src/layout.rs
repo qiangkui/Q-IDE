@@ -1,6 +1,9 @@
 //! 布局持久化：把面板尺寸、显示开关与资源管理器的根目录写到磁盘，
 //! 下次启动时恢复成上次关闭时的样子。
 //!
+//! 文件放在可执行文件旁边的 `layout.txt`（绿色版），便于直接查看和手动修改；
+//! 该目录不可写时退回用户目录 `%APPDATA%\gpui-first\layout.txt`。
+//!
 //! 文件格式是简单的 `键=值` 文本（值是百分号转义后的字符串），逐行解析，
 //! 未知键与损坏的行会被忽略，因此某个版本写坏文件也不会导致启动失败。
 
@@ -29,7 +32,7 @@ pub struct Layout {
     pub show_search: bool,
     pub show_output: bool,
     pub show_status_bar: bool,
-    /// `"dark"` 或 `"light"`。
+    /// `"dark"`、`"light"`，或自定义主题名（见 `themes.txt`）。
     pub theme: String,
     /// 资源管理器根目录的绝对路径。
     pub roots: Vec<String>,
@@ -59,6 +62,8 @@ pub struct Layout {
     pub output: OutputSettings,
     /// 上次关闭时的窗口位置与大小：`(x, y, 宽, 高)`，逻辑像素。
     pub window_bounds: Option<(f32, f32, f32, f32)>,
+    /// 设置窗口上次的大小：`(宽, 高)`，逻辑像素。
+    pub settings_size: Option<(f32, f32)>,
 }
 
 impl Default for Layout {
@@ -89,6 +94,7 @@ impl Default for Layout {
             editor: EditorSettings::default(),
             output: OutputSettings::default(),
             window_bounds: None,
+            settings_size: None,
         }
     }
 }
@@ -143,20 +149,77 @@ pub fn remap_breakpoint_conditions(
         .collect()
 }
 
-/// 布局文件的存放位置：`%APPDATA%\gpui-first\layout.txt`，
-/// 环境变量缺失时退到临时目录。
+/// 配置文件名：与可执行文件放在同一目录。
+pub const FILE_NAME: &str = "layout.txt";
+
+/// 可执行文件所在目录；路径取不到时返回 `None`。
+fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+}
+
+/// 旧版本使用的用户目录：`%APPDATA%\gpui-first`。
+/// 只用于迁移旧配置以及 exe 目录不可写时的退路。
+fn legacy_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("APPDATA").or_else(|| std::env::var_os("LOCALAPPDATA"))?;
+    Some(PathBuf::from(base).join("gpui-first"))
+}
+
+/// 配置文件名的候选位置，按优先级排列：
+/// 可执行文件同目录 → 旧版用户目录 → 临时目录。
+pub(crate) fn config_candidates(name: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(3);
+    if let Some(dir) = exe_dir() {
+        paths.push(dir.join(name));
+    }
+    if let Some(dir) = legacy_dir() {
+        push_unique(&mut paths, dir.join(name));
+    }
+    push_unique(&mut paths, std::env::temp_dir().join(name));
+    paths
+}
+
+fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.contains(&path) {
+        paths.push(path);
+    }
+}
+
+/// 布局文件的存放位置：可执行文件同目录的 `layout.txt`。
+/// 取不到可执行文件路径时退回用户目录，再不行用临时目录。
 pub fn path() -> PathBuf {
-    let base = std::env::var_os("APPDATA")
-        .or_else(|| std::env::var_os("LOCALAPPDATA"))
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("gpui-first").join("layout.txt")
+    config_candidates(FILE_NAME)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| std::env::temp_dir().join(FILE_NAME))
 }
 
 impl Layout {
     /// 读取布局文件；文件不存在或无法解析时返回默认布局。
     pub fn load() -> Self {
-        Self::load_from(&path())
+        let file = path();
+        let legacy = config_candidates(FILE_NAME)
+            .into_iter()
+            .find(|candidate| *candidate != file);
+        Self::load_with(&file, legacy.as_deref())
+    }
+
+    /// 优先读 `file`；不存在时把旧位置的配置搬过来再用。
+    fn load_with(file: &Path, legacy: Option<&Path>) -> Self {
+        if file.is_file() {
+            return Self::load_from(file);
+        }
+        if let Some(legacy) = legacy.filter(|legacy| *legacy != file)
+            && let Ok(text) = fs::read_to_string(legacy)
+        {
+            // 迁移成功后删掉旧文件，避免用户删掉新配置时又读回旧设置。
+            if write_text(file, &text).is_ok() {
+                let _ = fs::remove_file(legacy);
+            }
+            return Self::parse(&text);
+        }
+        Self::default()
     }
 
     /// 从指定文件读取布局，便于测试。
@@ -278,6 +341,22 @@ impl Layout {
                         layout.window_bounds = Some((parts[0], parts[1], parts[2], parts[3]));
                     }
                 }
+                "settings_size" => {
+                    let parts: Vec<f32> = value
+                        .split(',')
+                        .filter_map(|part| part.trim().parse::<f32>().ok())
+                        .collect();
+                    // 和设置窗口的最小尺寸保持一致，坏数据直接忽略。
+                    if parts.len() == 2
+                        && parts.iter().all(|value| value.is_finite())
+                        && parts[0] >= 400.0
+                        && parts[1] >= 300.0
+                        && parts[0] < 20_000.0
+                        && parts[1] < 20_000.0
+                    {
+                        layout.settings_size = Some((parts[0], parts[1]));
+                    }
+                }
                 // 编辑器 / 输出设置：缺失的键沿用默认值，方便旧布局文件升级。
                 "editor_font_size" => {
                     if let Ok(size) = value.parse::<f32>()
@@ -365,16 +444,23 @@ impl Layout {
     }
 
     /// 把布局写回磁盘，目录不存在时自动创建。
+    /// 可执行文件所在目录不可写（如装在 Program Files）时退回用户目录。
     pub fn save(&self) -> io::Result<()> {
-        self.save_to(&path())
+        let text = self.to_text();
+        let mut last: Option<io::Error> = None;
+        for file in config_candidates(FILE_NAME) {
+            match write_text(&file, &text) {
+                Ok(()) => return Ok(()),
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.unwrap_or_else(|| io::Error::other("没有可写的配置文件位置")))
     }
 
     /// 写入指定文件，便于测试。
+    #[cfg(test)]
     pub fn save_to(&self, file: &Path) -> io::Result<()> {
-        if let Some(parent) = file.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(file, self.to_text())
+        write_text(file, &self.to_text())
     }
 
     /// 序列化成布局文件内容。
@@ -465,6 +551,9 @@ impl Layout {
         if let Some((x, y, width, height)) = self.window_bounds {
             out.push_str(&format!("window_bounds={x},{y},{width},{height}\n"));
         }
+        if let Some((width, height)) = self.settings_size {
+            out.push_str(&format!("settings_size={width},{height}\n"));
+        }
         out
     }
 }
@@ -476,6 +565,14 @@ fn truthy(value: &str) -> bool {
 
 fn flag(value: bool) -> &'static str {
     if value { "1" } else { "0" }
+}
+
+/// 写入文本，父目录不存在时自动创建。
+pub(crate) fn write_text(file: &Path, text: &str) -> io::Result<()> {
+    if let Some(parent) = file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(file, text)
 }
 
 /// 转义换行与 `%`，保证一行只存一个值；其余字符原样保留，便于人工查看。
@@ -567,9 +664,20 @@ mod tests {
                 max_lines: 512,
             },
             window_bounds: Some((120.0, 90.0, 1280.0, 800.0)),
+            settings_size: Some((900.0, 640.0)),
         };
 
         assert_eq!(Layout::parse(&layout.to_text()), layout);
+    }
+
+    #[test]
+    fn broken_settings_size_is_ignored() {
+        assert_eq!(Layout::parse("settings_size=300,200\n").settings_size, None);
+        assert_eq!(Layout::parse("settings_size=900\n").settings_size, None);
+        assert_eq!(
+            Layout::parse("settings_size=900,640\n").settings_size,
+            Some((900.0, 640.0))
+        );
     }
 
     #[test]
@@ -761,6 +869,45 @@ mod tests {
         };
         layout.save_to(&file).expect("save");
         assert_eq!(Layout::load_from(&file), layout);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_file_lives_next_to_the_executable() {
+        let exe = std::env::current_exe().expect("可执行文件路径");
+        let expected = exe.parent().expect("可执行文件所在目录").join(FILE_NAME);
+        assert_eq!(path(), expected);
+    }
+
+    #[test]
+    fn legacy_user_dir_config_is_migrated_next_to_the_executable() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-first-layout-migrate-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let legacy = dir.join("appdata").join(FILE_NAME);
+        let file = dir.join("exe").join(FILE_NAME);
+        write_text(&legacy, "explorer_width=321\ntheme=light\n").expect("写旧配置");
+
+        let layout = Layout::load_with(&file, Some(&legacy));
+        assert_eq!(layout.explorer_width, 321.0);
+        assert_eq!(layout.theme, "light");
+        assert!(file.exists(), "旧配置应搬到可执行文件同目录");
+        assert!(!legacy.exists(), "迁移后应删除旧配置");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_config_and_no_legacy_falls_back_to_defaults() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-first-layout-default-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let file = dir.join("exe").join(FILE_NAME);
+        let legacy = dir.join("appdata").join(FILE_NAME);
+        assert_eq!(Layout::load_with(&file, Some(&legacy)), Layout::default());
         let _ = fs::remove_dir_all(&dir);
     }
 }

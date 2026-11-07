@@ -7,15 +7,29 @@ use crate::theme::{self as ui_theme, Palette};
 
 pub const APP_TITLE: &str = "Q-IDE";
 
-/// 主窗口标题栏：左侧菜单栏，中间是窗口拖动区域，右侧是最小化/最大化/关闭按钮。
+/// 主窗口标题栏：最左侧是程序图标，接着是菜单栏，中间是窗口拖动区域，
+/// 右侧是最小化/最大化/关闭按钮。
 /// 控制按钮贴住窗口上沿；拖动区域顶部留出一点空白，让出系统自带的上边缘缩放热区。
 pub fn render(palette: Palette, maximized: bool, menu_bar: impl IntoElement) -> AnyElement {
     h_flex()
         .h(px(ui_theme::TITLE_BAR_HEIGHT))
         .w_full()
-        .pl(px(6.0))
+        .pl(px(8.0))
         .bg(rgb(palette.window_bg))
         .items_start()
+        .child(
+            h_flex()
+                .h(px(ui_theme::TITLE_BAR_HEIGHT))
+                .flex_shrink_0()
+                .items_center()
+                .pr(px(6.0))
+                .child(
+                    img("app-icon.png")
+                        .flex_shrink_0()
+                        .w(px(16.0))
+                        .h(px(16.0)),
+                ),
+        )
         .child(
             h_flex()
                 .h(px(ui_theme::TITLE_BAR_HEIGHT))

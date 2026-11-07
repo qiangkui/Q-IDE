@@ -37,7 +37,7 @@
 - 跳转：转到定义（`F12`）、查找引用（`Shift+F12`）、转到行/符号（`Ctrl+G`）、转到文件（`Ctrl+P`，按文件名或路径模糊匹配）。
 - 命令面板（`Ctrl+Shift+P`）：37 条命令，模糊匹配、回车执行，结果写进输出面板。
 - Dock 布局：编辑器居中、输出固定底部、资源管理器/代码大纲/搜索可停靠左右侧，面板可拖动；完整布局写入布局文件。
-- 主题：深色 / 浅色；设置窗口可调外观、编辑器、输出选项。
+- 主题：设置窗口「主题」页选择内置深色 / 浅色（只读）、已保存的自定义主题或「新建主题」；自定义主题可改名、改颜色（取色器或手填十六进制），改动直接替换同名主题并写入 `themes.txt`。设置窗口按分类分页（布局 / 主题 / 排版 / 保存 / 语法分析器 / 输出），点左侧导航直接切换。
 
 ### 运行与调试
 
@@ -152,9 +152,10 @@ Debug.Print "名字个数：" & names.Count
 | `src/outline.rs` | 代码大纲、符号解析、转到定义 / 查找引用 |
 | `src/search.rs` | 项目内搜索与跨文件替换的纯逻辑 |
 | `src/layout.rs` | `layout.txt` 的读写与版本迁移 |
+| `src/custom_theme.rs` | 自定义主题模型与 `themes.txt` 读写 |
 | `src/settings/` | 设置模型（`SettingsStore`）与设置窗口 |
 | `src/menu.rs` / `src/title_bar.rs` / `src/window_frame.rs` | 顶部菜单、自绘标题栏、窗口外框 |
-| `src/theme.rs` | 深/浅两套配色与尺寸常量 |
+| `src/theme.rs` | 内置深/浅配色、自定义主题解析结果与尺寸常量 |
 | `src/*_tests.rs` | crate 级测试文件（在 `src/main.rs` 里用 `#[cfg(test)] mod ...;` 引入） |
 | `assets/`、`app.rc`、`build.rs` | 窗口与任务栏图标 |
 | `vendor/gpui-component/` | gpui-component 本地补丁 |
@@ -162,9 +163,12 @@ Debug.Print "名字个数：" & names.Count
 
 ## 配置与数据
 
-- 布局、会话与设置：`%APPDATA%\gpui-first\layout.txt`（`dock_state`、`window_bounds`、`open`/`active`、`recent`、`breakpoint`、`breakpoint_condition`、`watch`、`script_args` 等键）。
-- 布局文件带 `layout_version`：旧版本的 `dock_state` 会被丢弃并按默认布局重建，其余字段保留，旧文件可直接升级。
-- 没有单独的配置文件格式，所有设置项都在设置窗口里改，改完立即写盘。
+- 布局、会话与设置：可执行文件同目录的 `layout.txt`（`dock_state`、`window_bounds`、`open`/`active`、`recent`、`breakpoint`、`breakpoint_condition`、`watch`、`script_args` 等键）。安装目录不可写时（如放在 `Program Files`）退回 `%APPDATA%\gpui-first\layout.txt`。
+- 旧版本保存在 `%APPDATA%\gpui-first\layout.txt` 的配置，会在首次启动时自动搬到 exe 旁边并删除旧文件。
+- 自定义主题：同样放在可执行文件同目录的 `themes.txt`，每个主题以 `theme=名称` 开头，`base=dark|light` 指定基础配色，其余为 `#RRGGBB` / `#RRGGBBAA` 颜色键；删掉某一段即删除该主题。设置窗口「主题」页里：选内置主题时名称与颜色只读；选已保存的主题时改名称/颜色会直接替换该主题（改名即改名，不新增）；「新建主题」以当前主题的配色为底、名字留空，保存后成为新条目。颜色可用输入框右侧的取色器，也可直接输入十六进制。
+- 设置窗口的大小也记在 `layout.txt` 的 `settings_size` 键里，下次打开恢复上次的尺寸。
+- 布局文件是纯文本，可以直接编辑或删除；删除后恢复默认布局。文件带 `layout_version`：旧版本的 `dock_state` 会被丢弃并按默认布局重建，其余字段保留，旧文件可直接升级。
+- 布局与设置都放在设置窗口里改，改完立即写盘；主题颜色也可以直接在 `themes.txt` 里手工编辑。
 
 ## 文档
 
@@ -202,5 +206,5 @@ cargo clippy --all-targets
 - **版权与许可**：Q-IDE 的源码与文档版权归作者（qiangkui）所有，© 2026。本项目以 **MIT 许可证**发布，全文见 [LICENSE](LICENSE)：可以自由使用、修改、分发与商用（包括闭源分发），只需保留版权声明与许可声明。
 - **按现状提供**：本项目为个人学习与示例性质的项目，按「现状」提供，不附带任何明示或暗示的担保（包括适销性、特定用途适用性与不侵权担保）。因使用本项目而产生的任何直接或间接损失，作者不承担责任（详见 MIT 许可证原文）。
 - **脚本执行风险**：内置解释器可以调用 Win32 API（`Declare`）、读写本地文件、用 `Shell` 启动外部程序。请**只运行你信任的脚本**，不要执行来源不明的 `.vb` / `.vbs` / `.bas` 文件。
-- **隐私**：程序不含联网功能；打开的文件、布局与设置只保存在本机（`%APPDATA%\gpui-first\layout.txt`）。
+- **隐私**：程序不含联网功能；打开的文件、布局与设置只保存在本机（可执行文件同目录的 `layout.txt`，目录不可写时为 `%APPDATA%\gpui-first\layout.txt`）。
 - **第三方组件**：`gpui`（`gpui-pre`）、`gpui-kit`、`gpui-component`、`tree-sitter`、`tree-sitter-rust`、`encoding_rs`、`lsp-types`、`serde_json`、`embed-resource` 等依赖的版权归各自作者所有，使用与分发请遵守各自的许可证；`vendor/gpui-component` 是对其源码的本地补丁，同样受原项目许可证约束。

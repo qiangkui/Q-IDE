@@ -193,6 +193,8 @@ pub struct CodeWindow {
     window_bounds: Option<(f32, f32, f32, f32)>,
     /// 窗口矩形变了、还没写盘。
     window_bounds_dirty: bool,
+    /// 设置窗口上次的大小：`(宽, 高)`；这次没打开设置时沿用文件里的值。
+    settings_size: Option<(f32, f32)>,
     /// 输出组件当前高度。
     output_height: f32,
     /// 侧栏（资源管理器/代码大纲）最近一次停靠的一侧。
@@ -400,6 +402,7 @@ impl CodeWindow {
                 .clamp(ui_theme::SEARCH_MIN_WIDTH, ui_theme::SEARCH_MAX_WIDTH),
             window_bounds: layout.window_bounds,
             window_bounds_dirty: false,
+            settings_size: layout.settings_size,
             output_height: layout
                 .output_height
                 .clamp(ui_theme::OUTPUT_MIN_HEIGHT, 800.0),
@@ -1390,10 +1393,12 @@ impl CodeWindow {
                 });
             }
             "view.theme" => {
+                let dark = ui_theme::active(cx).mode.is_dark();
                 SettingsStore::update(cx, |settings| {
-                    settings.appearance.theme = match settings.appearance.theme {
-                        ThemeChoice::Dark => ThemeChoice::Light,
-                        ThemeChoice::Light => ThemeChoice::Dark,
+                    settings.appearance.theme = if dark {
+                        ThemeChoice::Light
+                    } else {
+                        ThemeChoice::Dark
                     };
                 });
             }
@@ -2008,9 +2013,9 @@ impl CodeWindow {
     fn sync_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let settings = SettingsStore::snapshot(cx);
 
-        let mode = settings.appearance.theme.mode();
-        if cx.theme().mode != mode {
-            ui_theme::apply(mode, cx);
+        let active = ui_theme::resolve(&settings.appearance.theme, cx);
+        if cx.try_global::<ui_theme::ActivePalette>() != Some(&active) {
+            ui_theme::apply(active, cx);
         }
 
         let editor_settings = settings.editor.clone();
@@ -3970,6 +3975,8 @@ impl CodeWindow {
             editor: settings.editor.clone(),
             output: settings.output.clone(),
             window_bounds: self.window_bounds,
+            // 这次打开过设置窗口就用新的尺寸，否则沿用文件里记住的值。
+            settings_size: crate::settings::remembered_window_size(cx).or(self.settings_size),
         };
         // 写盘失败不影响本次使用，下次启动会退回默认布局。
         let _ = layout.save();
@@ -4447,7 +4454,9 @@ impl CodeWindow {
             show_status_bar: settings.appearance.show_status_bar,
             has_files: !self.open_files.is_empty(),
             has_active: self.active_file.is_some(),
-            dark_theme: settings.appearance.theme == ThemeChoice::Dark,
+            dark_theme: ui_theme::resolve(&settings.appearance.theme, cx)
+                .mode
+                .is_dark(),
         };
         menu::render(
             cx,
@@ -4463,7 +4472,8 @@ impl CodeWindow {
         v_flex()
             .id("activity-bar")
             .w(px(ui_theme::ACTIVITY_BAR_WIDTH))
-            .h_full()
+            // 与面板一样向内缩 PANE_GAP/2，上下沿才能和右侧面板对齐。
+            .my(px(ui_theme::PANE_GAP / 2.0))
             .flex_shrink_0()
             .items_center()
             .gap_1()

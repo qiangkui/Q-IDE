@@ -1,10 +1,13 @@
-//! 主题：深色 / 浅色两套界面配色、所有界面共用的尺寸常量，
+//! 主题：深色 / 浅色两套内置配色、自定义主题的解析结果、所有界面共用的尺寸常量，
 //! 以及把 gpui 主题与自绘配色对齐的入口。
 
 use std::sync::Arc;
 
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
+
+use crate::custom_theme;
+use crate::settings::ThemeChoice;
 
 /// 界面配色。渲染时通过 [`Palette::for_theme`] 取当前主题对应的一组颜色。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,18 +127,55 @@ impl Palette {
         }
     }
 
-    pub fn from_mode(mode: ThemeMode) -> Self {
-        if mode.is_dark() {
-            Self::dark()
-        } else {
-            Self::light()
-        }
-    }
-
-    /// 取当前窗口主题对应的配色。
+    /// 取当前生效主题对应的配色（内置或自定义）。
     pub fn for_theme(cx: &App) -> Self {
-        Self::from_mode(Theme::global(cx).mode)
+        active(cx).palette
     }
+}
+
+/// 当前生效的配色：内置深/浅色，或某个自定义主题解析出来的结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActivePalette {
+    pub palette: Palette,
+    pub mode: ThemeMode,
+}
+
+impl Global for ActivePalette {}
+
+/// 按设置里的主题选择解析出实际配色；自定义主题已被删除时退回深色。
+pub fn resolve(choice: &ThemeChoice, cx: &App) -> ActivePalette {
+    match choice {
+        ThemeChoice::Dark => ActivePalette {
+            palette: Palette::dark(),
+            mode: ThemeMode::Dark,
+        },
+        ThemeChoice::Light => ActivePalette {
+            palette: Palette::light(),
+            mode: ThemeMode::Light,
+        },
+        ThemeChoice::Custom(name) => match custom_theme::find(cx, name) {
+            Some(theme) => ActivePalette {
+                palette: theme.palette(),
+                mode: theme.mode(),
+            },
+            None => ActivePalette {
+                palette: Palette::dark(),
+                mode: ThemeMode::Dark,
+            },
+        },
+    }
+}
+
+/// 当前正在生效的配色；还没应用过主题时按设置现算一份。
+pub fn active(cx: &App) -> ActivePalette {
+    if let Some(active) = cx.try_global::<ActivePalette>() {
+        return *active;
+    }
+    let choice = cx
+        .try_global::<crate::settings::SettingsStore>()
+        .map(|_| crate::settings::SettingsStore::snapshot(cx).appearance.theme)
+        .unwrap_or(ThemeChoice::Dark);
+    resolve(&choice, cx)
 }
 
 /// 标题栏高度。
@@ -192,11 +232,11 @@ pub fn bracket_match_highlight() -> Hsla {
     hsla(0.58, 0.85, 0.62, 0.45)
 }
 
-/// 应用主题模式：切换 gpui 主题，并让 Root 表面、编辑器与弹出层使用同一底色。
-pub fn apply(mode: ThemeMode, cx: &mut App) {
+/// 应用主题：切换 gpui 主题，并让 Root 表面、编辑器与弹出层使用同一底色。
+pub fn apply(active: ActivePalette, cx: &mut App) {
+    let ActivePalette { palette, mode } = active;
     Theme::change(mode, None, cx);
 
-    let palette = Palette::from_mode(mode);
     Theme::update(cx, |theme| {
         theme.tokens.background = Hsla::from(rgb(palette.window_bg)).into();
         theme.popover = Hsla::from(rgb(palette.popover_bg));
@@ -211,4 +251,11 @@ pub fn apply(mode: ThemeMode, cx: &mut App) {
             .style
             .editor_background = Some(Hsla::from(rgb(palette.window_bg)));
     });
+    cx.set_global(active);
+}
+
+/// 按当前设置重新解析并应用主题（自定义主题内容被修改后调用）。
+pub fn apply_from_settings(cx: &mut App) {
+    let choice = crate::settings::SettingsStore::snapshot(cx).appearance.theme;
+    apply(resolve(&choice, cx), cx);
 }

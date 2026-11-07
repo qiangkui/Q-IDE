@@ -361,7 +361,7 @@ fn tab_strip(
                 )
                 .child(
                     div()
-                        .text_sm()
+                        .text_xs()
                         .text_color(rgb(text_color))
                         .child(file.name.clone()),
                 )

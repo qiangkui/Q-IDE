@@ -618,11 +618,15 @@ fn view_menu(cx: &App, palette: Palette, state: MenuState) -> impl IntoElement {
     let toggle_status_bar = toggle_setting(|settings| {
         settings.appearance.show_status_bar = !settings.appearance.show_status_bar;
     });
-    let toggle_theme = toggle_setting(|settings| {
-        settings.appearance.theme = match settings.appearance.theme {
-            ThemeChoice::Dark => ThemeChoice::Light,
-            ThemeChoice::Light => ThemeChoice::Dark,
-        };
+    let dark = state.dark_theme;
+    let toggle_theme: MenuAction = Rc::new(move |_, cx| {
+        SettingsStore::update(cx, |settings| {
+            settings.appearance.theme = if dark {
+                ThemeChoice::Light
+            } else {
+                ThemeChoice::Dark
+            };
+        });
     });
     let fullscreen: MenuAction = Rc::new(|window, _| window.toggle_fullscreen());
     let theme_label = if state.dark_theme {

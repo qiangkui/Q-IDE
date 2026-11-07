@@ -6,40 +6,35 @@
 mod window;
 
 pub use window::open_settings_window;
+pub use window::remembered_window_size;
 
-use gpui_kit::component::ThemeMode;
 use gpui_kit::*;
 
 /// 颜色主题。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum ThemeChoice {
     #[default]
     Dark,
     Light,
+    /// 自定义主题名，定义在可执行文件同目录的 `themes.txt` 里。
+    Custom(String),
 }
 
 impl ThemeChoice {
-    pub const OPTIONS: &'static [(&'static str, &'static str)] =
-        &[("dark", "深色"), ("light", "浅色")];
-
-    pub fn as_str(self) -> &'static str {
+    /// 写进布局文件的键：内置主题用 `dark` / `light`，自定义主题用主题名。
+    pub fn as_str(&self) -> &str {
         match self {
             Self::Dark => "dark",
             Self::Light => "light",
+            Self::Custom(name) => name,
         }
     }
 
     pub fn from_str(value: &str) -> Self {
         match value {
             "light" => Self::Light,
-            _ => Self::Dark,
-        }
-    }
-
-    pub fn mode(self) -> ThemeMode {
-        match self {
-            Self::Dark => ThemeMode::Dark,
-            Self::Light => ThemeMode::Light,
+            "dark" | "" => Self::Dark,
+            name => Self::Custom(name.to_string()),
         }
     }
 }
