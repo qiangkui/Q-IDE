@@ -132,6 +132,11 @@ pub const COMMANDS: &[Command] = &[
         shortcut: "Ctrl+Shift+F",
     },
     Command {
+        id: "view.ai",
+        label: "AI 编程面板",
+        shortcut: "",
+    },
+    Command {
         id: "view.output",
         label: "输出面板",
         shortcut: "",

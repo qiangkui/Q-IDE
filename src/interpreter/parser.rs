@@ -772,6 +772,15 @@ impl Parser {
                     None,
                 )
             };
+            // `ByRef arr As Integer()`：类型后面的空括号也表示数组参数。
+            if !is_array
+                && self.at_op(Op::LParen)
+                && matches!(self.peek_at(1), TokenKind::Op(Op::RParen))
+            {
+                self.advance();
+                self.advance();
+                is_array = true;
+            }
             let default = if self.at_op(Op::Eq) {
                 self.advance();
                 Some(self.parse_expr()?)
@@ -1457,7 +1466,7 @@ impl Parser {
         let mut items = Vec::new();
         loop {
             let (name, suffix) = self.expect_ident_typed("变量名")?;
-            let bounds = if self.at_op(Op::LParen) {
+            let mut bounds = if self.at_op(Op::LParen) {
                 Some(self.parse_bounds()?)
             } else {
                 None
@@ -1480,11 +1489,26 @@ impl Parser {
                     None,
                 )
             };
+            // `Dim arr As Integer()`：类型后面的空括号表示动态数组。
+            if bounds.is_none()
+                && self.at_op(Op::LParen)
+                && matches!(self.peek_at(1), TokenKind::Op(Op::RParen))
+            {
+                self.advance();
+                self.advance();
+                bounds = Some(Vec::new());
+            }
+            let initializer = if self.eat_op(Op::Eq) {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
             items.push(Declared {
                 name,
                 ty,
                 record,
                 bounds,
+                initializer,
                 new_object,
                 with_events: false,
             });
@@ -2106,6 +2130,28 @@ impl Parser {
                 let expr = self.parse_expr()?;
                 self.expect_op(Op::RParen, "括号没有闭合")?;
                 expr
+            }
+            // `{1, 2, 3}`：数组字面量。
+            TokenKind::Op(Op::LBrace) => {
+                self.advance();
+                self.skip_newlines();
+                let mut items = Vec::new();
+                if !self.eat_op(Op::RBrace) {
+                    loop {
+                        items.push(self.parse_expr()?);
+                        self.skip_newlines();
+                        if !self.eat_op(Op::Comma) {
+                            break;
+                        }
+                        self.skip_newlines();
+                        // 允许尾逗号：`{1, 2,}`
+                        if self.at_op(Op::RBrace) {
+                            break;
+                        }
+                    }
+                    self.expect_op(Op::RBrace, "数组字面量需要 `}`")?;
+                }
+                Expr::ArrayLiteral(items)
             }
             TokenKind::Op(Op::Dot) => {
                 // `With` 块里的相对成员：`.X`、`.A.B`。

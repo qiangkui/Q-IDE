@@ -2,6 +2,10 @@
 //!
 //! 设置保存在 `Entity<AppSettings>` 中并通过 [`SettingsStore`] 注册为全局对象，
 //! 因此主窗口与设置窗口共享同一份状态：任一侧修改后，观察者会立即收到通知。
+//!
+//! 唯一例外是 DeepSeek 的 API Key：它不进 [`AppSettings`]（避免被序列化、
+//! `Debug` 打印或跟着设置一起拷贝），只由 [`crate::secret_store`] 存进
+//! Windows 凭据管理器。
 
 mod window;
 
@@ -115,14 +119,71 @@ impl SyntaxSettings {
     }
 }
 
+/// 左右两侧栏。每侧最多显示一个面板。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SideSlot {
+    Left,
+    Right,
+}
+
+impl SideSlot {
+    pub fn other(self) -> Self {
+        match self {
+            Self::Left => Self::Right,
+            Self::Right => Self::Left,
+        }
+    }
+}
+
+/// 可以停靠到左右侧栏的面板。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanelKind {
+    Explorer,
+    Outline,
+    Search,
+    Ai,
+}
+
+impl PanelKind {
+    /// 固定顺序：遍历面板、恢复旧布局时都用它。
+    pub const ALL: [Self; 4] = [Self::Explorer, Self::Outline, Self::Search, Self::Ai];
+
+    /// 两侧都空着时默认去的一侧：侧栏面板在左，AI 在右。
+    pub fn preferred_slot(self) -> SideSlot {
+        match self {
+            Self::Ai => SideSlot::Right,
+            Self::Explorer | Self::Outline | Self::Search => SideSlot::Left,
+        }
+    }
+
+    /// 写进布局文件的键。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Explorer => "explorer",
+            Self::Outline => "outline",
+            Self::Search => "search",
+            Self::Ai => "ai",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        Some(match value {
+            "explorer" => Self::Explorer,
+            "outline" => Self::Outline,
+            "search" => Self::Search,
+            "ai" => Self::Ai,
+            _ => return None,
+        })
+    }
+}
+
 /// 界面布局与外观设置。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppearanceSettings {
     pub theme: ThemeChoice,
-    pub show_explorer: bool,
-    pub show_outline: bool,
-    /// 项目内搜索面板：与资源管理器、代码大纲同侧，三者互斥。
-    pub show_search: bool,
+    /// 左侧栏显示的面板；每侧最多一个，与 `right_panel` 互相独立。
+    pub left_panel: Option<PanelKind>,
+    pub right_panel: Option<PanelKind>,
     pub show_output: bool,
     pub show_status_bar: bool,
 }
@@ -131,9 +192,8 @@ impl Default for AppearanceSettings {
     fn default() -> Self {
         Self {
             theme: ThemeChoice::Dark,
-            show_explorer: true,
-            show_outline: true,
-            show_search: false,
+            left_panel: Some(PanelKind::Explorer),
+            right_panel: None,
             show_output: true,
             show_status_bar: true,
         }
@@ -141,84 +201,137 @@ impl Default for AppearanceSettings {
 }
 
 impl AppearanceSettings {
-    /// 资源管理器与代码大纲共用左侧栏，二者互斥。
-    pub fn toggle_explorer(&mut self) {
-        self.set_explorer(!self.show_explorer);
+    /// 面板当前是否显示在某一侧。
+    pub fn show(&self, kind: PanelKind) -> bool {
+        self.slot_of(kind).is_some()
     }
 
-    /// 打开资源管理器时自动收起代码大纲与搜索面板。
-    pub fn set_explorer(&mut self, show: bool) {
-        self.show_explorer = show;
-        if show {
-            self.show_outline = false;
-            self.show_search = false;
-        }
+    pub fn show_explorer(&self) -> bool {
+        self.show(PanelKind::Explorer)
     }
 
-    /// 资源管理器与代码大纲共用左侧栏，二者互斥。
-    pub fn toggle_outline(&mut self) {
-        self.set_outline(!self.show_outline);
+    pub fn show_outline(&self) -> bool {
+        self.show(PanelKind::Outline)
     }
 
-    /// 打开代码大纲时自动收起资源管理器与搜索面板。
-    pub fn set_outline(&mut self, show: bool) {
-        self.show_outline = show;
-        if show {
-            self.show_explorer = false;
-            self.show_search = false;
-        }
+    pub fn show_search(&self) -> bool {
+        self.show(PanelKind::Search)
     }
 
-    /// 搜索面板与资源管理器、代码大纲同侧，三者互斥。
-    pub fn toggle_search(&mut self) {
-        self.set_search(!self.show_search);
+    pub fn show_ai(&self) -> bool {
+        self.show(PanelKind::Ai)
     }
 
-    /// 打开搜索面板时自动收起另外两个侧栏面板。
-    pub fn set_search(&mut self, show: bool) {
-        self.show_search = show;
-        if show {
-            self.show_explorer = false;
-            self.show_outline = false;
-        }
-    }
-
-    /// 哪个侧栏面板正在显示（互斥，最多一个）。
-    pub fn side_panel(&self) -> Option<SidePanel> {
-        if self.show_explorer {
-            Some(SidePanel::Explorer)
-        } else if self.show_outline {
-            Some(SidePanel::Outline)
-        } else if self.show_search {
-            Some(SidePanel::Search)
+    /// 面板所在的一侧；`None` 表示没有显示。
+    pub fn slot_of(&self, kind: PanelKind) -> Option<SideSlot> {
+        if self.left_panel == Some(kind) {
+            Some(SideSlot::Left)
+        } else if self.right_panel == Some(kind) {
+            Some(SideSlot::Right)
         } else {
             None
         }
     }
 
-    /// 修正旧布局里两个侧栏同时打开的状态：默认保留资源管理器。
-    pub fn normalize_side_panels(&mut self) {
-        let mut panels = [
-            (SidePanel::Explorer, self.show_explorer),
-            (SidePanel::Outline, self.show_outline),
-            (SidePanel::Search, self.show_search),
-        ]
-        .into_iter()
-        .filter(|(_, visible)| *visible);
-        // 只留第一个（优先资源管理器 → 代码大纲 → 搜索）。
-        let kept = panels.next().map(|(panel, _)| panel);
-        self.show_explorer = kept == Some(SidePanel::Explorer);
-        self.show_outline = kept == Some(SidePanel::Outline);
-        self.show_search = kept == Some(SidePanel::Search);
+    /// 某一侧当前显示的面板。
+    pub fn panel_in(&self, slot: SideSlot) -> Option<PanelKind> {
+        match slot {
+            SideSlot::Left => self.left_panel,
+            SideSlot::Right => self.right_panel,
+        }
     }
-}
 
-/// 侧栏（与资源管理器同侧）的三个互斥面板。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SidePanel {
-    Explorer,
-    Outline,
-    Search,
+    fn set_slot(&mut self, slot: SideSlot, kind: Option<PanelKind>) {
+        match slot {
+            SideSlot::Left => self.left_panel = kind,
+            SideSlot::Right => self.right_panel = kind,
+        }
+    }
+
+    /// 打开面板：偏好的那一侧空着就放那里，否则放到另一侧的空位；
+    /// 两侧都占用时替换偏好那一侧的面板。
+    pub fn open_panel(&mut self, kind: PanelKind) {
+        if self.show(kind) {
+            return;
+        }
+        let preferred = kind.preferred_slot();
+        let other = preferred.other();
+        let slot = if self.panel_in(preferred).is_none() {
+            preferred
+        } else if self.panel_in(other).is_none() {
+            other
+        } else {
+            preferred
+        };
+        // 目标侧原来的面板随之关闭。
+        self.set_slot(slot, Some(kind));
+    }
+
+    pub fn close_panel(&mut self, kind: PanelKind) {
+        if self.left_panel == Some(kind) {
+            self.left_panel = None;
+        }
+        if self.right_panel == Some(kind) {
+            self.right_panel = None;
+        }
+    }
+
+    pub fn toggle_panel(&mut self, kind: PanelKind) {
+        if self.show(kind) {
+            self.close_panel(kind);
+        } else {
+            self.open_panel(kind);
+        }
+    }
+
+    /// 把面板移到指定一侧；目标侧原来的面板关闭。
+    pub fn move_panel(&mut self, kind: PanelKind, slot: SideSlot) {
+        if self.slot_of(kind) == Some(slot) {
+            return;
+        }
+        self.close_panel(kind);
+        self.set_slot(slot, Some(kind));
+    }
+
+    pub fn set_panel(&mut self, kind: PanelKind, show: bool) {
+        if show {
+            self.open_panel(kind);
+        } else {
+            self.close_panel(kind);
+        }
+    }
+
+    pub fn toggle_explorer(&mut self) {
+        self.toggle_panel(PanelKind::Explorer);
+    }
+
+    pub fn set_explorer(&mut self, show: bool) {
+        self.set_panel(PanelKind::Explorer, show);
+    }
+
+    pub fn toggle_outline(&mut self) {
+        self.toggle_panel(PanelKind::Outline);
+    }
+
+    pub fn set_outline(&mut self, show: bool) {
+        self.set_panel(PanelKind::Outline, show);
+    }
+
+    pub fn toggle_search(&mut self) {
+        self.toggle_panel(PanelKind::Search);
+    }
+
+    pub fn set_search(&mut self, show: bool) {
+        self.set_panel(PanelKind::Search, show);
+    }
+
+    pub fn toggle_ai(&mut self) {
+        self.toggle_panel(PanelKind::Ai);
+    }
+
+    pub fn set_ai(&mut self, show: bool) {
+        self.set_panel(PanelKind::Ai, show);
+    }
 }
 
 /// 代码编辑器设置。
@@ -278,12 +391,115 @@ impl Default for OutputSettings {
     }
 }
 
+/// DeepSeek 接口的默认地址。
+pub const DEFAULT_AI_BASE_URL: &str = "https://api.deepseek.com";
+/// DeepSeek 的默认模型。
+pub const DEFAULT_AI_MODEL: &str = "deepseek-chat";
+
+/// AI 面板底部「模型」下拉里列出的常用模型：`(值, 界面文字)`。
+pub const AI_MODEL_OPTIONS: &[(&str, &str)] = &[
+    ("deepseek-chat", "deepseek-chat（对话）"),
+    ("deepseek-reasoner", "deepseek-reasoner（推理，不改文件）"),
+];
+
+/// AI 写文件时的确认方式。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AiApproval {
+    /// 每次写入前在对话里询问（默认）。
+    #[default]
+    Ask,
+    /// 自动允许所有工具操作，不再询问。
+    Auto,
+}
+
+impl AiApproval {
+    /// 所有可选项：`(值, 界面文字)`。
+    pub const OPTIONS: &'static [(&'static str, &'static str)] = &[
+        ("ask", "每次写入前确认"),
+        ("auto", "自动允许所有操作"),
+    ];
+
+    /// 写进布局文件的键。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Auto => "auto",
+        }
+    }
+
+    /// AI 面板底栏上显示的短标签。
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Ask => "每次确认",
+            Self::Auto => "全部允许",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Self {
+        match value.trim() {
+            "auto" => Self::Auto,
+            _ => Self::Ask,
+        }
+    }
+}
+
+/// AI 编程设置。
+///
+/// 注意：API Key 不在这里保存，也不写进布局文件；它只交给
+/// [`crate::secret_store`] 放进系统凭据管理器。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AiSettings {
+    /// 接口基础地址。
+    pub base_url: String,
+    /// 模型名。
+    pub model: String,
+    /// 写文件时要不要先问用户。
+    pub approval: AiApproval,
+}
+
+impl Default for AiSettings {
+    fn default() -> Self {
+        Self {
+            base_url: DEFAULT_AI_BASE_URL.to_string(),
+            model: DEFAULT_AI_MODEL.to_string(),
+            approval: AiApproval::default(),
+        }
+    }
+}
+
+impl AiSettings {
+    /// 空地址回退到默认地址，避免请求打到空字符串上。
+    // 供下一阶段的 DeepSeek 请求层使用。
+    #[allow(dead_code)]
+    pub fn effective_base_url(&self) -> &str {
+        let trimmed = self.base_url.trim();
+        if trimmed.is_empty() {
+            DEFAULT_AI_BASE_URL
+        } else {
+            trimmed
+        }
+    }
+
+    /// 空模型名回退到默认模型。
+    // 供下一阶段的 DeepSeek 请求层使用。
+    #[allow(dead_code)]
+    pub fn effective_model(&self) -> &str {
+        let trimmed = self.model.trim();
+        if trimmed.is_empty() {
+            DEFAULT_AI_MODEL
+        } else {
+            trimmed
+        }
+    }
+}
+
 /// 全部应用设置。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AppSettings {
     pub appearance: AppearanceSettings,
     pub editor: EditorSettings,
     pub output: OutputSettings,
+    pub ai: AiSettings,
 }
 
 /// 全局设置存储：持有唯一的设置实体。

@@ -16,6 +16,8 @@ pub struct Palette {
     pub window_bg: u32,
     /// 活动栏（最左侧图标栏）的背景色。
     pub activity_bar_bg: u32,
+    /// 活动栏选中按钮的背景：用偏白的高亮，避免看起来像按下变暗。
+    pub activity_bar_selected: u32,
     /// 侧边栏（资源管理器）等组件表面的背景色。
     pub sidebar_bg: u32,
     /// 组件内容区（树形框、输出日志）的背景色。
@@ -69,6 +71,7 @@ impl Palette {
         Self {
             window_bg: 0x181818,
             activity_bar_bg: 0x2d2d2d,
+            activity_bar_selected: 0xffffff33,
             sidebar_bg: 0x252526,
             panel_bg: 0x1f1f1f,
             popover_bg: 0x252526,
@@ -100,6 +103,7 @@ impl Palette {
         Self {
             window_bg: 0xf3f3f3,
             activity_bar_bg: 0xe7e7e7,
+            activity_bar_selected: 0xffffffd9,
             sidebar_bg: 0xf8f8f8,
             panel_bg: 0xffffff,
             popover_bg: 0xffffff,
@@ -191,6 +195,9 @@ pub const EXPLORER_WIDTH: f32 = 220.0;
 pub const OUTLINE_WIDTH: f32 = 240.0;
 /// 搜索面板初始宽度。
 pub const SEARCH_WIDTH: f32 = 300.0;
+
+/// AI 编程面板的默认宽度。
+pub const AI_WIDTH: f32 = 340.0;
 /// 设置窗口左侧导航栏初始宽度。
 pub const SETTINGS_SIDEBAR_WIDTH: f32 = 250.0;
 /// 拖动分隔条时允许的最小尺寸。
@@ -199,9 +206,13 @@ pub const OUTLINE_MIN_WIDTH: f32 = 150.0;
 pub const OUTLINE_MAX_WIDTH: f32 = 520.0;
 pub const SEARCH_MIN_WIDTH: f32 = 200.0;
 pub const SEARCH_MAX_WIDTH: f32 = 560.0;
+pub const AI_MIN_WIDTH: f32 = 240.0;
+pub const AI_MAX_WIDTH: f32 = 720.0;
 pub const OUTPUT_MIN_HEIGHT: f32 = 80.0;
-/// 各区域之间的间距。
+/// 窗口内容区的外边距。
 pub const PANE_GAP: f32 = 8.0;
+/// 面板之间的可见间隔；面板自身向内缩 `PANEL_GAP / 2`。
+pub const PANEL_GAP: f32 = 6.0;
 /// 各区域的圆角半径。
 pub const PANE_RADIUS: f32 = 8.0;
 /// 标签栏高度；标签铺满整个高度。

@@ -23,6 +23,7 @@ pub struct MenuState {
     pub show_explorer: bool,
     pub show_outline: bool,
     pub show_search: bool,
+    pub show_ai: bool,
     pub show_output: bool,
     pub show_status_bar: bool,
     pub has_files: bool,
@@ -615,6 +616,9 @@ fn view_menu(cx: &App, palette: Palette, state: MenuState) -> impl IntoElement {
     let toggle_search_panel = toggle_setting(|settings| {
         settings.appearance.toggle_search();
     });
+    let toggle_ai_panel = toggle_setting(|settings| {
+        settings.appearance.toggle_ai();
+    });
     let toggle_status_bar = toggle_setting(|settings| {
         settings.appearance.show_status_bar = !settings.appearance.show_status_bar;
     });
@@ -663,6 +667,15 @@ fn view_menu(cx: &App, palette: Palette, state: MenuState) -> impl IntoElement {
                 state.show_search,
                 false,
                 Some(toggle_search_panel.clone()),
+            ),
+            menu_row(
+                palette,
+                state_menu,
+                "view-ai",
+                "AI 编程",
+                state.show_ai,
+                false,
+                Some(toggle_ai_panel.clone()),
             ),
             menu_row(
                 palette,

@@ -1,14 +1,16 @@
 //! GPUI Kit 代码编辑器示例。
 //!
 //! 代码按职责拆分：
-//! - [`app`]：主窗口布局与标签页状态；
+//! - [`app`]：主窗口布局与标签页状态（`app/` 下按 dock、debug、editor、files、session、dialogs、view 等职责拆分）；
 //! - [`completion`] / [`lint`]：VB 脚本的补全与实时语法检查；
 //! - [`encoding`]：文本文件编码探测（UTF-8/UTF-16/GBK）与按原编码写回；
 //! - [`editor_pane`] / [`explorer`] / [`output`] / [`status_bar`] / [`title_bar`]：各界面区域；
 //! - [`panels`]：Dock 面板（编辑器、资源管理器、代码大纲、搜索、输出）；
+//! - [`ai`]：AI 编程功能，按界面 / 网络 / 协议 / 工具分成 `ai::panel`、`ai::client`、`ai::stream`、`ai::tools`；
 //! - [`search`]：项目内文本搜索的匹配模型与搜索面板渲染；
 //! - [`menu`]：顶部菜单；
 //! - [`settings`]：设置模型与设置窗口；
+//! - [`secret_store`]：Windows 凭据管理器读写 API Key（不落盘到布局文件）；
 //! - [`theme`]：配色与尺寸常量；
 //! - [`workspace`]：标签页模型与语言推断；
 //! - [`window_frame`]：Windows 窗口外框处理。
@@ -19,6 +21,7 @@
 
 // 资源管理器的模型测试放在独立文件里：写在 explorer.rs 的 tests 子模块中会
 // 触发 rustc 的宏展开递归上限。
+mod ai;
 mod app;
 mod assets;
 mod brackets;
@@ -38,6 +41,7 @@ mod output;
 mod panels;
 mod panel_drag;
 mod search;
+mod secret_store;
 mod settings;
 mod status_bar;
 mod syntax;
@@ -45,6 +49,9 @@ mod theme;
 mod title_bar;
 mod window_frame;
 mod workspace;
+
+#[cfg(test)]
+mod ai_tests;
 
 #[cfg(test)]
 mod editor_pane_tests;
@@ -111,6 +118,12 @@ mod brackets_tests;
 
 #[cfg(test)]
 mod shortcut_tests;
+
+#[cfg(test)]
+mod secret_store_tests;
+
+#[cfg(test)]
+mod interpreter_tests;
 
 use gpui_kit::*;
 

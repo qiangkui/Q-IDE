@@ -189,6 +189,10 @@ pub enum Op {
     GtEq,
     LParen,
     RParen,
+    /// `{`（数组字面量 `{1, 2, 3}` 的开头）。
+    LBrace,
+    /// `}`。
+    RBrace,
     Comma,
     /// `;`（`Print` 的分隔符，不做补位）。
     Semicolon,
@@ -215,6 +219,8 @@ impl Op {
             Self::GtEq => ">=",
             Self::LParen => "(",
             Self::RParen => ")",
+            Self::LBrace => "{",
+            Self::RBrace => "}",
             Self::Comma => ",",
             Self::Semicolon => ";",
             Self::Dot => ".",
@@ -625,6 +631,8 @@ fn scan_operator(chars: &[char], index: usize) -> Option<(Op, usize)> {
         '>' => Op::Gt,
         '(' => Op::LParen,
         ')' => Op::RParen,
+        '{' => Op::LBrace,
+        '}' => Op::RBrace,
         ',' => Op::Comma,
         ';' => Op::Semicolon,
         '.' => Op::Dot,

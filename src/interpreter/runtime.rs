@@ -46,6 +46,11 @@ pub struct Slot {
     readonly: bool,
     /// 声明时就是数组（`Dim a(2)`、`Dim a()`），不能整体赋成标量。
     array_binding: bool,
+    /// 由哪一行 `Dim` 声明出来的；0 表示参数、全局或 `Const` 这类非 `Dim` 来源。
+    ///
+    /// 循环体里的 `Dim` 每轮都会执行到，靠它区分「同一条声明又跑了一遍」和
+    /// 「同一过程里重复声明了两个同名变量」。
+    declared_at: usize,
 }
 
 impl Slot {
@@ -65,6 +70,7 @@ impl Slot {
             ty,
             readonly: false,
             array_binding: false,
+            declared_at: 0,
         }
     }
 
@@ -75,7 +81,14 @@ impl Slot {
             ty,
             readonly,
             array_binding,
+            declared_at: 0,
         }
+    }
+
+    /// 记下这条声明来自哪一行。
+    fn at_line(mut self, line: usize) -> Self {
+        self.declared_at = line;
+        self
     }
 
     pub fn is_readonly(&self) -> bool {
@@ -551,22 +564,29 @@ impl<'p, 'o> Runtime<'p, 'o> {
     }
 
     fn declare(&mut self, name: &str, ty: VbType, line: usize) -> Result<(), RuntimeError> {
-        self.declare_slot(name, default_value(ty), ty, line)
+        self.declare_slot(name, default_value(ty), ty, line).map(|_| ())
     }
 
+    /// 在当前作用域里声明变量；返回是否新建了单元。
+    ///
+    /// 同一条 `Dim` 语句被反复执行（例如写在循环体里）不算重复声明：
+    /// VB 的声明是按过程算一次的，变量会保留上一轮的值。
     fn declare_slot(
         &mut self,
         name: &str,
         value: Value,
         ty: VbType,
         line: usize,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<bool, RuntimeError> {
         let scope = self.scope_mut();
-        if scope.contains_key(name) {
+        if let Some(existing) = scope.get(name) {
+            if existing.declared_at == line {
+                return Ok(false);
+            }
             return Err(RuntimeError::new(format!("变量 `{name}` 重复声明"), line));
         }
-        scope.insert(name.to_string(), Slot::new(value, ty));
-        Ok(())
+        scope.insert(name.to_string(), Slot::new(value, ty).at_line(line));
+        Ok(true)
     }
 
     /// 取过程内的 `Static` 单元：首次调用时创建，之后复用。
@@ -847,15 +867,21 @@ impl<'p, 'o> Runtime<'p, 'o> {
                                 *line,
                             )
                         })?;
-                        if frame.locals.contains_key(&item.name) {
+                        if let Some(existing) = frame.locals.get(&item.name) {
+                            if existing.declared_at == *line {
+                                continue;
+                            }
                             return Err(RuntimeError::new(
                                 format!("变量 `{}` 重复声明", item.name),
                                 *line,
                             ));
                         }
                         frame.locals.insert(item.name.clone(), slot);
-                    } else {
-                        self.declare_slot(&item.name, value, slot_ty, *line)?;
+                    } else if !self.declare_slot(&item.name, value.clone(), slot_ty, *line)? {
+                        // 同一条 `Dim` 又跑了一遍（循环体里）：变量保留，初值重新算。
+                        if item.initializer.is_some() {
+                            self.set_var(&item.name, value, *line)?;
+                        }
                     }
                 }
                 Ok(Flow::Normal)
@@ -2242,6 +2268,11 @@ impl<'p, 'o> Runtime<'p, 'o> {
         item: &Declared,
         line: usize,
     ) -> Result<(Value, VbType), RuntimeError> {
+        // `Dim arr As Integer() = {1, 2, 3}`：声明时就带上初值。
+        if let Some(initializer) = &item.initializer {
+            let value = self.eval(initializer, line)?;
+            return Ok((value, VbType::Variant));
+        }
         if let Some(kind) = &item.new_object {
             let value = match kind {
                 NewObject::Collection => Value::collection(),
@@ -2953,6 +2984,13 @@ impl<'p, 'o> Runtime<'p, 'o> {
         self.tick(line)?;
         match expr {
             Expr::Literal(value) => Ok(value.clone()),
+            Expr::ArrayLiteral(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(self.eval(item, line)?);
+                }
+                Ok(Value::array(values))
+            }
             Expr::Var(name) => {
                 if let Some(slot) = self.find_slot(name) {
                     return Ok(slot.value());

@@ -15,6 +15,7 @@ use gpui_kit::*;
 
 use super::{AppSettings, SettingsStore, SyntaxLanguage, ThemeChoice};
 use crate::custom_theme::{self, ColorSpec, DraftKind, ThemeDraft, ThemeStore, COLORS};
+use crate::secret_store;
 use crate::theme::{self as ui_theme, Palette};
 use crate::title_bar;
 use crate::window_frame;
@@ -234,19 +235,35 @@ fn build_pages(
                 bool_item(
                     store,
                     "资源管理器",
-                    |s| s.appearance.show_explorer,
+                    |s| s.appearance.show_explorer(),
                     |s, v| s.appearance.set_explorer(v),
                     true,
                 )
-                .description("在左侧显示项目文件树（会收起代码大纲与搜索）"),
+                .description("显示项目文件树；有空的一侧时优先放左侧"),
+                bool_item(
+                    store,
+                    "代码大纲",
+                    |s| s.appearance.show_outline(),
+                    |s, v| s.appearance.set_outline(v),
+                    false,
+                )
+                .description("显示符号大纲；有空的一侧时优先放左侧"),
                 bool_item(
                     store,
                     "搜索面板",
-                    |s| s.appearance.show_search,
+                    |s| s.appearance.show_search(),
                     |s, v| s.appearance.set_search(v),
                     false,
                 )
-                .description("在左侧显示项目内文本搜索（会收起资源管理器与代码大纲）"),
+                .description("显示项目内文本搜索；有空的一侧时优先放左侧"),
+                bool_item(
+                    store,
+                    "AI 编程面板",
+                    |s| s.appearance.show_ai(),
+                    |s, v| s.appearance.set_ai(v),
+                    false,
+                )
+                .description("显示 AI 编程助手；有空的一侧时优先放右侧"),
                 bool_item(
                     store,
                     "输出面板",
@@ -385,6 +402,30 @@ fn build_pages(
                 )
                 .description("超出后自动丢弃最早的输出"),
             ])),
+        SettingPage::new("AI")
+            .icon(IconName::Bot)
+            .group(
+                SettingGroup::new()
+                    .title("DeepSeek")
+                    .description("当前接入 DeepSeek；以后可以再接入其它模型，每种模型一组设置")
+                    .items([
+                        api_key_item(),
+                        ai_text_item(
+                            store,
+                            "API 地址",
+                            |s| s.ai.base_url.as_str(),
+                            |s, value| s.ai.base_url = value,
+                        )
+                        .description("DeepSeek 接口地址，默认 https://api.deepseek.com"),
+                        ai_text_item(
+                            store,
+                            "模型",
+                            |s| s.ai.model.as_str(),
+                            |s, value| s.ai.model = value,
+                        )
+                        .description("默认 deepseek-chat，也可以填 deepseek-reasoner（推理模型不支持改文件）；AI 面板底部也能切换"),
+                    ]),
+            ),
     ]
 }
 
@@ -936,4 +977,120 @@ fn number_item(
     );
 
     SettingItem::new(title, field)
+}
+
+/// AI 设置页里的普通文本框（接口地址、模型名）。
+fn ai_text_item(
+    store: &Entity<AppSettings>,
+    title: &'static str,
+    get: fn(&AppSettings) -> &str,
+    set: fn(&mut AppSettings, String),
+) -> SettingItem {
+    let read = store.clone();
+    let write = store.clone();
+
+    let field = SettingField::input(
+        move |cx: &App| SharedString::from(get(read.read(cx))),
+        move |value: SharedString, cx: &mut App| {
+            write.update(cx, |settings, cx| {
+                set(settings, value.to_string());
+                cx.notify();
+            });
+        },
+    );
+
+    SettingItem::new(title, field)
+}
+
+/// API Key 输入框的状态。值只在内存与 Windows 凭据管理器之间流动，
+/// 不进 [`AppSettings`]，也不进 `layout.txt`。
+struct ApiKeyField {
+    input: Entity<InputState>,
+    /// 已经写进凭据管理器的值，用来判断输入框这次是否又改了。
+    saved: String,
+    /// 上一次读写的错误；只在界面上显示，不包含密钥内容。
+    error: Option<String>,
+}
+
+fn api_key_state(window: &mut Window, cx: &mut App) -> Entity<ApiKeyField> {
+    window.use_keyed_state(SharedString::from("ai-api-key"), cx, |window, cx| {
+        let saved = secret_store::load_api_key().unwrap_or_default();
+        let initial = saved.clone();
+        // 输入框默认遮住字符，复制、剪切对遮罩内容不生效。
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(initial)
+                .masked(true)
+        });
+        ApiKeyField {
+            input,
+            saved,
+            error: None,
+        }
+    })
+}
+
+/// 「API 密钥」一行：和「API 地址」一样是“标签在前、输入框在后”，
+/// 只是输入内容始终遮罩，右侧多一个「清除」按钮。
+fn api_key_item() -> SettingItem {
+    let field = SettingField::render(move |_, window, cx| {
+        let state = api_key_state(window, cx);
+        let value = state.read(cx).input.read(cx).value().to_string();
+        // 输入框内容变了就同步到凭据管理器；空字符串表示删除。
+        if value != state.read(cx).saved {
+            state.update(cx, |state, _| {
+                state.error = secret_store::save_api_key(&value)
+                    .err()
+                    .map(|error| format!("保存失败：{error}"));
+                state.saved = value;
+            });
+        }
+
+        let (input, error) = {
+            let state = state.read(cx);
+            (state.input.clone(), state.error.clone())
+        };
+        let clear_state = state.clone();
+        let row = h_flex()
+            .w_64()
+            .items_center()
+            .gap_2()
+            .child(div().flex_1().min_w_0().child(
+                Input::new(&input)
+                    .mask_toggle()
+                    .aria_label("DeepSeek API Key"),
+            ))
+            .child(
+                Button::new("ai-key-clear")
+                    .label("清除")
+                    .on_click(move |_, window, cx| {
+                        clear_state.update(cx, |state, cx| {
+                            state
+                                .input
+                                .update(cx, |input, cx| input.set_value("", window, cx));
+                            state.saved = String::new();
+                            state.error = secret_store::delete_api_key()
+                                .err()
+                                .map(|error| format!("删除失败：{error}"));
+                            cx.notify();
+                        });
+                    }),
+            );
+
+        // 正常时不占额外高度，只有读写失败才多出这一行提示。
+        match error {
+            Some(error) => {
+                let palette = Palette::for_theme(cx);
+                v_flex()
+                    .gap_1()
+                    .child(row)
+                    .child(div().text_xs().text_color(rgb(palette.error)).child(error))
+                    .into_any_element()
+            }
+            None => row.into_any_element(),
+        }
+    });
+
+    SettingItem::new("API 密钥", field)
+        .description("只存进 Windows 凭据管理器，不写进 layout.txt，也不会出现在日志或输出里")
 }

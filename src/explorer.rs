@@ -458,7 +458,10 @@ pub fn render(
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
                             .overflow_hidden()
+                            // 侧栏变窄时用省略号截断，不要让文件名折成多行。
+                            .truncate()
                             .text_xs()
                             .text_color(rgb(palette.sidebar_text))
                             .child(entry.item().label.clone()),

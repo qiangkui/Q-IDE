@@ -298,7 +298,8 @@ impl SettingItem {
                                     this.child(
                                         div()
                                             .size_full()
-                                            .text_sm()
+                                            // 本地补丁：说明文字比标题小一档（原来是 text_sm）。
+                                            .text_xs()
                                             .text_color(cx.theme().muted_foreground)
                                             .child(description),
                                     )

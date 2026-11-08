@@ -39,6 +39,8 @@ pub const EDITOR_PANEL: &str = "editor";
 pub const EXPLORER_PANEL: &str = "explorer";
 pub const OUTLINE_PANEL: &str = "outline";
 pub const SEARCH_PANEL: &str = "search";
+/// AI 编程面板：默认停在右侧，也可以拖到左侧。
+pub const AI_PANEL: &str = "ai";
 pub const OUTPUT_PANEL: &str = "output";
 
 /// 编辑器面板：文件标签栏 + 代码编辑框。
@@ -435,7 +437,7 @@ impl Render for EditorPanel {
         let context_menu = self.build_context_menu(cx);
         div()
             .size_full()
-            .p(px(ui_theme::PANE_GAP / 2.0))
+            .p(px(ui_theme::PANEL_GAP / 2.0))
             .child(editor_pane::render(
                 cx,
                 EditorPaneProps {
@@ -633,7 +635,7 @@ impl BasePanel for ExplorerPanel {
     }
 
     fn visible(&self, cx: &App) -> bool {
-        SettingsStore::snapshot(cx).appearance.show_explorer
+        SettingsStore::snapshot(cx).appearance.show_explorer()
     }
 
     fn on_added_to(
@@ -787,7 +789,7 @@ impl Render for ExplorerPanel {
 
         let panel_element = div()
             .size_full()
-            .p(px(ui_theme::PANE_GAP / 2.0))
+            .p(px(ui_theme::PANEL_GAP / 2.0))
             .child(explorer::render(
                 &self.tree,
                 None,
@@ -900,7 +902,7 @@ impl BasePanel for OutlinePanel {
     }
 
     fn visible(&self, cx: &App) -> bool {
-        SettingsStore::snapshot(cx).appearance.show_outline
+        SettingsStore::snapshot(cx).appearance.show_outline()
     }
 
     fn on_added_to(
@@ -1035,7 +1037,7 @@ impl Render for OutlinePanel {
 
         div()
             .size_full()
-            .p(px(ui_theme::PANE_GAP / 2.0))
+            .p(px(ui_theme::PANEL_GAP / 2.0))
             .child(outline::render(
                 outline::OutlineRender {
                     width: None,
@@ -1283,7 +1285,7 @@ impl BasePanel for SearchPanel {
     }
 
     fn visible(&self, cx: &App) -> bool {
-        SettingsStore::snapshot(cx).appearance.show_search
+        SettingsStore::snapshot(cx).appearance.show_search()
     }
 
     fn on_added_to(
@@ -1453,7 +1455,7 @@ impl Render for SearchPanel {
 
         div()
             .size_full()
-            .p(px(ui_theme::PANE_GAP / 2.0))
+            .p(px(ui_theme::PANEL_GAP / 2.0))
             .on_action({
                 let close = close_panel.clone();
                 move |_: &Escape, window, cx| close(window, cx)
@@ -1659,7 +1661,7 @@ impl Render for OutputPanel {
 
         div()
             .size_full()
-            .p(px(ui_theme::PANE_GAP / 2.0))
+            .p(px(ui_theme::PANEL_GAP / 2.0))
             .child(output::render(props, on_copy, on_clear, on_close, true))
     }
 }

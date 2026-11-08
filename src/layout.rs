@@ -12,7 +12,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::settings::{EditorSettings, OutputSettings, SyntaxLanguage};
+use crate::settings::{
+    AiApproval, AiSettings, EditorSettings, OutputSettings, PanelKind, SyntaxLanguage,
+};
 use crate::theme as ui_theme;
 
 /// Dock 布局的版本号。修改默认面板结构或修复旧布局问题时递增，
@@ -26,10 +28,13 @@ pub struct Layout {
     pub explorer_width: f32,
     pub outline_width: f32,
     pub search_width: f32,
+    /// AI 编程面板的宽度。
+    pub ai_width: f32,
     pub output_height: f32,
-    pub show_explorer: bool,
-    pub show_outline: bool,
-    pub show_search: bool,
+    /// 左侧栏显示的面板；`None` 表示左侧空着。
+    pub left_panel: Option<PanelKind>,
+    /// 右侧栏显示的面板；`None` 表示右侧空着。
+    pub right_panel: Option<PanelKind>,
     pub show_output: bool,
     pub show_status_bar: bool,
     /// `"dark"`、`"light"`，或自定义主题名（见 `themes.txt`）。
@@ -54,12 +59,12 @@ pub struct Layout {
     pub watches: Vec<String>,
     /// Dock 面板的完整布局（JSON），用于保留用户拖动/拆分后的面板位置。
     pub dock_state: String,
-    /// 侧栏最近使用的一侧：`"left"` 或 `"right"`。
-    pub side_dock: String,
     /// 编辑器设置（字号、换行、自动保存、语法分析……），重启后继续生效。
     pub editor: EditorSettings,
     /// 输出面板设置（字号、时间戳、保留行数）。
     pub output: OutputSettings,
+    /// AI 设置（接口地址、模型）；API Key 不在布局文件里。
+    pub ai: AiSettings,
     /// 上次关闭时的窗口位置与大小：`(x, y, 宽, 高)`，逻辑像素。
     pub window_bounds: Option<(f32, f32, f32, f32)>,
     /// 设置窗口上次的大小：`(宽, 高)`，逻辑像素。
@@ -73,10 +78,10 @@ impl Default for Layout {
             explorer_width: ui_theme::EXPLORER_WIDTH,
             outline_width: ui_theme::OUTLINE_WIDTH,
             search_width: ui_theme::SEARCH_WIDTH,
+            ai_width: ui_theme::AI_WIDTH,
             output_height: ui_theme::OUTPUT_HEIGHT,
-            show_explorer: true,
-            show_outline: true,
-            show_search: false,
+            left_panel: Some(PanelKind::Explorer),
+            right_panel: None,
             show_output: true,
             show_status_bar: true,
             theme: "dark".to_string(),
@@ -90,9 +95,9 @@ impl Default for Layout {
             script_args: String::new(),
             watches: Vec::new(),
             dock_state: String::new(),
-            side_dock: "left".to_string(),
             editor: EditorSettings::default(),
             output: OutputSettings::default(),
+            ai: AiSettings::default(),
             window_bounds: None,
             settings_size: None,
         }
@@ -243,6 +248,13 @@ impl Layout {
         let mut declared_roots: Option<usize> = None;
         let mut roots: Vec<String> = Vec::new();
         let mut saw_root = false;
+        // 新的左右槽位键；旧文件只有 show_* 布尔值，解析完再折算。
+        let mut left_panel: Option<PanelKind> = None;
+        let mut right_panel: Option<PanelKind> = None;
+        let mut saw_slot = false;
+        let mut legacy_visible: Vec<PanelKind> = Vec::new();
+        let mut saw_legacy_panel = false;
+        let mut legacy_side_right = false;
 
         for line in text.lines() {
             let line = line.trim_end();
@@ -279,6 +291,13 @@ impl Layout {
                         layout.search_width = width;
                     }
                 }
+                "ai_width" => {
+                    if let Ok(width) = value.parse::<f32>()
+                        && width.is_finite()
+                    {
+                        layout.ai_width = width;
+                    }
+                }
                 "output_height" => {
                     if let Ok(height) = value.parse::<f32>()
                         && height.is_finite()
@@ -286,12 +305,45 @@ impl Layout {
                         layout.output_height = height;
                     }
                 }
-                "show_explorer" => layout.show_explorer = truthy(&value),
-                "show_outline" => layout.show_outline = truthy(&value),
-                "show_search" => layout.show_search = truthy(&value),
+                "left_panel" => {
+                    saw_slot = true;
+                    left_panel = PanelKind::from_str(&value);
+                }
+                "right_panel" => {
+                    saw_slot = true;
+                    right_panel = PanelKind::from_str(&value);
+                }
+                "show_explorer" => {
+                    saw_legacy_panel = true;
+                    if truthy(&value) {
+                        legacy_visible.push(PanelKind::Explorer);
+                    }
+                }
+                "show_outline" => {
+                    saw_legacy_panel = true;
+                    if truthy(&value) {
+                        legacy_visible.push(PanelKind::Outline);
+                    }
+                }
+                "show_search" => {
+                    saw_legacy_panel = true;
+                    if truthy(&value) {
+                        legacy_visible.push(PanelKind::Search);
+                    }
+                }
+                "show_ai" => {
+                    saw_legacy_panel = true;
+                    if truthy(&value) {
+                        legacy_visible.push(PanelKind::Ai);
+                    }
+                }
+                "side_dock" => legacy_side_right = value == "right",
                 "show_output" => layout.show_output = truthy(&value),
                 "show_status_bar" => layout.show_status_bar = truthy(&value),
                 "theme" => layout.theme = value,
+                "ai_base_url" => layout.ai.base_url = value,
+                "ai_model" => layout.ai.model = value,
+                "ai_approval" => layout.ai.approval = AiApproval::from_str(&value),
                 "roots" => declared_roots = value.parse::<usize>().ok(),
                 "root" => {
                     saw_root = true;
@@ -324,7 +376,6 @@ impl Layout {
                     }
                 }
                 "dock_state" => layout.dock_state = value,
-                "side_dock" => layout.side_dock = value,
                 "window_bounds" => {
                     let parts: Vec<f32> = value
                         .split(',')
@@ -436,6 +487,34 @@ impl Layout {
         } else if saw_root {
             layout.roots = roots;
         }
+        if saw_slot {
+            layout.left_panel = left_panel;
+            layout.right_panel = right_panel;
+        } else if saw_legacy_panel {
+            // 旧版三个侧栏面板互斥，只保留优先级最高的那个；AI 固定在右侧。
+            let side = [PanelKind::Explorer, PanelKind::Outline, PanelKind::Search]
+                .into_iter()
+                .find(|kind| legacy_visible.contains(kind));
+            let ai = legacy_visible.contains(&PanelKind::Ai);
+            layout.left_panel = None;
+            layout.right_panel = None;
+            match (side, ai) {
+                (Some(side), true) => {
+                    // 一侧只留一个：AI 保持右侧，侧栏面板让到左侧。
+                    layout.left_panel = Some(side);
+                    layout.right_panel = Some(PanelKind::Ai);
+                }
+                (Some(side), false) => {
+                    if legacy_side_right {
+                        layout.right_panel = Some(side);
+                    } else {
+                        layout.left_panel = Some(side);
+                    }
+                }
+                (None, true) => layout.right_panel = Some(PanelKind::Ai),
+                (None, false) => {}
+            }
+        }
         if layout.layout_version < LAYOUT_VERSION {
             layout.layout_version = LAYOUT_VERSION;
             layout.dock_state.clear();
@@ -471,13 +550,39 @@ impl Layout {
         out.push_str(&format!("explorer_width={}\n", self.explorer_width));
         out.push_str(&format!("outline_width={}\n", self.outline_width));
         out.push_str(&format!("search_width={}\n", self.search_width));
+        out.push_str(&format!("ai_width={}\n", self.ai_width));
         out.push_str(&format!("output_height={}\n", self.output_height));
-        out.push_str(&format!("show_explorer={}\n", flag(self.show_explorer)));
-        out.push_str(&format!("show_outline={}\n", flag(self.show_outline)));
-        out.push_str(&format!("show_search={}\n", flag(self.show_search)));
+        out.push_str(&format!(
+            "left_panel={}\n",
+            self.left_panel.map(PanelKind::as_str).unwrap_or_default()
+        ));
+        out.push_str(&format!(
+            "right_panel={}\n",
+            self.right_panel.map(PanelKind::as_str).unwrap_or_default()
+        ));
+        // 同时写出面板开关，方便阅读，也让旧版本仍能识别布局意图。
+        let show = |kind: PanelKind| {
+            self.left_panel == Some(kind) || self.right_panel == Some(kind)
+        };
+        out.push_str(&format!(
+            "show_explorer={}\n",
+            flag(show(PanelKind::Explorer))
+        ));
+        out.push_str(&format!(
+            "show_outline={}\n",
+            flag(show(PanelKind::Outline))
+        ));
+        out.push_str(&format!(
+            "show_search={}\n",
+            flag(show(PanelKind::Search))
+        ));
+        out.push_str(&format!("show_ai={}\n", flag(show(PanelKind::Ai))));
         out.push_str(&format!("show_output={}\n", flag(self.show_output)));
         out.push_str(&format!("show_status_bar={}\n", flag(self.show_status_bar)));
         out.push_str(&format!("theme={}\n", escape(&self.theme)));
+        out.push_str(&format!("ai_base_url={}\n", escape(&self.ai.base_url)));
+        out.push_str(&format!("ai_model={}\n", escape(&self.ai.model)));
+        out.push_str(&format!("ai_approval={}\n", self.ai.approval.as_str()));
         out.push_str(&format!("roots={}\n", self.roots.len()));
         for root in &self.roots {
             out.push_str(&format!("root=dir:{}\n", escape(root)));
@@ -517,7 +622,6 @@ impl Layout {
             out.push_str(&format!("watch={}\n", escape(watch)));
         }
         out.push_str(&format!("dock_state={}\n", escape(&self.dock_state)));
-        out.push_str(&format!("side_dock={}\n", escape(&self.side_dock)));
         out.push_str(&format!("editor_font_size={}\n", self.editor.font_size));
         out.push_str(&format!("editor_soft_wrap={}\n", flag(self.editor.soft_wrap)));
         out.push_str(&format!(
@@ -621,10 +725,10 @@ mod tests {
             explorer_width: 320.5,
             outline_width: 350.0,
             search_width: 310.0,
+            ai_width: 380.0,
             output_height: 210.0,
-            show_explorer: false,
-            show_outline: false,
-            show_search: true,
+            left_panel: Some(PanelKind::Outline),
+            right_panel: Some(PanelKind::Ai),
             show_output: true,
             show_status_bar: false,
             theme: "light".to_string(),
@@ -644,7 +748,6 @@ mod tests {
             script_args: "input.txt /v".to_string(),
             watches: vec!["total + 1".to_string(), "p.Name".to_string()],
             dock_state: "{\"center\":{}}".to_string(),
-            side_dock: "right".to_string(),
             editor: EditorSettings {
                 font_size: 17.5,
                 soft_wrap: true,
@@ -663,11 +766,82 @@ mod tests {
                 show_timestamps: true,
                 max_lines: 512,
             },
+            ai: AiSettings {
+                base_url: "https://example.com/v1".to_string(),
+                model: "deepseek-reasoner".to_string(),
+                approval: AiApproval::Auto,
+            },
             window_bounds: Some((120.0, 90.0, 1280.0, 800.0)),
             settings_size: Some((900.0, 640.0)),
         };
 
         assert_eq!(Layout::parse(&layout.to_text()), layout);
+    }
+
+    #[test]
+    fn ai_panel_state_survives_a_round_trip() {
+        let layout = Layout {
+            ai_width: 412.0,
+            right_panel: Some(PanelKind::Ai),
+            ..Layout::default()
+        };
+        let parsed = Layout::parse(&layout.to_text());
+        assert_eq!(parsed.ai_width, 412.0);
+        assert_eq!(parsed.right_panel, Some(PanelKind::Ai));
+
+        // 旧布局文件没有 AI 面板的键：默认不占用右侧空间。
+        let parsed = Layout::parse("show_explorer=1\n");
+        assert_eq!(parsed.ai_width, ui_theme::AI_WIDTH);
+        assert_eq!(parsed.left_panel, Some(PanelKind::Explorer));
+        assert_eq!(parsed.right_panel, None);
+    }
+
+    #[test]
+    fn ai_settings_survive_a_round_trip_without_api_key() {
+        let layout = Layout {
+            ai: AiSettings {
+                base_url: "https://api.deepseek.com/v1".to_string(),
+                model: "deepseek-reasoner".to_string(),
+                approval: AiApproval::Auto,
+            },
+            ..Layout::default()
+        };
+        let parsed = Layout::parse(&layout.to_text());
+        assert_eq!(parsed.ai, layout.ai);
+        assert!(layout.to_text().contains("ai_approval=auto"));
+
+        // 旧布局里没有 AI 键时使用默认值。
+        let parsed = Layout::parse("explorer_width=300\n");
+        assert_eq!(parsed.ai, AiSettings::default());
+        // 布局文件里不允许出现 API Key 字段。
+        assert!(!layout.to_text().contains("api_key"));
+    }
+
+    #[test]
+    fn empty_slots_survive_a_round_trip() {
+        let layout = Layout {
+            left_panel: None,
+            right_panel: None,
+            ..Layout::default()
+        };
+        let parsed = Layout::parse(&layout.to_text());
+        assert_eq!(parsed.left_panel, None);
+        assert_eq!(parsed.right_panel, None);
+    }
+
+    #[test]
+    fn legacy_show_flags_are_converted_to_left_and_right_slots() {
+        // 旧文件把侧栏面板与 AI 都记成“显示”：一侧只留一个，AI 留在右侧，
+        // 旧版停靠在右侧的侧栏面板让到左侧。
+        let parsed = Layout::parse(
+            "show_explorer=1\nshow_outline=1\nshow_ai=1\nside_dock=right\n",
+        );
+        assert_eq!(parsed.left_panel, Some(PanelKind::Explorer));
+        assert_eq!(parsed.right_panel, Some(PanelKind::Ai));
+
+        let parsed = Layout::parse("show_outline=1\nside_dock=right\n");
+        assert_eq!(parsed.left_panel, None);
+        assert_eq!(parsed.right_panel, Some(PanelKind::Outline));
     }
 
     #[test]
@@ -836,9 +1010,10 @@ mod tests {
     }
 
     #[test]
-    fn older_layouts_keep_default_outline_state_and_width() {
-        let layout = Layout::parse("show_explorer=0\n");
-        assert!(layout.show_outline);
+    fn older_layouts_without_visible_panels_leave_both_sides_empty() {
+        let layout = Layout::parse("show_explorer=0\nshow_outline=0\nshow_search=0\n");
+        assert_eq!(layout.left_panel, None);
+        assert_eq!(layout.right_panel, None);
         assert_eq!(layout.outline_width, ui_theme::OUTLINE_WIDTH);
     }
 

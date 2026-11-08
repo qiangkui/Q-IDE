@@ -116,6 +116,9 @@ impl Checker {
                             self.check_expr(upper, names, *line);
                         }
                     }
+                    if let Some(initializer) = &item.initializer {
+                        self.check_expr(initializer, names, *line);
+                    }
                 }
             }
             Stmt::Const { value, line, .. } => self.check_expr(value, names, *line),
@@ -440,6 +443,11 @@ impl Checker {
     fn check_expr(&mut self, expr: &Expr, names: &HashSet<String>, line: usize) {
         match expr {
             Expr::Literal(_) | Expr::NewObject(_) | Expr::AddressOf(_) => {}
+            Expr::ArrayLiteral(items) => {
+                for item in items {
+                    self.check_expr(item, names, line);
+                }
+            }
             Expr::Var(name) => self.check_undefined(name, names, line, "未声明的变量"),
             Expr::Member { base, .. } => self.check_expr(base, names, line),
             Expr::MemberIndex { base, indices, .. } => {

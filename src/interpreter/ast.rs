@@ -145,6 +145,8 @@ pub struct Declared {
     pub record: Option<String>,
     /// `Some([])` 表示动态数组 `a()`，`Some(bounds)` 表示带边界的数组，`None` 是标量。
     pub bounds: Option<Vec<(Expr, Expr)>>,
+    /// `Dim arr As Integer() = {1, 2, 3}`：声明时的初值。
+    pub initializer: Option<Expr>,
     /// `Dim c As New Collection`：声明时立即创建对象。
     pub new_object: Option<NewObject>,
     /// `WithEvents m As Foo`：类里的字段要接收 `Foo` 的 `RaiseEvent`。
@@ -192,6 +194,8 @@ pub enum BinOp {
 #[derive(Clone, Debug)]
 pub enum Expr {
     Literal(Value),
+    /// `{1, 2, 3}`：数组字面量（VB.NET 风格，等价于 `Array(1, 2, 3)`）。
+    ArrayLiteral(Vec<Expr>),
     Var(String),
     /// `p.X`：读取记录的字段。
     Member {
