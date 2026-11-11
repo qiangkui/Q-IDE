@@ -154,6 +154,24 @@ impl CustomTheme {
                 _ => {}
             }
         }
+        // 深色主题（含自定义深色主题）里，侧栏面板内容区跟随窗口底色。
+        palette.side_panel_bg = if self.dark {
+            palette.window_bg
+        } else {
+            palette.panel_bg
+        };
+        // 深色主题的编辑框比窗口再深一档；浅色主题保持原来的窗口底色。
+        palette.editor_bg = if self.dark {
+            palette.panel_bg
+        } else {
+            palette.window_bg
+        };
+        // 气泡/卡片仍然要和内容区拉开一档：深色用原来的内容区底色，浅色用侧栏底色。
+        palette.side_panel_raised_bg = if self.dark {
+            palette.panel_bg
+        } else {
+            palette.sidebar_bg
+        };
         palette
     }
 }

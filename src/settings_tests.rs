@@ -175,7 +175,8 @@ fn auto_save_is_off_by_default() {
 #[test]
 fn ai_settings_fall_back_to_deepseek_defaults() {
     use crate::settings::{
-        AiApproval, AiRoundLimit, AiSettings, DEFAULT_AI_BASE_URL, DEFAULT_AI_MODEL,
+        AiApproval, AiRoundLimit, AiSettings, DEFAULT_AI_BASE_URL, DEFAULT_AI_FONT_SIZE,
+        DEFAULT_AI_MODEL,
     };
 
     let ai = AiSettings::default();
@@ -183,9 +184,10 @@ fn ai_settings_fall_back_to_deepseek_defaults() {
     assert_eq!(ai.model, DEFAULT_AI_MODEL);
     assert_eq!(ai.effective_base_url(), DEFAULT_AI_BASE_URL);
     assert_eq!(ai.effective_model(), DEFAULT_AI_MODEL);
-    // 默认每次写入前确认，工具最多连续跑 6 轮。
+    // 默认每次写入前确认，工具最多连续跑 6 轮，对话字号与原 text_xs 一致。
     assert_eq!(ai.approval, AiApproval::Ask);
     assert_eq!(ai.round_limit, AiRoundLimit::Six);
+    assert_eq!(ai.font_size, DEFAULT_AI_FONT_SIZE);
 
     // 设置窗口里清空输入不应该让请求打到空地址或空模型。
     let blank = AiSettings {

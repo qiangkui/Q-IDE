@@ -22,6 +22,8 @@ pub fn render(palette: Palette, maximized: bool, menu_bar: impl IntoElement) -> 
                 .h(px(ui_theme::TITLE_BAR_HEIGHT))
                 .flex_shrink_0()
                 .items_center()
+                // 内容整体下移一点，视觉上更居中于系统窗口边缘。
+                .pt(px(4.0))
                 .pr(px(6.0))
                 .child(
                     img("app-icon.png")
@@ -35,6 +37,7 @@ pub fn render(palette: Palette, maximized: bool, menu_bar: impl IntoElement) -> 
                 .h(px(ui_theme::TITLE_BAR_HEIGHT))
                 .flex_shrink_0()
                 .items_center()
+                .pt(px(4.0))
                 .child(menu_bar),
         )
         .child(

@@ -12,9 +12,11 @@ use crate::settings::ThemeChoice;
 /// 界面配色。渲染时通过 [`Palette::for_theme`] 取当前主题对应的一组颜色。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Palette {
-    /// 窗口底色，比组件更暗。
+    /// 主窗口底色；暗色主题下与侧边栏（资源管理器）同色。
     pub window_bg: u32,
-    /// 活动栏（最左侧图标栏）的背景色。
+    /// 代码编辑框、路径栏与当前标签的底色；暗色主题下比窗口背景稍深一档。
+    pub editor_bg: u32,
+    /// 活动栏（最左侧图标栏）的背景色；暗色主题下与侧边栏同色。
     pub activity_bar_bg: u32,
     /// 活动栏选中按钮的背景：用偏白的高亮，避免看起来像按下变暗。
     pub activity_bar_selected: u32,
@@ -22,6 +24,14 @@ pub struct Palette {
     pub sidebar_bg: u32,
     /// 组件内容区（树形框、输出日志）的背景色。
     pub panel_bg: u32,
+    /// 资源管理器、代码大纲、AI 等侧栏面板内容区的底色。
+    ///
+    /// 深色主题下与窗口背景一致，浅色主题沿用 [`Self::panel_bg`]。
+    pub side_panel_bg: u32,
+    /// 侧栏面板里需要与内容区底色区分的气泡、确认卡片底色。
+    ///
+    /// 深色主题下用原来的内容区底色，浅色主题下用侧栏底色。
+    pub side_panel_raised_bg: u32,
     /// 弹出菜单、下拉菜单的背景色。
     pub popover_bg: u32,
     /// 标题栏文字。
@@ -69,11 +79,15 @@ pub struct Palette {
 impl Palette {
     pub const fn dark() -> Self {
         Self {
-            window_bg: 0x181818,
-            activity_bar_bg: 0x2d2d2d,
+            // 暗色主题下主窗口与侧边栏（资源管理器）同色，整窗更统一。
+            window_bg: 0x252526,
+            editor_bg: 0x1f1f1f,
+            activity_bar_bg: 0x252526,
             activity_bar_selected: 0xffffff33,
             sidebar_bg: 0x252526,
             panel_bg: 0x1f1f1f,
+            side_panel_bg: 0x252526,
+            side_panel_raised_bg: 0x1f1f1f,
             popover_bg: 0x252526,
             title_text: 0xcccccc,
             menu_text: 0xa0a0a0,
@@ -102,10 +116,13 @@ impl Palette {
     pub const fn light() -> Self {
         Self {
             window_bg: 0xf3f3f3,
+            editor_bg: 0xf3f3f3,
             activity_bar_bg: 0xe7e7e7,
             activity_bar_selected: 0xffffffd9,
             sidebar_bg: 0xf8f8f8,
             panel_bg: 0xffffff,
+            side_panel_bg: 0xffffff,
+            side_panel_raised_bg: 0xf8f8f8,
             popover_bg: 0xffffff,
             title_text: 0x333333,
             menu_text: 0x5a5a5a,
@@ -183,7 +200,7 @@ pub fn active(cx: &App) -> ActivePalette {
 }
 
 /// 标题栏高度。
-pub const TITLE_BAR_HEIGHT: f32 = 34.0;
+pub const TITLE_BAR_HEIGHT: f32 = 28.0;
 /// 标题栏顶部留白，让出系统边框的缩放热区。
 pub const TITLE_BAR_INSET: f32 = 8.0;
 pub const WINDOW_BUTTON_WIDTH: f32 = 44.0;
@@ -213,6 +230,10 @@ pub const OUTPUT_MIN_HEIGHT: f32 = 80.0;
 pub const PANE_GAP: f32 = 8.0;
 /// 面板之间的可见间隔；面板自身向内缩 `PANEL_GAP / 2`。
 pub const PANEL_GAP: f32 = 6.0;
+/// 内容区与底部状态栏之间的间隙，比面板间距更小。
+pub const STATUS_BAR_GAP: f32 = 4.0;
+/// 标题栏与下方内容区之间的间隙，比面板间距更小。
+pub const CONTENT_TOP_GAP: f32 = 4.0;
 /// 各区域的圆角半径。
 pub const PANE_RADIUS: f32 = 8.0;
 /// 标签栏高度；标签铺满整个高度。
@@ -260,7 +281,7 @@ pub fn apply(active: ActivePalette, cx: &mut App) {
         theme.accent = Hsla::from(rgb(palette.menu_item_active));
         Arc::make_mut(&mut theme.highlight_theme)
             .style
-            .editor_background = Some(Hsla::from(rgb(palette.window_bg)));
+            .editor_background = Some(Hsla::from(rgb(palette.editor_bg)));
     });
     cx.set_global(active);
 }

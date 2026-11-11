@@ -671,25 +671,26 @@ impl AiPanel {
         cx: &Context<Self>,
     ) -> AnyElement {
         let is_user = matches!(message.role, Role::User);
+        let font_size = chat_font_size(cx);
         let bubble_bg = if is_user {
             palette.menu_item_active
         } else {
-            palette.sidebar_bg
+            palette.side_panel_raised_bg
         };
 
         let thinking = !is_user && self.pending && message.content.is_empty();
         let content: AnyElement = if thinking {
             div()
-                .text_xs()
+                .text_size(font_size)
                 .text_color(rgb(palette.muted_text))
                 .child("正在思考…")
                 .into_any_element()
         } else if is_user {
-            text_block(segment_id(index, 0), &message.content, palette)
+            text_block(segment_id(index, 0), &message.content, palette, font_size)
         } else {
             let segments = markdown::split(&message.content);
             if segments.is_empty() {
-                div().text_xs().into_any_element()
+                div().text_size(font_size).into_any_element()
             } else {
                 let mut blocks = v_flex().gap_2().min_w_0();
                 for (segment_index, segment) in segments.into_iter().enumerate() {
@@ -698,6 +699,7 @@ impl AiPanel {
                         segment_index,
                         segment,
                         palette,
+                        font_size,
                         cx,
                     ));
                 }
@@ -716,7 +718,7 @@ impl AiPanel {
                     .py(px(6.0))
                     .rounded(px(8.0))
                     .bg(rgb(bubble_bg))
-                    .text_xs()
+                    .text_size(font_size)
                     .text_color(rgb(palette.sidebar_text))
                     .child(content),
             )
@@ -730,11 +732,12 @@ impl AiPanel {
         segment: usize,
         seg: Segment,
         palette: &Palette,
+        font_size: Pixels,
         cx: &Context<Self>,
     ) -> AnyElement {
         let (language, code) = match seg {
             Segment::Text(text) => {
-                return text_block(segment_id(message, segment), &text, palette);
+                return text_block(segment_id(message, segment), &text, palette, font_size);
             }
             Segment::Code { language, code, .. } => (language, code),
         };
@@ -804,7 +807,7 @@ impl AiPanel {
             .min_w_0()
             .child(
                 TextView::markdown(segment_id(message, segment), body)
-                    .text_xs()
+                    .text_size(font_size)
                     .style(code_text_style(palette)),
             )
             .child(controls)
@@ -872,6 +875,7 @@ impl Focusable for AiPanel {
 impl Render for AiPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::for_theme(cx);
+        let chat_font = chat_font_size(cx);
         let panel_id = PanelId::from(cx.entity().entity_id());
         let drag = self
             .group
@@ -954,14 +958,14 @@ impl Render for AiPanel {
             && self.notice.is_none()
             && self.approval.is_none();
         let body: AnyElement = if empty {
-            placeholder(palette).into_any_element()
+            placeholder(palette, chat_font).into_any_element()
         } else {
             let bubbles: Vec<AnyElement> = self
                 .messages
                 .iter()
                 .enumerate()
                 .map(|(index, entry)| match entry.message.role {
-                    Role::Tool => tool_row(entry, &palette),
+                    Role::Tool => tool_row(entry, &palette, chat_font),
                     // 只调用工具、没有正文的助手消息不必占一个空气泡。
                     Role::Assistant
                         if !self.pending && entry.message.content.trim().is_empty() =>
@@ -973,12 +977,12 @@ impl Render for AiPanel {
                 .collect();
             let mut list = v_flex().gap_2().w_full().children(bubbles);
             if let Some(pending) = &self.approval {
-                list = list.child(approval_card(pending, &palette, cx));
+                list = list.child(approval_card(pending, &palette, chat_font, cx));
             }
             if let Some(error) = &self.error {
                 list = list.child(
                     div()
-                        .text_xs()
+                        .text_size(chat_font)
                         .text_color(rgb(palette.error))
                         .child(error.clone()),
                 );
@@ -986,7 +990,7 @@ impl Render for AiPanel {
             if let Some(notice) = &self.notice {
                 list = list.child(
                     div()
-                        .text_xs()
+                        .text_size(chat_font)
                         .text_color(rgb(palette.muted_text))
                         .child(notice.clone()),
                 );
@@ -998,7 +1002,7 @@ impl Render for AiPanel {
                 .min_h_0()
                 .overflow_y_scroll()
                 .track_scroll(&self.scroll)
-                .bg(rgb(palette.panel_bg))
+                .bg(rgb(palette.side_panel_bg))
                 .p(px(10.0))
                 .child(list)
                 .into_any_element()
@@ -1009,7 +1013,7 @@ impl Render for AiPanel {
         let mut input = Input::new(&self.input)
             .xsmall()
             .cleanable(true)
-            .bg(rgb(palette.panel_bg))
+            .bg(rgb(palette.side_panel_bg))
             // 不要组件自带的聚焦外圈：焦点只用更亮的边框表示。
             .focus_ring(false);
         if focused {
@@ -1031,7 +1035,7 @@ impl Render for AiPanel {
             .py(px(6.0))
             .border_t_1()
             .border_color(rgba(palette.border))
-            .bg(rgb(palette.panel_bg))
+            .bg(rgb(palette.side_panel_bg))
             .on_action(move |_: &Escape, window, cx| escape(window, cx))
             .on_action(cx.listener(|this, _: &Enter, window, cx| this.send(window, cx)))
             .child(div().flex_1().min_w_0().child(input))
@@ -1139,7 +1143,7 @@ impl Render for AiPanel {
             .pb(px(6.0))
             .gap_1()
             .items_center()
-            .bg(rgb(palette.panel_bg))
+            .bg(rgb(palette.side_panel_bg))
             .child(mode_button)
             .child(round_button)
             .child(model_button);
@@ -1166,7 +1170,7 @@ impl Render for AiPanel {
 }
 
 /// 还没有对话时居中显示的提示。
-fn placeholder(palette: Palette) -> impl IntoElement {
+fn placeholder(palette: Palette, font_size: Pixels) -> impl IntoElement {
     v_flex()
         .flex_1()
         .w_full()
@@ -1175,24 +1179,24 @@ fn placeholder(palette: Palette) -> impl IntoElement {
         .justify_center()
         .gap_2()
         .px(px(16.0))
-        .bg(rgb(palette.panel_bg))
+        .bg(rgb(palette.side_panel_bg))
         .child(Icon::new(IconName::Bot).text_color(rgb(palette.muted_text)))
         .child(
             div()
-                .text_xs()
+                .text_size(font_size)
                 .text_color(rgb(palette.sidebar_text))
                 .child("AI 编程助手"),
         )
         .child(
             div()
-                .text_xs()
+                .text_size(font_size)
                 .text_color(rgb(palette.muted_text))
                 .child("在下面输入需求，按回车发给 DeepSeek"),
         )
 }
 
 /// 工具调用的一行活动记录。
-fn tool_row(entry: &ChatEntry, palette: &Palette) -> AnyElement {
+fn tool_row(entry: &ChatEntry, palette: &Palette, font_size: Pixels) -> AnyElement {
     let note = entry
         .note
         .clone()
@@ -1204,7 +1208,7 @@ fn tool_row(entry: &ChatEntry, palette: &Palette) -> AnyElement {
         .child(
             div()
                 .flex_shrink_0()
-                .text_xs()
+                .text_size(font_size)
                 .text_color(rgb(palette.muted_text))
                 .child("·"),
         )
@@ -1212,7 +1216,7 @@ fn tool_row(entry: &ChatEntry, palette: &Palette) -> AnyElement {
             div()
                 .min_w_0()
                 .truncate()
-                .text_xs()
+                .text_size(font_size)
                 .text_color(rgb(palette.muted_text))
                 .child(note),
         )
@@ -1220,7 +1224,12 @@ fn tool_row(entry: &ChatEntry, palette: &Palette) -> AnyElement {
 }
 
 /// 写入确认卡片。
-fn approval_card(pending: &PendingWrite, palette: &Palette, cx: &Context<AiPanel>) -> AnyElement {
+fn approval_card(
+    pending: &PendingWrite,
+    palette: &Palette,
+    font_size: Pixels,
+    cx: &Context<AiPanel>,
+) -> AnyElement {
     v_flex()
         .w_full()
         .gap_2()
@@ -1228,16 +1237,16 @@ fn approval_card(pending: &PendingWrite, palette: &Palette, cx: &Context<AiPanel
         .rounded(px(8.0))
         .border_1()
         .border_color(rgba(palette.border))
-        .bg(rgb(palette.sidebar_bg))
+        .bg(rgb(palette.side_panel_raised_bg))
         .child(
             div()
-                .text_xs()
+                .text_size(font_size)
                 .text_color(rgb(palette.sidebar_text))
                 .child("AI 想修改文件"),
         )
         .child(
             div()
-                .text_xs()
+                .text_size(font_size)
                 .text_color(rgb(palette.muted_text))
                 .child(pending.summary.clone()),
         )
@@ -1281,12 +1290,22 @@ fn write_id(message: usize, segment: usize) -> SharedString {
 }
 
 /// 说明文字：Markdown 渲染，可拖选后用 Ctrl+C 复制。
-fn text_block(id: impl Into<ElementId>, text: &str, palette: &Palette) -> AnyElement {
+fn text_block(
+    id: impl Into<ElementId>,
+    text: &str,
+    palette: &Palette,
+    font_size: Pixels,
+) -> AnyElement {
     TextView::markdown(id, text.to_string())
-        .text_xs()
+        .text_size(font_size)
         .text_color(rgb(palette.sidebar_text))
         .style(code_text_style(palette))
         .into_any_element()
+}
+
+/// AI 对话区的字号，来自「设置 → AI」。
+fn chat_font_size(cx: &App) -> Pixels {
+    px(SettingsStore::snapshot(cx).ai.font_size as f32)
 }
 
 /// 代码块底色：在气泡底色上每个通道再压暗一点，暗色 / 浅色主题都合适。

@@ -833,7 +833,7 @@ pub fn render(
             .flex()
             .items_center()
             .justify_center()
-            .bg(rgb(palette.panel_bg))
+            .bg(rgb(palette.side_panel_bg))
             .child(
                 div()
                     .text_sm()
@@ -850,7 +850,7 @@ pub fn render(
             .flex()
             .items_center()
             .justify_center()
-            .bg(rgb(palette.panel_bg))
+            .bg(rgb(palette.side_panel_bg))
             .child(
                 div()
                     .text_sm()
@@ -958,7 +958,7 @@ pub fn render(
                                     .cursor(CursorStyle::PointingHand)
                                     .hover(move |this| this.bg(rgba(palette.hover)))
                                     .child(
-                                        Icon::new(IconName::Close)
+                                        Icon::new(IconName::ChevronDown)
                                             .xsmall()
                                             .text_color(rgb(palette.sidebar_text)),
                                     )
@@ -1097,7 +1097,7 @@ fn log_body(
                 .size_full()
                 .overflow_y_scroll()
                 .track_scroll(log.scroll_handle())
-                .bg(rgb(palette.panel_bg))
+                .bg(rgb(palette.side_panel_bg))
                 .p(px(12.0))
                 .font_family(ui_theme::MONO_FONT)
                 .text_size(px(font_size))

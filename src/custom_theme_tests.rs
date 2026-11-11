@@ -185,6 +185,38 @@ fn palette_applies_overrides_on_top_of_the_base() {
 }
 
 #[test]
+fn side_panels_follow_the_window_in_dark_themes() {
+    // 内置深色：资源管理器/代码大纲/AI 面板的内容区与窗口同色；浅色保持原内容区底色。
+    assert_eq!(Palette::dark().side_panel_bg, Palette::dark().window_bg);
+    assert_eq!(Palette::light().side_panel_bg, Palette::light().panel_bg);
+    // 气泡/卡片仍比内容区高出一档，避免和面板底色混在一起。
+    assert_eq!(
+        Palette::dark().side_panel_raised_bg,
+        Palette::dark().panel_bg
+    );
+    assert_eq!(
+        Palette::light().side_panel_raised_bg,
+        Palette::light().sidebar_bg
+    );
+    // 编辑框比窗口背景稍深；浅色保持原来的窗口底色。
+    assert_eq!(Palette::dark().editor_bg, Palette::dark().panel_bg);
+    assert_eq!(Palette::light().editor_bg, Palette::light().window_bg);
+
+    // 自定义主题沿用同样的规则：深色跟随窗口底色，浅色跟随内容区底色。
+    let dark = ThemeStore::parse("theme=深蓝\nbase=dark\nwindow_bg=#000010\n");
+    let palette = dark.find("深蓝").expect("应解析出主题").palette();
+    assert_eq!(palette.side_panel_bg, 0x000010);
+    assert_eq!(palette.side_panel_raised_bg, palette.panel_bg);
+    assert_eq!(palette.editor_bg, palette.panel_bg);
+
+    let light = ThemeStore::parse("theme=米色\nbase=light\nwindow_bg=#111111\n");
+    let palette = light.find("米色").expect("应解析出主题").palette();
+    assert_eq!(palette.side_panel_bg, Palette::light().panel_bg);
+    assert_eq!(palette.side_panel_raised_bg, palette.sidebar_bg);
+    assert_eq!(palette.editor_bg, 0x111111);
+}
+
+#[test]
 fn theme_store_saves_and_loads_from_disk() {
     let dir = temp_dir("disk");
     let file = dir.join("themes.txt");

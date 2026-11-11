@@ -289,7 +289,9 @@ impl Render for CodeWindow {
                     .items_stretch()
                     .flex_1()
                     .min_h_0()
-                    .p(px(ui_theme::PANE_GAP))
+                    .px(px(ui_theme::PANE_GAP))
+                    .pt(px(ui_theme::CONTENT_TOP_GAP))
+                    .pb(px(ui_theme::STATUS_BAR_GAP))
                     .child(self.activity_bar(cx, &appearance))
                     // 左面板自身还会向内缩 PANEL_GAP/2，这里的间隔只补一半，
                     // 活动栏与面板之间的可见间距才和其他面板之间一致。

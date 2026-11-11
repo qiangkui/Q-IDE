@@ -978,7 +978,7 @@ pub fn render(
                 .flex_1()
                 .min_h_0()
                 .overflow_y_scroll()
-                .bg(rgb(palette.panel_bg))
+                .bg(rgb(palette.side_panel_bg))
                 .child(body),
         )
         .into_any_element()

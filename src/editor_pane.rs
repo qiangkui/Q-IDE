@@ -133,7 +133,7 @@ pub fn render(
         .size_full()
         .min_w_0()
         .min_h_0()
-        .bg(rgb(palette.window_bg))
+        .bg(rgb(palette.editor_bg))
         .rounded(px(ui_theme::PANE_RADIUS))
         .border_1()
         .border_color(rgba(palette.border))
@@ -275,7 +275,7 @@ fn path_bar(path: &str, palette: Palette) -> AnyElement {
         .items_center()
         .gap_1()
         .px(px(10.0))
-        .bg(rgb(palette.window_bg));
+        .bg(rgb(palette.editor_bg));
     if !dir.is_empty() {
         bar = bar.child(
             div()
@@ -345,7 +345,7 @@ fn tab_strip(
                 .pr(px(4.0))
                 .rounded_t(px(6.0))
                 .cursor(CursorStyle::PointingHand)
-                .when(is_active, |this| this.bg(rgb(palette.window_bg)))
+                .when(is_active, |this| this.bg(rgb(palette.editor_bg)))
                 .when(!is_active, |this| {
                     this.hover(move |style| style.bg(rgba(palette.hover)))
                 })

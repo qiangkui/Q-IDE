@@ -347,6 +347,11 @@ impl Layout {
                 "ai_round_limit" => {
                     layout.ai.round_limit = crate::settings::AiRoundLimit::from_str(&value)
                 }
+                "ai_font_size" => {
+                    if let Ok(size) = value.parse::<u32>() {
+                        layout.ai.font_size = size.clamp(8, 32);
+                    }
+                }
                 "roots" => declared_roots = value.parse::<usize>().ok(),
                 "root" => {
                     saw_root = true;
@@ -590,6 +595,7 @@ impl Layout {
             "ai_round_limit={}\n",
             self.ai.round_limit.as_str()
         ));
+        out.push_str(&format!("ai_font_size={}\n", self.ai.font_size));
         out.push_str(&format!("roots={}\n", self.roots.len()));
         for root in &self.roots {
             out.push_str(&format!("root=dir:{}\n", escape(root)));
@@ -778,6 +784,7 @@ mod tests {
                 model: "deepseek-reasoner".to_string(),
                 approval: AiApproval::Auto,
                 round_limit: AiRoundLimit::Twelve,
+                font_size: 16,
             },
             window_bounds: Some((120.0, 90.0, 1280.0, 800.0)),
             settings_size: Some((900.0, 640.0)),
@@ -812,6 +819,7 @@ mod tests {
                 model: "deepseek-reasoner".to_string(),
                 approval: AiApproval::Auto,
                 round_limit: AiRoundLimit::Twelve,
+                font_size: 15,
             },
             ..Layout::default()
         };
@@ -819,6 +827,7 @@ mod tests {
         assert_eq!(parsed.ai, layout.ai);
         assert!(layout.to_text().contains("ai_approval=auto"));
         assert!(layout.to_text().contains("ai_round_limit=12"));
+        assert!(layout.to_text().contains("ai_font_size=15"));
 
         // 旧布局里没有 AI 键时使用默认值。
         let parsed = Layout::parse("explorer_width=300\n");
@@ -889,11 +898,12 @@ mod tests {
     #[test]
     fn settings_values_are_clamped_on_load() {
         let layout = Layout::parse(
-            "editor_font_size=1\neditor_auto_save_interval=0\noutput_max_lines=1\n",
+            "editor_font_size=1\neditor_auto_save_interval=0\noutput_max_lines=1\nai_font_size=99\n",
         );
         assert_eq!(layout.editor.font_size, 8.0);
         assert_eq!(layout.editor.auto_save_interval_secs, 5);
         assert_eq!(layout.output.max_lines, 100);
+        assert_eq!(layout.ai.font_size, 32);
     }
 
     #[test]

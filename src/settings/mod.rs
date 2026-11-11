@@ -396,6 +396,9 @@ pub const DEFAULT_AI_BASE_URL: &str = "https://api.deepseek.com";
 /// DeepSeek 的默认模型。
 pub const DEFAULT_AI_MODEL: &str = "deepseek-chat";
 
+/// AI 对话区的默认字号（像素），与 `text_xs` 的视觉大小一致。
+pub const DEFAULT_AI_FONT_SIZE: u32 = 12;
+
 /// AI 面板底部「模型」下拉里列出的常用模型：`(值, 界面文字)`。
 pub const AI_MODEL_OPTIONS: &[(&str, &str)] = &[
     ("deepseek-chat", "deepseek-chat（对话）"),
@@ -518,6 +521,8 @@ pub struct AiSettings {
     pub approval: AiApproval,
     /// 一次提问里最多连续跑多少轮工具调用。
     pub round_limit: AiRoundLimit,
+    /// 对话区（消息、代码块、提示）的字号，单位像素。
+    pub font_size: u32,
 }
 
 impl Default for AiSettings {
@@ -527,6 +532,7 @@ impl Default for AiSettings {
             model: DEFAULT_AI_MODEL.to_string(),
             approval: AiApproval::default(),
             round_limit: AiRoundLimit::default(),
+            font_size: DEFAULT_AI_FONT_SIZE,
         }
     }
 }

@@ -1020,7 +1020,7 @@ impl Render for OutlinePanel {
             let mut input = Input::new(&self.filter)
                 .xsmall()
                 .cleanable(true)
-                .bg(rgb(palette.panel_bg))
+                .bg(rgb(palette.side_panel_bg))
                 // 不要组件自带的聚焦外圈：焦点只用更亮的边框表示。
                 .focus_ring(false);
             if filter_focused {
@@ -1030,7 +1030,7 @@ impl Render for OutlinePanel {
                 .px(px(8.0))
                 .pt(px(6.0))
                 .pb(px(2.0))
-                .bg(rgb(palette.panel_bg))
+                .bg(rgb(palette.side_panel_bg))
                 .child(input)
                 .into_any_element()
         });
@@ -1597,7 +1597,7 @@ impl DockPanel for OutputPanel {
             Button::new("output-close")
                 .ghost()
                 .xsmall()
-                .icon(IconName::Close)
+                .icon(IconName::ChevronDown)
                 .on_click(|_, _, cx| {
                     SettingsStore::update(cx, |settings| {
                         settings.appearance.show_output = false;

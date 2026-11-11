@@ -190,6 +190,14 @@ impl Render for SettingsWindow {
                 "设置",
             ))
             .child(
+                // 标题栏与下方内容之间的一条细横线。
+                div()
+                    .h(px(1.0))
+                    .w_full()
+                    .flex_shrink_0()
+                    .bg(rgba(palette.border)),
+            )
+            .child(
                 div()
                     .flex_1()
                     .min_h_0()
@@ -425,6 +433,20 @@ fn build_pages(
                         )
                         .description("默认 deepseek-chat，也可以填 deepseek-reasoner（推理模型不支持改文件）；AI 面板底部也能切换"),
                     ]),
+            )
+            .group(
+                SettingGroup::new()
+                    .title("对话")
+                    .items([number_item(
+                        store,
+                        "字号",
+                        8.0,
+                        32.0,
+                        1.0,
+                        |s| s.ai.font_size as f64,
+                        |s, v| s.ai.font_size = v.round() as u32,
+                    )
+                    .description("AI 对话区的文字大小，包含消息、代码块和提示")]),
             ),
     ]
 }
