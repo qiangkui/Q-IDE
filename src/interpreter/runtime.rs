@@ -333,6 +333,10 @@ pub struct Runtime<'p, 'o> {
     started: Instant,
     /// `Dir()` 的遍历状态：第一次带路径调用时建立，之后无参调用依次往后取。
     dir: Option<builtins::DirState>,
+    /// `StrPtr` 返回的 UTF-16 缓冲区，保持到脚本结束，避免指针悬空。
+    strings: Vec<Vec<u16>>,
+    /// 存进结构体/变量后仍要被系统回调的 `AddressOf` 跳板，保持到脚本结束。
+    persistent_callbacks: Vec<PersistentCallback>,
     /// 事件订阅表：源实例 → 订阅它的 `WithEvents` 对象（弱引用，随对象一起消失）。
     events: HashMap<usize, Vec<Weak<RefCell<VbInstance>>>>,
     /// 调试控制器；普通运行时为 `None`。
@@ -345,6 +349,21 @@ pub struct Runtime<'p, 'o> {
     script_dir: PathBuf,
     /// 脚本视角的当前目录：相对路径按它解析，`ChDir` 只改它不动进程 CWD。
     cwd: PathBuf,
+}
+
+impl Drop for Runtime<'_, '_> {
+    fn drop(&mut self) {
+        // 脚本结束/中止时窗口可能还活着，系统之后仍可能回调：
+        // 跳板与上下文留到进程结束，回调入口会用 `ACTIVE_RUNTIME` 判断并直接返回 0。
+        for callback in &mut self.persistent_callbacks {
+            if let Some(context) = callback.context.take() {
+                std::mem::forget(context);
+            }
+            if let Some(trampoline) = callback.trampoline.take() {
+                std::mem::forget(trampoline);
+            }
+        }
+    }
 }
 
 thread_local! {
@@ -446,6 +465,8 @@ pub fn run_program(
         rng: 0x9E37_79B9_7F4A_7C15,
         started: Instant::now(),
         dir: None,
+        strings: Vec::new(),
+        persistent_callbacks: Vec::new(),
         events: HashMap::new(),
         debug,
         evaluating: false,
@@ -457,9 +478,13 @@ pub fn run_program(
     // 脚本执行期间让 `Class_Terminate` 能找到解释器；结束时先释放变量再撤回指针。
     let engine = &mut runtime as *mut Runtime<'_, '_> as *mut ();
     let previous = ACTIVE_RUNTIME.with(|slot| slot.replace(engine));
+    // 模块级只有声明（变量/常量）时仍自动调用 `Main`；有可执行的模块级语句时按脚本顺序执行。
+    let module_only_declarations = program
+        .main
+        .iter()
+        .all(|stmt| matches!(stmt, Stmt::Dim { .. } | Stmt::Const { .. }));
     let outcome = runtime.exec_block(&program.main).and_then(|_| {
-        // 只有 `Sub Main` 没有模块级语句时，自动调用 `Main`。
-        if program.main.is_empty()
+        if module_only_declarations
             && let Some(main) = program.procedures.iter().find(|procedure| {
                 procedure.name == "main" && !procedure.is_function && !procedure.is_let
             })
@@ -3201,6 +3226,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 failure: None,
                 command: &self.command_line,
                 cwd: &mut self.cwd,
+                strings: &mut self.strings,
             };
             let outcome = builtins::call(name, values, &mut ctx);
             let failure = ctx.failure;
@@ -3555,6 +3581,18 @@ impl<'p, 'o> Runtime<'p, 'o> {
             values.push(ffi::Arg::ByVal(self.eval(expr, line)?));
         }
 
+        // 结构体里存着的 `AddressOf`：API 可能把指针保存下来以后再回调，
+        // 所以这里换成整次脚本运行期间都有效的跳板。
+        for value in &values {
+            match value {
+                ffi::Arg::ByVal(value) => self.materialize_record_callbacks(value, line)?,
+                ffi::Arg::ByRef(slot) => {
+                    self.materialize_record_callbacks(&slot.value(), line)?;
+                }
+                ffi::Arg::Callback(_) => {}
+            }
+        }
+
         // `AddressOf` 实参：现场生成跳板，调用返回后立刻释放。
         let mut contexts: Vec<Box<CallbackCtx>> = Vec::new();
         let mut trampolines: Vec<Trampoline> = Vec::new();
@@ -3610,6 +3648,15 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 return Err(error);
             }
         }
+        for callback in &self.persistent_callbacks {
+            if let Some(error) = callback
+                .context
+                .as_ref()
+                .and_then(|context| context.error.take())
+            {
+                return Err(error);
+            }
+        }
         outcome
     }
 
@@ -3621,10 +3668,10 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 line,
             ));
         };
-        if procedure.params.len() > 3 {
+        if procedure.params.len() > 4 {
             return Err(RuntimeError::new(
                 format!(
-                    "回调 `{}` 有 {} 个参数，`AddressOf` 最多支持 3 个",
+                    "回调 `{}` 有 {} 个参数，`AddressOf` 最多支持 4 个",
                     procedure.name,
                     procedure.params.len()
                 ),
@@ -3691,6 +3738,68 @@ impl<'p, 'o> Runtime<'p, 'o> {
             }
         }
         Ok(procedure)
+    }
+
+    /// 把 `AddressOf` 换成持久的跳板地址；同一过程只生成一次。
+    fn persistent_callback_address(
+        &mut self,
+        name: &str,
+        line: usize,
+    ) -> Result<usize, RuntimeError> {
+        let key = name.to_ascii_lowercase();
+        if let Some(trampoline) = self
+            .persistent_callbacks
+            .iter()
+            .find(|item| item.name == key)
+            .and_then(|callback| callback.trampoline.as_ref())
+        {
+            return Ok(trampoline.address());
+        }
+        let procedure = self.resolve_callback(name, line)?;
+        let context = Box::new(CallbackCtx::new(self as *mut Self as *mut (), procedure));
+        let pointer = &*context as *const CallbackCtx as usize;
+        let trampoline = Trampoline::new(pointer, callback_thunk as CallbackThunk as usize)
+            .map_err(|message| RuntimeError::new(message, line))?;
+        let address = trampoline.address();
+        self.persistent_callbacks.push(PersistentCallback {
+            name: key,
+            context: Some(context),
+            trampoline: Some(trampoline),
+        });
+        Ok(address)
+    }
+
+    /// 结构体字段里的 `AddressOf` 换成真实地址：这类回调可能在 `Declare` 返回之后才被调用。
+    fn materialize_record_callbacks(
+        &mut self,
+        value: &Value,
+        line: usize,
+    ) -> Result<(), RuntimeError> {
+        let Value::Record(record) = value else {
+            return Ok(());
+        };
+        let fields: Vec<(String, Value)> = {
+            let record = record.borrow();
+            record
+                .fields()
+                .iter()
+                .map(|field| (field.name.clone(), field.value()))
+                .collect()
+        };
+        for (name, field) in fields {
+            match field {
+                Value::FuncPtr(procedure) => {
+                    let address = self.persistent_callback_address(&procedure, line)?;
+                    record
+                        .borrow_mut()
+                        .set(&name, Value::Int(address as i64))
+                        .map_err(|message| RuntimeError::from_coerce(message, line))?;
+                }
+                Value::Record(_) => self.materialize_record_callbacks(&field, line)?,
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// 从原生回调里进入 VB 过程：实参已经按形参类型还原成值。
@@ -3774,24 +3883,40 @@ impl CallbackCtx {
     }
 }
 
-/// 跳板的转发函数签名（`RCX` 是上下文，随后 3 个实参来自 `RDX`/`R8`/`R9`）。
-type CallbackThunk = unsafe extern "system" fn(*mut CallbackCtx, usize, usize, usize) -> usize;
+/// 一个在整次脚本运行期间都有效的回调：API 可能把指针存下来，之后再调用。
+///
+/// 脚本结束（包括出错/停止）时窗口可能还没销毁，系统之后仍可能回调：
+/// 这两个字段会在 [`Runtime`] 的 `Drop` 里泄漏掉，回调入口再检查运行时是否还活着。
+struct PersistentCallback {
+    name: String,
+    context: Option<Box<CallbackCtx>>,
+    trampoline: Option<Trampoline>,
+}
 
-/// 机器码跳板的转发入口：`ctx` 在 `RCX`，前 3 个回调实参依次在 `RDX`/`R8`/`R9`。
+/// 跳板的转发函数签名（`RCX` 是上下文，随后 4 个实参来自 `RDX`/`R8`/`R9` 与栈）。
+type CallbackThunk =
+    unsafe extern "system" fn(*mut CallbackCtx, usize, usize, usize, usize) -> usize;
+
+/// 机器码跳板的转发入口：`ctx` 在 `RCX`，前 4 个回调实参依次在 `RDX`/`R8`/`R9`/栈。
 unsafe extern "system" fn callback_thunk(
     ctx: *mut CallbackCtx,
     first: usize,
     second: usize,
     third: usize,
+    fourth: usize,
 ) -> usize {
     if ctx.is_null() {
         return 0;
     }
-    // SAFETY: 跳板由 `Trampoline` 生成，传入的就是 `call_declare` 栈上的上下文。
+    // SAFETY: 跳板由 `Trampoline` 生成，传入的就是 `call_declare` 栈上或持久回调表里的上下文。
     let context = unsafe { &*ctx };
+    // 运行时已经结束（窗口可能还活着）：不再进入解释器，直接返回 0。
+    if ACTIVE_RUNTIME.with(|slot| slot.get()) != context.runtime {
+        return 0;
+    }
     // 回调里 panic 会穿过 extern "system" 直接终止进程，这里先兜住。
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        dispatch_callback(context, [first, second, third])
+        dispatch_callback(context, [first, second, third, fourth])
     })) {
         Ok(value) => value,
         Err(_) => {
@@ -3802,7 +3927,7 @@ unsafe extern "system" fn callback_thunk(
 }
 
 /// 把寄存器里的实参还原成 VB 值，执行过程，再把返回值转回寄存器值。
-unsafe fn dispatch_callback(context: &CallbackCtx, registers: [usize; 3]) -> usize {
+unsafe fn dispatch_callback(context: &CallbackCtx, registers: [usize; 4]) -> usize {
     // SAFETY: 上下文里的指针在 `ffi::call` 期间一直有效；`call_declare` 在调用外部函数时
     // 不持有 `self` 的任何引用（类型表是提前克隆的），所以这里重新借出 `&mut` 不会
     // 和数据里的其它引用重叠。

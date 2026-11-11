@@ -344,6 +344,9 @@ impl Layout {
                 "ai_base_url" => layout.ai.base_url = value,
                 "ai_model" => layout.ai.model = value,
                 "ai_approval" => layout.ai.approval = AiApproval::from_str(&value),
+                "ai_round_limit" => {
+                    layout.ai.round_limit = crate::settings::AiRoundLimit::from_str(&value)
+                }
                 "roots" => declared_roots = value.parse::<usize>().ok(),
                 "root" => {
                     saw_root = true;
@@ -583,6 +586,10 @@ impl Layout {
         out.push_str(&format!("ai_base_url={}\n", escape(&self.ai.base_url)));
         out.push_str(&format!("ai_model={}\n", escape(&self.ai.model)));
         out.push_str(&format!("ai_approval={}\n", self.ai.approval.as_str()));
+        out.push_str(&format!(
+            "ai_round_limit={}\n",
+            self.ai.round_limit.as_str()
+        ));
         out.push_str(&format!("roots={}\n", self.roots.len()));
         for root in &self.roots {
             out.push_str(&format!("root=dir:{}\n", escape(root)));
@@ -716,7 +723,7 @@ fn unescape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::SyntaxSettings;
+    use crate::settings::{AiRoundLimit, SyntaxSettings};
 
     #[test]
     fn round_trip_keeps_every_field() {
@@ -770,6 +777,7 @@ mod tests {
                 base_url: "https://example.com/v1".to_string(),
                 model: "deepseek-reasoner".to_string(),
                 approval: AiApproval::Auto,
+                round_limit: AiRoundLimit::Twelve,
             },
             window_bounds: Some((120.0, 90.0, 1280.0, 800.0)),
             settings_size: Some((900.0, 640.0)),
@@ -803,12 +811,14 @@ mod tests {
                 base_url: "https://api.deepseek.com/v1".to_string(),
                 model: "deepseek-reasoner".to_string(),
                 approval: AiApproval::Auto,
+                round_limit: AiRoundLimit::Twelve,
             },
             ..Layout::default()
         };
         let parsed = Layout::parse(&layout.to_text());
         assert_eq!(parsed.ai, layout.ai);
         assert!(layout.to_text().contains("ai_approval=auto"));
+        assert!(layout.to_text().contains("ai_round_limit=12"));
 
         // 旧布局里没有 AI 键时使用默认值。
         let parsed = Layout::parse("explorer_width=300\n");

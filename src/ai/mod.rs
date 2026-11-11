@@ -7,6 +7,7 @@
 //! - [`stream`]：与界面无关的 SSE 增量解析（纯逻辑，可单测）；
 //! - [`tools`]：与界面无关的工具层：工具清单 + 把一次调用算成只读结果或待写入文件；
 //! - [`markdown`]：与界面无关的极简 Markdown 分段（说明文字 / 围栏代码块）；
+//! - [`rules`]：程序目录下 `ai-rules/` 里的固定规则，按当前文件语言选择；
 //! - [`panel`]：Q-IDE 的 GPUI 面板。换成别的界面框架时，只需要重写这一层，
 //!   前面几块不用动。
 //!
@@ -16,5 +17,6 @@
 pub mod client;
 pub mod markdown;
 pub mod panel;
+pub mod rules;
 pub mod stream;
 pub mod tools;

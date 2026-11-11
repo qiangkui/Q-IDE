@@ -174,15 +174,18 @@ fn auto_save_is_off_by_default() {
 
 #[test]
 fn ai_settings_fall_back_to_deepseek_defaults() {
-    use crate::settings::{AiApproval, AiSettings, DEFAULT_AI_BASE_URL, DEFAULT_AI_MODEL};
+    use crate::settings::{
+        AiApproval, AiRoundLimit, AiSettings, DEFAULT_AI_BASE_URL, DEFAULT_AI_MODEL,
+    };
 
     let ai = AiSettings::default();
     assert_eq!(ai.base_url, DEFAULT_AI_BASE_URL);
     assert_eq!(ai.model, DEFAULT_AI_MODEL);
     assert_eq!(ai.effective_base_url(), DEFAULT_AI_BASE_URL);
     assert_eq!(ai.effective_model(), DEFAULT_AI_MODEL);
-    // 默认每次写入前确认。
+    // 默认每次写入前确认，工具最多连续跑 6 轮。
     assert_eq!(ai.approval, AiApproval::Ask);
+    assert_eq!(ai.round_limit, AiRoundLimit::Six);
 
     // 设置窗口里清空输入不应该让请求打到空地址或空模型。
     let blank = AiSettings {
@@ -220,6 +223,39 @@ fn ai_approval_round_trips_through_text() {
     // 面板底栏用的是短标签，必须有字且各不相同。
     assert_eq!(AiApproval::Ask.short_label(), "每次确认");
     assert_eq!(AiApproval::Auto.short_label(), "全部允许");
+}
+
+#[test]
+fn ai_round_limit_options_and_reached_boundary() {
+    use crate::settings::AiRoundLimit;
+
+    assert_eq!(AiRoundLimit::default(), AiRoundLimit::Six);
+    assert_eq!(AiRoundLimit::Six.limit(), Some(6));
+    assert_eq!(AiRoundLimit::Twelve.limit(), Some(12));
+    assert_eq!(AiRoundLimit::Unlimited.limit(), None);
+
+    // 到上限那一轮执行完就停，不能多跑一轮。
+    assert!(!AiRoundLimit::Six.reached(5));
+    assert!(AiRoundLimit::Six.reached(6));
+    assert!(!AiRoundLimit::Twelve.reached(11));
+    assert!(AiRoundLimit::Twelve.reached(12));
+    assert!(!AiRoundLimit::Unlimited.reached(10_000));
+
+    assert_eq!(AiRoundLimit::from_str("12"), AiRoundLimit::Twelve);
+    assert_eq!(AiRoundLimit::from_str("unlimited"), AiRoundLimit::Unlimited);
+    // 旧布局或写坏的值回退到默认的 6 轮。
+    assert_eq!(AiRoundLimit::from_str(""), AiRoundLimit::Six);
+    assert_eq!(AiRoundLimit::from_str("whatever"), AiRoundLimit::Six);
+    for (value, _) in AiRoundLimit::OPTIONS {
+        assert_eq!(AiRoundLimit::from_str(value).as_str(), *value);
+    }
+
+    // 底栏短标签必须能区分三种设置。
+    let labels: std::collections::HashSet<_> = AiRoundLimit::OPTIONS
+        .iter()
+        .map(|(value, _)| AiRoundLimit::from_str(value).short_label())
+        .collect();
+    assert_eq!(labels.len(), AiRoundLimit::OPTIONS.len());
 }
 
 #[test]

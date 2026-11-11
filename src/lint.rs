@@ -3,10 +3,12 @@
 //! 菜单里的「检查语法」只在手动触发时报告一次；这里把同一套解析器接到编辑框上，
 //! 内容一变就重新检查，把发现的问题挂成编辑器诊断（波浪线 + 悬停提示）。
 
+use std::path::Path;
+
 use gpui_kit::Context;
 use gpui_kit::base::input::{Diagnostic, DiagnosticSeverity, EditorState, Position, RopeExt as _};
 
-use crate::interpreter::{parse, sema};
+use crate::interpreter::{parse, parse_with_source_map, sema};
 
 /// 一次最多挂多少个诊断，避免大脚本把编辑器压垮。
 const MAX_DIAGNOSTICS: usize = 100;
@@ -32,6 +34,7 @@ pub struct Analysis {
 }
 
 /// 解析 + 语义检查：语法错误只报第一处，语义问题按行去重后全部给出。
+#[allow(dead_code)] // 供测试与没有脚本路径的检查使用。
 pub fn analyze(source: &str) -> Analysis {
     match parse(source) {
         Ok(program) => Analysis {
@@ -54,15 +57,43 @@ pub fn analyze(source: &str) -> Analysis {
     }
 }
 
+/// 同 [`analyze`]，但按 `path` 所在目录展开 `#Include`，并把被包含文件的
+/// 诊断映射回主文件的 `#Include` 行。
+pub fn analyze_with_path(source: &str, path: Option<&Path>) -> Analysis {
+    match parse_with_source_map(source, path) {
+        Ok((program, map)) => Analysis {
+            issues: sema::analyze(&program)
+                .into_iter()
+                .map(|issue| {
+                    let (line, message) = map.remap(issue.line, &issue.message);
+                    SyntaxIssue { line, message }
+                })
+                .collect(),
+            program: Some(program),
+        },
+        Err(error) => Analysis {
+            issues: vec![SyntaxIssue {
+                line: error.line(),
+                message: error.message().to_string(),
+            }],
+            program: None,
+        },
+    }
+}
+
 /// 重新检查编辑器内容并刷新诊断，返回发现的问题。
-pub fn refresh(editor: &mut EditorState, cx: &mut Context<EditorState>) -> Vec<SyntaxIssue> {
+pub fn refresh(
+    editor: &mut EditorState,
+    path: Option<&Path>,
+    cx: &mut Context<EditorState>,
+) -> Vec<SyntaxIssue> {
     let text = editor.text().clone();
     if text.len() > MAX_LIVE_CHECK_BYTES {
         clear(editor, cx);
         return Vec::new();
     }
 
-    let issues = analyze(&text.to_string()).issues;
+    let issues = analyze_with_path(&text.to_string(), path).issues;
 
     let Some(diagnostics) = editor.diagnostics_mut() else {
         return issues;

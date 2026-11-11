@@ -165,8 +165,8 @@ pub fn call(
             args.len()
         ));
     }
-    if decl.params.len() > 12 {
-        return Err(format!("`{}` 的参数超过 12 个，暂不支持", decl.symbol));
+    if decl.params.len() > 14 {
+        return Err(format!("`{}` 的参数超过 14 个，暂不支持", decl.symbol));
     }
 
     let mut prepared = Vec::with_capacity(decl.params.len());
@@ -791,6 +791,8 @@ unsafe fn invoke(address: usize, args: &[usize]) -> usize {
     type F10 = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
     type F11 = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
     type F12 = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
+    type F13 = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
+    type F14 = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
 
     match args.len() {
         0 => {
@@ -866,6 +868,24 @@ unsafe fn invoke(address: usize, args: &[usize]) -> usize {
                 function(
                     args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
                     args[8], args[9], args[10], args[11],
+                )
+            }
+        }
+        13 => {
+            let function: F13 = unsafe { std::mem::transmute(address) };
+            unsafe {
+                function(
+                    args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
+                    args[8], args[9], args[10], args[11], args[12],
+                )
+            }
+        }
+        14 => {
+            let function: F14 = unsafe { std::mem::transmute(address) };
+            unsafe {
+                function(
+                    args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
+                    args[8], args[9], args[10], args[11], args[12], args[13],
                 )
             }
         }

@@ -12,6 +12,148 @@ fn output(source: &str) -> Vec<String> {
 }
 
 #[test]
+fn module_level_declarations_are_globals_and_main_still_runs() {
+    let source = r#"
+Option Explicit
+Private counter As Long
+Private greeting As String
+Private Const STEP_SIZE As Long = 2
+
+Sub Main()
+    counter = counter + STEP_SIZE
+    greeting = "次数"
+    Debug.Print greeting & counter
+End Sub
+"#;
+    assert_eq!(output(source), ["次数2"]);
+}
+
+#[test]
+fn address_of_accepts_four_parameter_callback() {
+    let source = r#"
+Function Four(ByVal a As Long, ByVal b As Long, ByVal c As Long, ByVal d As Long) As Long
+    Four = a + b + c + d
+End Function
+Debug.Print AddressOf Four
+"#;
+    assert_eq!(output(source), ["AddressOf four"]);
+}
+
+#[test]
+fn address_of_four_parameter_callback_receives_arguments() {
+    let source = r#"
+Declare PtrSafe Function EnumLanguageGroupLocalesW Lib "kernel32" (ByVal proc As LongPtr, ByVal group As Long, ByVal flags As Long, ByVal param As LongPtr) As Long
+Private g_group As Long
+Private g_locale As Long
+Private g_name As String
+Private g_param As LongPtr
+
+Function OnGroupLocale(ByVal group As Long, ByVal locale As Long, ByVal name As String, ByVal param As LongPtr) As Long
+    If Len(name) > 0 Then
+        g_group = group
+        g_locale = locale
+        g_name = name
+        g_param = param
+        OnGroupLocale = 0
+    Else
+        OnGroupLocale = 1
+    End If
+End Function
+
+EnumLanguageGroupLocalesW AddressOf OnGroupLocale, 1, 0, 123
+Debug.Print g_group = 1
+Debug.Print g_locale <> 0
+Debug.Print Len(g_name) > 0
+Debug.Print g_param = 123
+"#;
+    assert_eq!(output(source), ["True", "True", "True", "True"]);
+}
+
+#[test]
+fn strptr_points_at_a_wide_string_buffer() {
+    let source = r#"
+Declare PtrSafe Function lstrlenW Lib "kernel32" (ByVal text As LongPtr) As Long
+Private Type Holder
+    Ptr As LongPtr
+End Type
+
+Dim h As Holder
+h.Ptr = StrPtr("你好abc")
+Debug.Print lstrlenW(h.Ptr)
+Debug.Print lstrlenW(StrPtr("abc"))
+"#;
+    assert_eq!(output(source), ["5", "3"]);
+}
+
+#[test]
+fn declare_supports_fourteen_parameters() {
+    let source = r#"
+Declare PtrSafe Function CreateFontW Lib "gdi32" (ByVal nHeight As Long, ByVal nWidth As Long, ByVal nEscapement As Long, ByVal nOrientation As Long, ByVal fnWeight As Long, ByVal fdwItalic As Long, ByVal fdwUnderline As Long, ByVal fdwStrikeOut As Long, ByVal fdwCharSet As Long, ByVal fdwOutputPrecision As Long, ByVal fdwClipPrecision As Long, ByVal fdwQuality As Long, ByVal fdwPitchAndFamily As Long, ByVal lpszFace As String) As LongPtr
+Declare PtrSafe Function DeleteObject Lib "gdi32" (ByVal hObject As LongPtr) As Long
+Dim h As LongPtr
+h = CreateFontW(-16, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, "微软雅黑")
+Debug.Print h <> 0
+Debug.Print DeleteObject(h) <> 0
+"#;
+    assert_eq!(output(source), ["True", "True"]);
+}
+
+#[test]
+fn address_of_stored_in_a_record_gets_a_persistent_trampoline() {
+    let source = r#"
+Private Type WNDCLASSW
+    style As Long
+    lpfnWndProc As LongPtr
+    cbClsExtra As Long
+    cbWndExtra As Long
+    hInstance As LongPtr
+    hIcon As LongPtr
+    hCursor As LongPtr
+    hbrBackground As LongPtr
+    lpszMenuName As LongPtr
+    lpszClassName As LongPtr
+End Type
+
+Declare PtrSafe Function GetModuleHandleW Lib "kernel32" (ByVal name As LongPtr) As LongPtr
+Declare PtrSafe Function DefWindowProcW Lib "user32" (ByVal hWnd As LongPtr, ByVal msg As Long, ByVal wParam As LongPtr, ByVal lParam As LongPtr) As LongPtr
+Declare PtrSafe Function RegisterClassW Lib "user32" (ByRef wc As WNDCLASSW) As Long
+Declare PtrSafe Function UnregisterClassW Lib "user32" (ByVal name As LongPtr, ByVal instance As LongPtr) As Long
+Declare PtrSafe Function CreateWindowExW Lib "user32" (ByVal exStyle As Long, ByVal className As LongPtr, ByVal windowName As String, ByVal style As Long, ByVal x As Long, ByVal y As Long, ByVal w As Long, ByVal h As Long, ByVal parent As LongPtr, ByVal menu As LongPtr, ByVal instance As LongPtr, ByVal param As LongPtr) As LongPtr
+Declare PtrSafe Function DestroyWindow Lib "user32" (ByVal hWnd As LongPtr) As Long
+
+Private g_calls As Long
+
+Function DummyProc(ByVal hWnd As LongPtr, ByVal msg As Long, ByVal wParam As LongPtr, ByVal lParam As LongPtr) As LongPtr
+    g_calls = g_calls + 1
+    DummyProc = DefWindowProcW(hWnd, msg, wParam, lParam)
+End Function
+
+Dim wc As WNDCLASSW
+Dim hInst As LongPtr
+Dim hWnd As LongPtr
+Dim className As String
+className = "QideInterpreterCallbackTest"
+hInst = GetModuleHandleW(0)
+wc.lpfnWndProc = AddressOf DummyProc
+wc.hInstance = hInst
+wc.lpszClassName = StrPtr(className)
+Debug.Print RegisterClassW(wc) <> 0
+hWnd = CreateWindowExW(0, StrPtr(className), "test", 0, 0, 0, 100, 100, 0, 0, hInst, 0)
+Debug.Print hWnd <> 0
+DestroyWindow hWnd
+Debug.Print g_calls > 0
+Debug.Print UnregisterClassW(StrPtr(className), hInst) <> 0
+"#;
+    assert_eq!(output(source), ["True", "True", "True", "True"]);
+}
+
+#[test]
+fn hex_literals_accept_type_suffix() {
+    assert_eq!(output("Debug.Print &HFFFF& And &HFF"), ["255"]);
+    assert_eq!(output("Debug.Print &H10000& \\ &H100&"), ["256"]);
+}
+
+#[test]
 fn array_literal_declaration_runs() {
     let source = "Dim arr As Integer() = {64, 34, 25, 12, 22, 11, 90}";
     assert_eq!(output(&format!("{source}\nDebug.Print arr(0)")), ["64"]);

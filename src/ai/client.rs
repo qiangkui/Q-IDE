@@ -12,6 +12,9 @@
 //! ask_stream(&request, &mut on_event)?;
 //! ```
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
 use serde_json::{Value, json};
 
 use crate::ai::stream::ToolCallDelta;
@@ -92,13 +95,8 @@ pub enum StreamItem {
     ToolCalls(Vec<ToolCallDelta>),
 }
 
-/// 系统提示：把模型限定成编辑器里的编程助手。
-pub const SYSTEM_PROMPT: &str = "你是 Q-IDE 编辑器内置的编程助手。用简体中文回答，代码要完整，只聊与编程和当前任务相关的内容。\
-当前编辑器运行的是 VB6/VBA 风格脚本：没有 Module/End Module、Console、List(Of T)、Try/Catch、String.Join 等 .NET 专有语法；\
-输出用 Debug.Print 或 MsgBox，数组写成 Dim a() As Integer 或 Dim a As Integer() = {1, 2, 3}。\
-需要看代码时先调用 read_file；改代码时用 replace_in_file（给出一段在文件里唯一的原文）或 write_file（新建/整文件重写），\
-改完用 check_syntax 自查，运行报错可以看 read_output。写入前用户会确认，不要重复写入同一处。\
-如果用户只是想看代码，直接把完整代码放在 ``` 代码块里回答即可（用户可以点代码块上的「写入」）。";
+/// 系统提示的身份部分；具体语言与工具规则来自程序目录下的 `ai-rules/`。
+pub const SYSTEM_PROMPT: &str = "你是 Q-IDE 编辑器内置的编程助手。用简体中文回答，代码要完整，只聊与编程和当前任务相关的内容。";
 
 /// 上下文里最多带多少个字符的当前文件内容。
 const CONTEXT_LIMIT: usize = 40_000;
@@ -229,8 +227,12 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     /// 附在系统提示后面的上下文（当前打开的文件等）。
     pub context: Option<String>,
+    /// 当前文件的语言（`vb` / `rust` / `json` / `text` …），用来选择 `ai-rules/` 里的规则。
+    pub language: Option<String>,
     /// 发给模型的 `tools` 数组（空数组表示不带工具）。
     pub tools: Value,
+    /// 用户点「停止」时置真；网络层在每个数据块之间检查。
+    pub cancel: Arc<AtomicBool>,
 }
 
 /// 把设置里的「API 地址」解析成主机、端口与请求路径。
@@ -280,6 +282,7 @@ pub fn endpoint_from(base_url: &str) -> Result<Endpoint, String> {
 /// `stream` 为真时开启 SSE 流式返回（接口会一段段地推增量文本）。
 /// 历史太长（对话越积越多、工具输出又大）时会先裁剪，并在系统提示里注明，
 /// 免得请求超出模型的上下文窗口被接口直接拒绝。
+#[allow(dead_code)] // 测试与没有语言信息的调用方使用；界面统一走 `request_body_for`。
 pub fn request_body(
     model: &str,
     messages: &[ChatMessage],
@@ -287,10 +290,27 @@ pub fn request_body(
     context: Option<&str>,
     tools: &Value,
 ) -> String {
-    let mut system = match context {
-        Some(context) if !context.trim().is_empty() => format!("{SYSTEM_PROMPT}\n\n{context}"),
-        _ => SYSTEM_PROMPT.to_string(),
-    };
+    request_body_for(None, model, messages, stream, context, tools)
+}
+
+/// 同 [`request_body`]，额外按当前文件语言加载 `ai-rules/` 里的固定规则。
+pub fn request_body_for(
+    language: Option<&str>,
+    model: &str,
+    messages: &[ChatMessage],
+    stream: bool,
+    context: Option<&str>,
+    tools: &Value,
+) -> String {
+    let mut parts = vec![SYSTEM_PROMPT.to_string()];
+    let rules = crate::ai::rules::rules_for_language(language);
+    if !rules.trim().is_empty() {
+        parts.push(rules);
+    }
+    if let Some(context) = context.filter(|context| !context.trim().is_empty()) {
+        parts.push(context.to_string());
+    }
+    let mut system = parts.join("\n\n");
     // 系统提示与文件上下文先占掉预算，剩下的才是对话历史能用的长度。
     let budget = REQUEST_CHAR_BUDGET.saturating_sub(system.chars().count());
     let (history, dropped, clipped) = fit_history(messages, budget);
@@ -381,6 +401,7 @@ pub fn ask_stream(
 mod http {
     use std::ffi::c_void;
     use std::io;
+    use std::sync::atomic::Ordering;
 
     use super::ChatRequest;
     use crate::ai::stream::{SseDecoder, SseEvent};
@@ -391,6 +412,10 @@ mod http {
     const WINHTTP_FLAG_SECURE: u32 = 0x0080_0000;
     const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
     const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
+
+    fn cancelled(request: &ChatRequest) -> bool {
+        request.cancel.load(Ordering::Relaxed)
+    }
 
     #[link(name = "winhttp")]
     unsafe extern "system" {
@@ -521,6 +546,9 @@ mod http {
         request: &ChatRequest,
         on_event: &mut dyn FnMut(super::StreamItem),
     ) -> Result<(), String> {
+        if cancelled(request) {
+            return Ok(());
+        }
         let agent = wide("Q-IDE");
         let session = Handle::new(unsafe {
             WinHttpOpen(
@@ -567,7 +595,8 @@ mod http {
             return Err(sys_error("创建请求失败"));
         }
 
-        let body = super::request_body(
+        let body = super::request_body_for(
+            request.language.as_deref(),
             &request.model,
             &request.messages,
             true,
@@ -580,6 +609,10 @@ mod http {
             request.api_key
         ));
         let headers_len = (headers.len() - 1) as u32;
+        if cancelled(request) {
+            headers.fill(0);
+            return Ok(());
+        }
         let sent = unsafe {
             WinHttpSendRequest(
                 handle.raw(),
@@ -597,6 +630,9 @@ mod http {
             return Err(sys_error("发送请求失败"));
         }
 
+        if cancelled(request) {
+            return Ok(());
+        }
         if unsafe { WinHttpReceiveResponse(handle.raw(), std::ptr::null_mut()) } == 0 {
             return Err(sys_error("等待服务器响应失败"));
         }
@@ -632,6 +668,9 @@ mod http {
         let mut decoder = SseDecoder::new();
         let mut buffer = [0u8; 8192];
         'read: loop {
+            if cancelled(request) {
+                return Ok(());
+            }
             let mut read = 0u32;
             let ok = unsafe {
                 WinHttpReadData(
@@ -647,6 +686,9 @@ mod http {
             if read == 0 {
                 break;
             }
+            if cancelled(request) {
+                return Ok(());
+            }
             for event in decoder.push(&buffer[..read as usize]) {
                 match event {
                     SseEvent::Delta(text) => on_event(super::StreamItem::Delta(text)),
@@ -659,6 +701,9 @@ mod http {
             }
         }
 
+        if cancelled(request) {
+            return Ok(());
+        }
         // 连接提前断掉时，最后一行可能没有换行符，补解析一次。
         if !decoder.is_done() {
             for event in decoder.finish() {

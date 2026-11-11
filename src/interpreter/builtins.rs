@@ -26,6 +26,8 @@ pub struct Ctx<'a> {
     pub cwd: &'a mut std::path::PathBuf,
     /// 内置函数失败时要用的 VB 错误号（找不到文件 53、路径错误 75 …）。
     pub failure: Option<i64>,
+    /// `StrPtr` 返回的 UTF-16 缓冲区；必须活到脚本结束，指针才一直有效。
+    pub strings: &'a mut Vec<Vec<u16>>,
 }
 
 /// 把脚本里的路径变成实际路径：绝对路径原样返回，相对路径按脚本当前目录解析。
@@ -141,6 +143,7 @@ const BUILTINS: &[&str] = &[
     "isdate",
     "strreverse",
     "strcomp",
+    "strptr",
     "filter",
     "ascw",
     "chrw",
@@ -459,6 +462,14 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
                 .map(Value::type_name)
                 .unwrap_or_default(),
         ),
+        // `StrPtr(s)`：返回以 0 结尾的 UTF-16 缓冲区地址（`LongPtr`），供 `Declare` 的指针参数使用。
+        "strptr" => {
+            let mut buffer: Vec<u16> = text(0)?.encode_utf16().collect();
+            buffer.push(0);
+            ctx.strings.push(buffer);
+            let pointer = ctx.strings.last().expect("刚压入").as_ptr() as i64;
+            Value::Int(pointer)
+        }
         "lbound" | "ubound" => {            let array = args
                 .first()
                 .ok_or_else(|| format!("`{name}` 缺少第 1 个参数"))?

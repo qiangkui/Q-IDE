@@ -443,6 +443,67 @@ impl AiApproval {
     }
 }
 
+/// 一次提问里最多连续执行多少轮工具调用。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AiRoundLimit {
+    /// 默认 6 轮，够完成大多数小改动。
+    #[default]
+    Six,
+    /// 复杂任务可以放宽到 12 轮。
+    Twelve,
+    /// 不限制轮数，只靠用户点「停止」结束。
+    Unlimited,
+}
+
+impl AiRoundLimit {
+    /// 所有可选项：`(值, 界面文字)`。
+    pub const OPTIONS: &'static [(&'static str, &'static str)] = &[
+        ("6", "6 轮"),
+        ("12", "12 轮"),
+        ("unlimited", "一直执行"),
+    ];
+
+    /// 写进布局文件的键。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Six => "6",
+            Self::Twelve => "12",
+            Self::Unlimited => "unlimited",
+        }
+    }
+
+    /// AI 面板底栏上显示的短标签。
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Six => "6 轮",
+            Self::Twelve => "12 轮",
+            Self::Unlimited => "一直执行",
+        }
+    }
+
+    /// 轮数上限；`None` 表示一直执行。
+    pub fn limit(self) -> Option<usize> {
+        match self {
+            Self::Six => Some(6),
+            Self::Twelve => Some(12),
+            Self::Unlimited => None,
+        }
+    }
+
+    /// 已经跑完的轮数是否到达上限。
+    pub fn reached(self, rounds: usize) -> bool {
+        self.limit().is_some_and(|limit| rounds >= limit)
+    }
+
+    pub fn from_str(value: &str) -> Self {
+        match value.trim() {
+            "12" => Self::Twelve,
+            "unlimited" | "always" | "none" => Self::Unlimited,
+            _ => Self::Six,
+        }
+    }
+}
+
 /// AI 编程设置。
 ///
 /// 注意：API Key 不在这里保存，也不写进布局文件；它只交给
@@ -455,6 +516,8 @@ pub struct AiSettings {
     pub model: String,
     /// 写文件时要不要先问用户。
     pub approval: AiApproval,
+    /// 一次提问里最多连续跑多少轮工具调用。
+    pub round_limit: AiRoundLimit,
 }
 
 impl Default for AiSettings {
@@ -463,6 +526,7 @@ impl Default for AiSettings {
             base_url: DEFAULT_AI_BASE_URL.to_string(),
             model: DEFAULT_AI_MODEL.to_string(),
             approval: AiApproval::default(),
+            round_limit: AiRoundLimit::default(),
         }
     }
 }

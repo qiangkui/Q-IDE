@@ -173,14 +173,37 @@ pub type ToggleScopeAction = Rc<dyn Fn(String, &mut Window, &mut App)>;
 pub type GoToLineAction = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 
 impl OutlineModel {
+    #[allow(dead_code)] // 供测试与没有脚本路径的调用方使用。
     pub fn from_source(source: &str) -> Self {
-        match crate::interpreter::parse(source) {
-            Ok(program) => Self::from_program(&program),
+        Self::from_source_with_path(source, None)
+    }
+
+    /// 按脚本路径展开 `#Include`；大纲只保留主文件里的符号。
+    pub fn from_source_with_path(source: &str, path: Option<&std::path::Path>) -> Self {
+        Self::from_source_with_path_mode(source, path, false)
+    }
+
+    /// 代码补全用：展开 `#Include`，并保留被包含文件里的符号（补全不需要行号）。
+    pub fn from_source_for_completion(source: &str, path: Option<&std::path::Path>) -> Self {
+        Self::from_source_with_path_mode(source, path, true)
+    }
+
+    fn from_source_with_path_mode(
+        source: &str,
+        path: Option<&std::path::Path>,
+        include_included: bool,
+    ) -> Self {
+        match crate::interpreter::parse_with_source_map(source, path) {
+            Ok((program, map)) => Self::from_program(&program, Some(&map), include_included),
             Err(_) => scan_incomplete_source(source),
         }
     }
 
-    fn from_program(program: &Program) -> Self {
+    fn from_program(
+        program: &Program,
+        map: Option<&crate::interpreter::include::SourceMap>,
+        include_included: bool,
+    ) -> Self {
         let mut model = Self::default();
 
         for procedure in &program.procedures {
@@ -236,6 +259,15 @@ impl OutlineModel {
         }
 
         collect_variables(&program.main, "模块", &mut model.variables);
+        if let Some(map) = map.filter(|map| map.has_includes() && !include_included) {
+            // 大纲是「当前文件」的大纲：被包含文件的符号不列出（行号也属于另一个文件）。
+            model.procedures.retain(|symbol| map.is_main_line(symbol.line));
+            model.variables.retain(|symbol| map.is_main_line(symbol.line));
+            model.types.retain(|symbol| map.is_main_line(symbol.line));
+            model.classes.retain(|symbol| map.is_main_line(symbol.line));
+            model.enums.retain(|symbol| map.is_main_line(symbol.line));
+            model.declares.retain(|symbol| map.is_main_line(symbol.line));
+        }
         sort_symbols(&mut model);
         model
     }

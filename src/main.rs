@@ -125,9 +125,15 @@ mod secret_store_tests;
 #[cfg(test)]
 mod interpreter_tests;
 
+#[cfg(test)]
+mod include_tests;
+
 use gpui_kit::*;
 
 fn main() {
+    // 程序目录下的 ai-rules/：缺失的默认规则补齐，已有的用户修改不动。
+    ai::rules::ensure_defaults();
+
     gpui_kit::application()
         .with_assets(assets::Assets)
         .run(|cx| {

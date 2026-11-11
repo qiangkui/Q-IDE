@@ -399,10 +399,16 @@ fn keyword(word: &str) -> Option<Kw> {
 
 /// 把源码切成 token 流。
 pub fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
+    tokenize_mapped(source, &[])
+}
+
+/// 同 [`tokenize`]，但允许把物理行映射成逻辑行号（`#Include` 展开用）。
+pub fn tokenize_mapped(source: &str, lines: &[usize]) -> Result<Vec<Token>, ParseError> {
     let chars: Vec<char> = source.chars().collect();
     let mut tokens = Vec::new();
     let mut index = 0usize;
-    let mut line = 1usize;
+    let mut physical_line = 1usize;
+    let mut line = logical_line(lines, physical_line);
     let mut at_statement_start = true;
 
     while index < chars.len() {
@@ -411,7 +417,8 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
             '\r' => index += 1,
             '\n' => {
                 tokens.push(Token::new(TokenKind::Newline, line));
-                line += 1;
+                physical_line += 1;
+                line = logical_line(lines, physical_line);
                 index += 1;
                 at_statement_start = true;
             }
@@ -432,7 +439,8 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
                 }
                 if index < chars.len() {
                     index += 1;
-                    line += 1;
+                    physical_line += 1;
+                    line = logical_line(lines, physical_line);
                 }
             }
             '"' => {
@@ -500,6 +508,15 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
     Ok(tokens)
 }
 
+/// 物理行 → 逻辑行号；映射表用完后沿用最后一项（EOF 行）。
+fn logical_line(lines: &[usize], physical: usize) -> usize {
+    lines
+        .get(physical.saturating_sub(1))
+        .copied()
+        .or_else(|| lines.last().copied())
+        .unwrap_or(physical)
+}
+
 fn is_line_continuation(chars: &[char], index: usize) -> bool {
     let mut cursor = index + 1;
     while cursor < chars.len() && (chars[cursor] == ' ' || chars[cursor] == '\t') {
@@ -544,6 +561,10 @@ fn scan_radix_number(
     }
     if digits.is_empty() {
         return Err(ParseError::new("进制字面量缺少数字", line));
+    }
+    // `&HFFFF&`：进制字面量后面可以跟类型后缀（`%`/`&`/`!`/`#`/`@`），值不变。
+    if matches!(chars.get(index), Some('%' | '&' | '!' | '#' | '@')) {
+        index += 1;
     }
     let value = i64::from_str_radix(&digits, radix)
         .map_err(|_| ParseError::new(format!("无法解析数字 `{digits}`"), line))?;

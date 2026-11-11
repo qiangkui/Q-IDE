@@ -554,6 +554,94 @@ fn an_over_long_tool_output_is_clipped_with_a_marker() {
     assert!(system.contains("已截断"), "系统提示里要有截断标记：{system}");
 }
 
+fn temp_rules_dir(name: &str) -> std::path::PathBuf {
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("qide_ai_rules_{}_{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("创建规则临时目录");
+    dir
+}
+
+#[test]
+fn ai_rules_select_common_plus_language_file() {
+    let dir = temp_rules_dir("select");
+    std::fs::write(dir.join("common.md"), "COMMON").unwrap();
+    std::fs::write(dir.join("vb.md"), "VB").unwrap();
+    std::fs::write(dir.join("default.md"), "DEFAULT").unwrap();
+
+    let vb = crate::ai::rules::rules_for_language_in(Some(&dir), Some("vb"));
+    assert!(vb.contains("COMMON") && vb.contains("VB"), "{vb}");
+    assert!(!vb.contains("DEFAULT"), "{vb}");
+
+    let rust = crate::ai::rules::rules_for_language_in(Some(&dir), Some("rust"));
+    assert!(rust.contains("COMMON") && rust.contains("DEFAULT"), "{rust}");
+    assert!(!rust.contains("VB"), "{rust}");
+
+    let none = crate::ai::rules::rules_for_language_in(Some(&dir), None);
+    assert!(none.contains("COMMON") && none.contains("DEFAULT"), "{none}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ai_rules_fall_back_to_the_embedded_vb_rules() {
+    let dir = temp_rules_dir("vb-fallback");
+    std::fs::write(dir.join("common.md"), "COMMON").unwrap();
+    std::fs::write(dir.join("default.md"), "DEFAULT").unwrap();
+    let vb = crate::ai::rules::rules_for_language_in(Some(&dir), Some("vb"));
+    assert!(vb.contains("COMMON"), "{vb}");
+    assert!(vb.contains("VB6 / VBA"), "{vb}");
+    assert!(!vb.contains("DEFAULT"), "{vb}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ai_rules_defaults_do_not_overwrite_user_edits() {
+    let dir = temp_rules_dir("ensure");
+    crate::ai::rules::ensure_defaults_in(&dir).expect("写出默认规则");
+    assert!(dir.join("README.md").exists());
+    assert!(dir.join("common.md").exists());
+    assert!(dir.join("vb.md").exists());
+    assert!(dir.join("default.md").exists());
+
+    std::fs::write(dir.join("vb.md"), "MY VB RULES").unwrap();
+    crate::ai::rules::ensure_defaults_in(&dir).expect("再次补齐默认规则");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("vb.md")).unwrap(),
+        "MY VB RULES"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn request_body_for_uses_the_language_rules() {
+    let body = crate::ai::client::request_body_for(
+        Some("vb"),
+        "deepseek-chat",
+        &[],
+        true,
+        None,
+        &json!([]),
+    );
+    let value: serde_json::Value = serde_json::from_str(&body).expect("请求体是合法 JSON");
+    let system = value["messages"][0]["content"].as_str().expect("系统提示");
+    assert!(system.contains("VB6 / VBA"), "{system}");
+    assert!(system.contains("read_file"), "{system}");
+
+    let body = crate::ai::client::request_body_for(
+        Some("rust"),
+        "deepseek-chat",
+        &[],
+        true,
+        None,
+        &json!([]),
+    );
+    let value: serde_json::Value = serde_json::from_str(&body).expect("请求体是合法 JSON");
+    let system = value["messages"][0]["content"].as_str().expect("系统提示");
+    assert!(system.contains("非 VB 脚本"), "{system}");
+    assert!(system.contains("Rust"), "{system}");
+}
+
 #[test]
 fn the_reasoner_model_gets_no_tools() {
     let messages = vec![ChatMessage::user("你好")];

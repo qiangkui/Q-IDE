@@ -12,6 +12,11 @@ impl CodeWindow {
         Some((file.id.to_string(), content.to_string()))
     }
 
+    /// 当前编辑器使用的语言（没有打开文件时按新建的 VB 缓冲区处理）。
+    pub(crate) fn ai_language(&self) -> String {
+        self.active_file_language().to_string()
+    }
+
     /// 「写入文件」：先让用户确认目标路径，再写盘。
     pub(crate) fn apply_ai_code(&mut self, code: &str, window: &mut Window, cx: &mut Context<Self>) {
         let hint = self.ai_target_hint();

@@ -7,9 +7,6 @@ use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Value, json};
 
-/// 一轮对话里最多连续执行多少次工具调用，避免模型原地打转。
-pub const MAX_TOOL_ROUNDS: usize = 6;
-
 /// 单个工具的定义。
 pub struct ToolSpec {
     pub name: &'static str,
@@ -37,7 +34,7 @@ pub fn tools_json() -> Value {
     Value::Array(tools)
 }
 
-/// 轮数上限以外的说明：DeepSeek 的推理模型（`deepseek-reasoner`）暂不支持工具调用。
+/// DeepSeek 的推理模型（`deepseek-reasoner`）暂不支持工具调用。
 pub fn model_supports_tools(model: &str) -> bool {
     !model.trim().to_ascii_lowercase().contains("reasoner")
 }
@@ -334,7 +331,7 @@ fn check_syntax(ctx: &PlanCtx<'_>, args: &Value) -> ToolPlan {
             format!("错误：读不到文件 `{raw}`"),
         );
     };
-    let (report, issues) = syntax_report(&text);
+    let (report, issues) = syntax_report(&text, Some(&path));
     let display = display_path(ctx.root, &path);
     let summary = if issues == 0 {
         format!("检查 {display}：没有发现问题")
@@ -365,22 +362,28 @@ fn read_output(ctx: &PlanCtx<'_>) -> ToolPlan {
 }
 
 /// 语法 + 语义检查，返回给模型看的文本与问题数量。
-fn syntax_report(source: &str) -> (String, usize) {
-    match crate::interpreter::parse(source) {
-        Ok(program) => {
-            let issues = crate::interpreter::sema::analyze(&program);
+fn syntax_report(source: &str, path: Option<&Path>) -> (String, usize) {
+    match crate::interpreter::parse_with_source_map(source, path) {
+        Ok((program, map)) => {
+            let issues = crate::interpreter::sema::analyze(&program)
+                .into_iter()
+                .map(|issue| map.remap(issue.line, &issue.message))
+                .collect::<Vec<_>>();
             if issues.is_empty() {
                 ("没有发现语法或语义问题。".to_string(), 0)
             } else {
                 let text = issues
                     .iter()
-                    .map(|issue| format!("第 {} 行: {}", issue.line, issue.message))
+                    .map(|(line, message)| format!("第 {line} 行: {message}"))
                     .collect::<Vec<_>>()
                     .join("\n");
                 (text, issues.len())
             }
         }
-        Err(error) => (format!("第 {} 行: {}", error.line, error.message), 1),
+        Err(error) => (
+            format!("第 {} 行: {}", error.line(), error.message()),
+            1,
+        ),
     }
 }
 

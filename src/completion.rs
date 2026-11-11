@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui_kit::base::input::{Rope, RopeExt as _};
@@ -24,6 +25,20 @@ use crate::outline::{
 
 /// 一次最多给出的候选数量，避免空前缀时列表过长。
 const MAX_ITEMS: usize = 200;
+
+thread_local! {
+    /// 当前编辑器里的脚本路径：补全时按它所在目录展开 `#Include`。
+    static SCRIPT_PATH: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// 切换/保存文件时由界面线程更新；新建的未保存缓冲区传 `None`。
+pub fn set_script_path(path: Option<PathBuf>) {
+    SCRIPT_PATH.with(|slot| *slot.borrow_mut() = path);
+}
+
+fn script_path() -> Option<PathBuf> {
+    SCRIPT_PATH.with(|slot| slot.borrow().clone())
+}
 
 /// `As` 后面可以写的声明类型；与解释器 `parse_declared_type` 接受的类型一致。
 ///
@@ -514,7 +529,8 @@ fn enclosing_class(source: &str, cursor_line: usize) -> Option<String> {
 
 /// 从源码里取出可以补全的名字（走代码大纲的解析，语法不完整时也会尽量给）。
 fn collect_symbols(source: &str) -> Vec<SymbolItem> {
-    let model = OutlineModel::from_source(source);
+    let path = script_path();
+    let model = OutlineModel::from_source_for_completion(source, path.as_deref());
     let mut items = Vec::new();
 
     for symbol in &model.procedures {

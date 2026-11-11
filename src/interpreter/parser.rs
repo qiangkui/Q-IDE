@@ -2,12 +2,18 @@
 
 use crate::interpreter::ast::*;
 use crate::interpreter::error::ParseError;
-use crate::interpreter::lexer::{Kw, Op, Token, TokenKind, tokenize};
+use crate::interpreter::lexer::{Kw, Op, Token, TokenKind, tokenize, tokenize_mapped};
 use crate::interpreter::value::{VbType, Value};
 
 /// 解析一段 VB 源码。
+#[allow(dead_code)] // 供 `interpreter::parse` 与测试使用。
 pub fn parse(source: &str) -> Result<Program, ParseError> {
-    let tokens = tokenize(source)?;
+    parse_mapped(source, &[])
+}
+
+/// 同 [`parse`]，但可以指定每个物理行的逻辑行号（`#Include` 展开用）。
+pub fn parse_mapped(source: &str, lines: &[usize]) -> Result<Program, ParseError> {
+    let tokens = tokenize_mapped(source, lines)?;
     Parser {
         tokens,
         pos: 0,
@@ -248,11 +254,13 @@ impl Parser {
             }
 
             // 允许 `Public` / `Private` / `Global` 修饰。
+            let mut has_modifier = false;
             while matches!(
                 self.peek(),
                 TokenKind::Kw(Kw::Public | Kw::Private | Kw::Global)
             ) {
                 self.advance();
+                has_modifier = true;
             }
 
             match self.peek() {
@@ -276,6 +284,11 @@ impl Parser {
                 }
                 TokenKind::Kw(Kw::Enum) => {
                     program.enums.push(self.parse_enum()?);
+                }
+                // `Private x As Long`：模块级变量声明，不带 `Dim`。
+                TokenKind::Ident(_) if has_modifier => {
+                    let line = self.line();
+                    program.main.push(self.parse_dim(line, false)?);
                 }
                 _ => {
                     let before = self.pos;

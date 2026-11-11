@@ -27,6 +27,8 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -50,7 +52,7 @@ use crate::app::CodeWindow;
 use crate::outline::{ClosePanelAction, DragStartAction};
 use crate::panels::AI_PANEL;
 use crate::secret_store;
-use crate::settings::{AI_MODEL_OPTIONS, AiApproval, SettingsStore};
+use crate::settings::{AI_MODEL_OPTIONS, AiApproval, AiRoundLimit, SettingsStore};
 use crate::theme::{self as ui_theme, Palette};
 
 /// 代码块折叠时先显示多少行。
@@ -146,7 +148,11 @@ pub struct AiPanel {
     tool_queue: VecDeque<ToolCall>,
     /// 这次提问已经连续跑了多少轮工具，用来防死循环。
     tool_rounds: usize,
-    /// 设置变化（底栏切换交互方式或模型）后重绘。
+    /// 当前请求的停止标志；用户点「停止」时置真。
+    cancel: Option<Arc<AtomicBool>>,
+    /// 不是错误的提示（如「已停止」「达到轮数上限」），用淡色显示。
+    notice: Option<String>,
+    /// 设置变化（底栏切换交互方式、轮数或模型）后重绘。
     _settings_subscription: Subscription,
 }
 
@@ -168,6 +174,8 @@ impl AiPanel {
             approval: None,
             tool_queue: VecDeque::new(),
             tool_rounds: 0,
+            cancel: None,
+            notice: None,
             _settings_subscription: settings_subscription,
         }
     }
@@ -202,8 +210,17 @@ impl AiPanel {
         self.input.update(cx, |input, cx| input.focus(window, cx));
         self.messages.push(ChatEntry::new(ChatMessage::user(text)));
         self.error = None;
+        self.notice = None;
+        self.cancel_current();
         self.tool_rounds = 0;
         self.run_turn(window, cx);
+    }
+
+    /// 让当前请求的停止标志生效（如果有）。
+    fn cancel_current(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
     }
 
     /// 检查 API 地址与密钥；不完整时把原因写进 `error`。
@@ -230,12 +247,15 @@ impl AiPanel {
 
     /// 发一轮请求：先占一条空的助手消息，流式文本往里追加。
     fn run_turn(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.tool_rounds > tools::MAX_TOOL_ROUNDS {
+        let round_limit = SettingsStore::snapshot(cx).ai.round_limit;
+        if round_limit.reached(self.tool_rounds) {
             self.pending = false;
-            self.error = Some(format!(
-                "工具调用已超过 {} 轮，先停下来以免反复修改",
-                tools::MAX_TOOL_ROUNDS
+            self.cancel_current();
+            self.notice = Some(format!(
+                "已达到 {} 工具调用上限，已停止。可在底栏切换轮数、选择「一直执行」，或直接发送消息继续。",
+                round_limit.short_label()
             ));
+            self.scroll.scroll_to_bottom();
             cx.notify();
             return;
         }
@@ -250,6 +270,8 @@ impl AiPanel {
         self.pending = true;
         self.request_id += 1;
         let request_id = self.request_id;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(cancel.clone());
 
         // 把当前打开的文件带上，模型才能针对真实代码给出修改。
         let context = self
@@ -257,6 +279,11 @@ impl AiPanel {
             .upgrade()
             .and_then(|app| app.read_with(cx, |this, _| this.ai_file_context()))
             .map(|(path, content)| client::file_context(&path, &content));
+        // 当前语言决定加载 ai-rules/ 里的哪份固定规则（vb.md / rust.md / default.md）。
+        let language = self
+            .app
+            .upgrade()
+            .map(|app| app.read_with(cx, |this, _| this.ai_language()));
         let messages: Vec<ChatMessage> = self.messages[..self.messages.len() - 1]
             .iter()
             .map(|entry| entry.message.clone())
@@ -269,7 +296,9 @@ impl AiPanel {
             api_key,
             messages,
             context,
+            language,
             tools: tool_list,
+            cancel,
         };
         self.scroll.scroll_to_bottom();
 
@@ -389,6 +418,7 @@ impl AiPanel {
         cx: &mut Context<Self>,
     ) {
         self.pending = false;
+        self.cancel = None;
 
         if let Err(error) = outcome {
             // 一条字都没收到就把空消息去掉，只留错误说明。
@@ -555,11 +585,55 @@ impl AiPanel {
         self.process_tools(window, cx);
     }
 
+    /// 停止当前请求：网络请求、工具循环和待确认的写入都取消。
+    fn stop(&mut self, cx: &mut Context<Self>) {
+        if !self.pending && self.approval.is_none() && self.cancel.is_none() {
+            return;
+        }
+        self.cancel_current();
+        self.request_id += 1;
+        self.pending = false;
+        self.approval = None;
+        self.tool_queue.clear();
+        self.tool_rounds = 0;
+        self.close_unfinished_tool_calls();
+        self.drop_empty_reply();
+        self.notice = Some("已停止".to_string());
+        self.scroll.scroll_to_bottom();
+        cx.notify();
+    }
+
+    /// 停止时给还没拿到结果的工具调用补一条结果，保证历史符合接口协议。
+    fn close_unfinished_tool_calls(&mut self) {
+        let Some(index) = self.messages.iter().rposition(|entry| {
+            matches!(entry.message.role, Role::Assistant) && !entry.message.tool_calls.is_empty()
+        }) else {
+            return;
+        };
+        let answered: HashSet<String> = self.messages[index + 1..]
+            .iter()
+            .filter(|entry| matches!(entry.message.role, Role::Tool))
+            .map(|entry| entry.message.tool_call_id.clone())
+            .collect();
+        let missing: Vec<String> = self.messages[index]
+            .message
+            .tool_calls
+            .iter()
+            .map(|call| call.id.clone())
+            .filter(|id| !answered.contains(id))
+            .collect();
+        for id in missing {
+            self.push_tool_result(&id, "用户停止了本次执行。".to_string(), "已停止".to_string());
+        }
+    }
+
     /// 清空当前对话（要连输入框一起清就用「新建对话」）。正在进行的请求结果会被丢弃。
     fn clear(&mut self, cx: &mut Context<Self>) {
+        self.cancel_current();
         self.request_id += 1;
         self.messages.clear();
         self.error = None;
+        self.notice = None;
         self.pending = false;
         self.approval = None;
         self.tool_queue.clear();
@@ -877,6 +951,7 @@ impl Render for AiPanel {
         let empty = self.messages.is_empty()
             && !self.pending
             && self.error.is_none()
+            && self.notice.is_none()
             && self.approval.is_none();
         let body: AnyElement = if empty {
             placeholder(palette).into_any_element()
@@ -908,6 +983,14 @@ impl Render for AiPanel {
                         .child(error.clone()),
                 );
             }
+            if let Some(notice) = &self.notice {
+                list = list.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(palette.muted_text))
+                        .child(notice.clone()),
+                );
+            }
             div()
                 .id("ai-messages")
                 .flex_1()
@@ -934,6 +1017,13 @@ impl Render for AiPanel {
         }
         let escape = close_panel.clone();
         let send_label = if self.pending { "思考中…" } else { "发送" };
+        let stop_button = Button::new("ai-stop")
+            .ghost()
+            .xsmall()
+            .label("停止")
+            .text_color(rgb(palette.error))
+            .tooltip("停止当前 AI 请求")
+            .on_click(cx.listener(|this, _, _window, cx| this.stop(cx)));
         let input_row = h_flex()
             .gap_1()
             .items_center()
@@ -953,9 +1043,10 @@ impl Render for AiPanel {
                     .disabled(busy)
                     .tooltip("回车也可以发送")
                     .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
-            );
+            )
+            .when(busy, |this| this.child(stop_button));
 
-        // 底栏：交互方式 + 当前 AI 模型，点开都是下拉菜单。
+        // 底栏：交互方式 + 工具轮数 + 当前 AI 模型，点开都是下拉菜单。
         // 文字用比正文更淡的颜色，免得两行按钮抢了对话的注意力。
         let settings = SettingsStore::snapshot(cx);
         let approval = settings.ai.approval;
@@ -980,6 +1071,32 @@ impl Render for AiPanel {
                             .on_click(move |_, _, cx| {
                                 let mode = AiApproval::from_str(value);
                                 SettingsStore::update(cx, |settings| settings.ai.approval = mode);
+                            }),
+                    );
+                }
+                menu
+            });
+        let round_limit = settings.ai.round_limit;
+        let round_button = Button::new("ai-rounds")
+            .ghost()
+            .xsmall()
+            .label(round_limit.short_label())
+            .text_color(footer_text)
+            .child(Icon::new(IconName::ChevronDown).xsmall().text_color(footer_text))
+            .tooltip("AI 一次提问最多连续执行多少轮工具调用")
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                let mut menu = menu;
+                for (value, label) in AiRoundLimit::OPTIONS {
+                    let value = *value;
+                    let checked = AiRoundLimit::from_str(value) == round_limit;
+                    menu = menu.item(
+                        PopupMenuItem::new(*label)
+                            .checked(checked)
+                            .on_click(move |_, _, cx| {
+                                let limit = AiRoundLimit::from_str(value);
+                                SettingsStore::update(cx, |settings| {
+                                    settings.ai.round_limit = limit
+                                });
                             }),
                     );
                 }
@@ -1024,6 +1141,7 @@ impl Render for AiPanel {
             .items_center()
             .bg(rgb(palette.panel_bg))
             .child(mode_button)
+            .child(round_button)
             .child(model_button);
 
         div()

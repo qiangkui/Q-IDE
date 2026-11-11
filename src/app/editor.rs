@@ -534,8 +534,9 @@ impl CodeWindow {
             return;
         }
         self.outline_source = Some(source.clone());
+        let path = self.active_script_path();
         self.outline_model = if self.active_file_language().eq_ignore_ascii_case("vb") {
-            OutlineModel::from_source(&source)
+            OutlineModel::from_source_with_path(&source, path.as_deref())
         } else {
             OutlineModel::default()
         };
@@ -655,6 +656,7 @@ impl CodeWindow {
     /// 只有 VB 脚本才检查；文本没变（只是移动光标、滚动）时直接返回，
     /// 避免重复解析同一个文本。
     pub(super) fn refresh_diagnostics(&mut self, cx: &mut Context<Self>) {
+        crate::completion::set_script_path(self.active_script_path());
         let editor = self.editor.clone();
 
         if !self.active_file_language().eq_ignore_ascii_case("vb") {
@@ -674,7 +676,10 @@ impl CodeWindow {
         }
         self.checked_source = Some(source);
 
-        let issues = editor.update(cx, crate::lint::refresh);
+        let path = self.active_script_path();
+        let issues = editor.update(cx, |editor, cx| {
+            crate::lint::refresh(editor, path.as_deref(), cx)
+        });
         let errors = issues.len();
         if self.error_count != errors {
             self.error_count = errors;

@@ -613,7 +613,7 @@ impl CodeWindow {
         output.command(cx, "> 语法检查");
 
         let editor = self.editor.clone();
-        let analysis = crate::lint::analyze(&source);
+        let analysis = crate::lint::analyze_with_path(&source, self.active_script_path().as_deref());
         if analysis.issues.is_empty() {
             editor.update(cx, crate::lint::clear);
             self.checked_source = Some(source);

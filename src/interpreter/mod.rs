@@ -24,11 +24,12 @@
 //! 不支持 `Single` 与 `Double` 混用、超过 4 个参数的混合浮点调用，
 //! 结构体里的变长 `String` 与 UDT 数组字段也不能用于 Win32 调用。
 //! `AddressOf 过程名` 可以把自己的过程当成回调交给 API：参数经机器码跳板进入解释器，
-//! 支持最多 3 个 `Byte`/`Integer`/`Long`/`Boolean`/`LongLong`/`LongPtr`/`Single`/`Double`
+//! 支持最多 4 个 `Byte`/`Integer`/`Long`/`Boolean`/`LongLong`/`LongPtr`/`Single`/`Double`
 //! 或 `String` 形参（`ByVal String` 是 `LPCWSTR`，`ByRef` 是 `LPWSTR *`），
 //! 返回值可为整数类型（`Sub` 视为 0），不支持返回 `String`/浮点、记录与数组形参；
-//! 跳板只在这次 `Declare` 调用期间有效，所以只适用于「调用期间同步回调」的 API
-//! （`EnumWindows`、`InitOnceExecuteOnce` 等），把指针存起来以后再回调的 API 不能这样用。
+//! 直接作为 `Declare` 实参的跳板只在该次调用期间有效（`EnumWindows`、`InitOnceExecuteOnce` 等）；
+//! 写进 UDT 字段（如 `WNDCLASSW.lpfnWndProc`）时会生成持久跳板，存活到脚本结束，
+//! 因此 `RegisterClassW` + `CreateWindowExW` 这类窗口过程也能用。
 //! `Type` 字段支持 `String * n`（按空格补齐/截断，`Len` 仍为 n）与定长数组
 //! （`Items(2) As Long`、`Items(1 To 3) As Item`，用 `p.Items(1)` 读写元素，
 //! `p.Items(0).V = 1` 也可用）；`String * n` 在结构体与文件里都占 `2n` 字节 UTF-16
@@ -105,6 +106,7 @@ pub mod dialog;
 pub mod error;
 pub mod ffi;
 pub mod filelock;
+pub mod include;
 pub mod lexer;
 pub mod parser;
 pub mod runtime;
@@ -114,7 +116,7 @@ pub mod value;
 
 pub use error::{Error, ParseError};
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -161,8 +163,9 @@ pub fn run_with<F>(
 where
     F: FnMut(&str),
 {
-    let program = parser::parse(source)?;
-    runtime::run_program(&program, &mut out, interrupt, &options, None)?;
+    let (program, map) = parse_with_source_map(source, options.script_path.as_deref())?;
+    runtime::run_program(&program, &mut out, interrupt, &options, None)
+        .map_err(|error| Error::Runtime(remap_runtime(error, &map)))?;
     Ok(())
 }
 
@@ -178,22 +181,54 @@ pub fn run_debug<F>(
 where
     F: FnMut(&str),
 {
-    let program = parser::parse(source)?;
+    let (program, map) = parse_with_source_map(source, options.script_path.as_deref())?;
     let outcome = runtime::run_program(
         &program,
         &mut out,
         interrupt,
         &options,
         Some(debug.clone()),
-    );
+    )
+    .map_err(|error| Error::Runtime(remap_runtime(error, &map)));
     debug.finish();
     outcome?;
     Ok(())
 }
 
-/// 只做语法检查，不执行。
+/// 只做语法检查，不执行；不展开 `#Include`（没有脚本路径，无法解析相对路径）。
+#[allow(dead_code)] // 供测试与不需要 include 的轻量检查使用。
 pub fn parse(source: &str) -> Result<ast::Program, ParseError> {
     parser::parse(source)
+}
+
+/// 解析脚本并展开 `#Include`，同时返回行号映射。
+pub fn parse_with_source_map(
+    source: &str,
+    path: Option<&Path>,
+) -> Result<(ast::Program, include::SourceMap), Error> {
+    let expanded = include::expand(source, path)
+        .map_err(|error| Error::Parse(ParseError::new(error.message, error.line)))?;
+    let program = parser::parse_mapped(&expanded.text, &expanded.logical_lines)
+        .map_err(|error| remap_parse(error, &expanded.map))?;
+    Ok((program, expanded.map))
+}
+
+/// 解析脚本并展开 `#Include`（相对路径按 `path` 所在目录解析）。
+#[allow(dead_code)] // 方便只需要语法树、不需要行号映射的调用方。
+pub fn parse_with_path(source: &str, path: Option<&Path>) -> Result<ast::Program, Error> {
+    parse_with_source_map(source, path).map(|(program, _)| program)
+}
+
+fn remap_parse(error: ParseError, map: &include::SourceMap) -> Error {
+    let (line, message) = map.remap(error.line, &error.message);
+    Error::Parse(ParseError { line, message })
+}
+
+fn remap_runtime(mut error: error::RuntimeError, map: &include::SourceMap) -> error::RuntimeError {
+    let (line, message) = map.remap(error.line, &error.message);
+    error.line = line;
+    error.message = message;
+    error
 }
 
 #[cfg(test)]
@@ -3167,13 +3202,13 @@ InitOnceExecuteOnce once, AddressOf Boom, 0, ctx
 
         let source = r#"
 Declare PtrSafe Function InitOnceExecuteOnce Lib "kernel32" (ByVal a As LongPtr, ByVal b As LongPtr) As Long
-Function TooMany(a As Long, b As Long, c As Long, d As Long) As Long
+Function TooMany(a As Long, b As Long, c As Long, d As Long, e As Long) As Long
     TooMany = 0
 End Function
 InitOnceExecuteOnce AddressOf TooMany, 0
 "#;
         let error = run_lines(source).unwrap_err();
-        assert!(error.message().contains("最多支持 3 个"), "{error}");
+        assert!(error.message().contains("最多支持 4 个"), "{error}");
 
         let source = r#"
 Declare PtrSafe Function MessageBoxA Lib "user32" (ByVal hwnd As LongPtr, ByVal text As String, ByVal title As String, ByVal flags As Long) As Long
