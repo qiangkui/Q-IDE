@@ -12,6 +12,7 @@ pub const DIR_NAME: &str = "ai-rules";
 
 const COMMON: &str = include_str!("common.md");
 const VB: &str = include_str!("vb.md");
+const RUST: &str = include_str!("rust.md");
 const DEFAULT: &str = include_str!("default.md");
 const README: &str = include_str!("README.md");
 
@@ -42,6 +43,7 @@ pub(crate) fn ensure_defaults_in(dir: &Path) -> std::io::Result<()> {
         ("README.md", README),
         ("common.md", COMMON),
         ("vb.md", VB),
+        ("rust.md", RUST),
         ("default.md", DEFAULT),
     ] {
         let path = dir.join(name);

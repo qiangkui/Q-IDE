@@ -1,8 +1,11 @@
 //! VB 值模型：`Variant` 语义、类型名与转换规则。
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
+
+use crate::interpreter::com::ComObject;
 
 /// VB 的声明类型（`Dim x As Long` 里的 `Long`）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,6 +18,8 @@ pub enum VbType {
     LongPtr,
     Single,
     Double,
+    Currency,
+    Date,
     Boolean,
     Str,
     Object,
@@ -33,6 +38,8 @@ impl VbType {
             "longptr" => Self::LongPtr,
             "single" => Self::Single,
             "double" => Self::Double,
+            "currency" => Self::Currency,
+            "date" => Self::Date,
             "boolean" | "bool" => Self::Boolean,
             "string" | "str" => Self::Str,
             "object" => Self::Object,
@@ -41,7 +48,7 @@ impl VbType {
         })
     }
 
-    /// 标识符类型后缀（`s$`、`x%`）对应的声明类型；`@`（Currency）尚未实现。
+    /// 标识符类型后缀（`s$`、`x%`、`amount@`）对应的声明类型。
     pub fn from_suffix(suffix: char) -> Option<Self> {
         Some(match suffix {
             '$' => Self::Str,
@@ -49,6 +56,7 @@ impl VbType {
             '&' => Self::Long,
             '!' => Self::Single,
             '#' => Self::Double,
+            '@' => Self::Currency,
             _ => return None,
         })
     }
@@ -64,6 +72,8 @@ impl VbType {
             Self::LongPtr => "LongPtr",
             Self::Single => "Single",
             Self::Double => "Double",
+            Self::Currency => "Currency",
+            Self::Date => "Date",
             Self::Boolean => "Boolean",
             Self::Str => "String",
             Self::Object => "Object",
@@ -134,9 +144,7 @@ impl VbArray {
         let total = dims.iter().map(|(_, count)| *count).product::<usize>();
         Self {
             dims,
-            items: (0..total)
-                .map(|_| new_cell(fill.copy_value()))
-                .collect(),
+            items: (0..total).map(|_| new_cell(fill.copy_value())).collect(),
             ty,
             dynamic,
             record,
@@ -157,7 +165,15 @@ impl VbArray {
 
     /// 元素快照，用于 `Join` / `For Each` 这类线性遍历。
     pub fn values(&self) -> Vec<Value> {
-        self.items.iter().map(|cell| cell.borrow().clone()).collect()
+        self.items
+            .iter()
+            .map(|cell| cell.borrow().clone())
+            .collect()
+    }
+
+    /// 元素存储单元（共享 `Rc`，不复制值），供只需要读一遍的调用方遍历。
+    pub fn cells(&self) -> &[Rc<RefCell<Value>>] {
+        &self.items
     }
 
     /// 数组类型名：`Long()`、`Point()` 等。
@@ -226,30 +242,42 @@ impl VbArray {
         Ok(())
     }
 
-    /// `ReDim [Preserve]`：重建维度；`Preserve` 时按线性位置保留原有元素。
+    /// `ReDim [Preserve]`：重建维度；`Preserve` 时按行保留最后一维里已有的元素。
     pub fn redim(&mut self, dims: Vec<(i32, usize)>, ty: Option<VbType>, preserve: bool) {
         let explicit_type = ty.is_some();
         let ty = ty.unwrap_or(self.ty);
         // `ReDim a(n) As String` 会把 UDT 数组改成普通数组。
-        let template = if explicit_type { None } else { self.record.clone() };
+        let template = if explicit_type {
+            None
+        } else {
+            self.record.clone()
+        };
         let fill = match &template {
             Some((_, template)) => template.copy_value(),
             None => default_value(ty),
         };
         let total = dims.iter().map(|(_, count)| *count).product::<usize>();
-        let mut items: Vec<Rc<RefCell<Value>>> =
+        let items: Vec<Rc<RefCell<Value>>> =
             (0..total).map(|_| new_cell(fill.copy_value())).collect();
-        if preserve && self.dims.len() == dims.len() {
+        if preserve && self.dims.len() == dims.len() && !self.dims.is_empty() {
             let element_ty = if template.is_some() {
                 VbType::Variant
             } else {
                 ty
             };
-            for (cell, old) in items.iter_mut().zip(&self.items) {
-                *cell.borrow_mut() = old
-                    .borrow()
-                    .coerce(element_ty)
-                    .unwrap_or_else(|_| fill.copy_value());
+            // 行主序：只有最后一维（行内下标）变化，其余维度由调用方保证不变，
+            // 因此按「行」逐段搬运，前几维的数据不会串行。
+            let old_last = self.dims[self.dims.len() - 1].1;
+            let new_last = dims[dims.len() - 1].1;
+            let keep = old_last.min(new_last);
+            // `old_last` 理论上不会是 0（`array_dims` 保证每一维至少一个元素）。
+            let rows = self.items.len().checked_div(old_last).unwrap_or(0);
+            for row in 0..rows {
+                for column in 0..keep {
+                    let old = self.items[row * old_last + column].borrow();
+                    *items[row * new_last + column].borrow_mut() =
+                        old.coerce(element_ty).unwrap_or_else(|_| fill.copy_value());
+                }
             }
         }
         self.dims = dims;
@@ -483,9 +511,10 @@ impl VbCollection {
     }
 
     fn position_of_key(&self, key: &str) -> Option<usize> {
-        self.items
-            .iter()
-            .position(|(name, _)| name.as_deref().is_some_and(|name| name.eq_ignore_ascii_case(key)))
+        self.items.iter().position(|(name, _)| {
+            name.as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(key))
+        })
     }
 }
 
@@ -496,15 +525,20 @@ impl Default for VbCollection {
 }
 
 /// `Dictionary`：键值对（键大小写不敏感，保持插入顺序）。
+///
+/// 另存一张「小写键 → 下标」的索引表，`Exists` / `d(键)` 这类查找是 O(1)，
+/// 大量插入时不会退化成 O(n²)。
 #[derive(Clone, Debug, PartialEq)]
 pub struct VbDictionary {
     entries: Vec<(String, Value)>,
+    index: HashMap<String, usize>,
 }
 
 impl VbDictionary {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            index: HashMap::new(),
         }
     }
 
@@ -522,7 +556,7 @@ impl VbDictionary {
     }
 
     pub fn exists(&self, key: &str) -> bool {
-        self.position(key).is_some()
+        self.index.contains_key(&key.to_ascii_lowercase())
     }
 
     pub fn get(&self, key: &str) -> Result<Value, String> {
@@ -532,9 +566,12 @@ impl VbDictionary {
     }
 
     pub fn set(&mut self, key: String, value: Value) {
-        match self.position(&key) {
+        match self.index.get(&key.to_ascii_lowercase()).copied() {
             Some(index) => self.entries[index].1 = value,
-            None => self.entries.push((key, value)),
+            None => {
+                self.index.insert(key.to_ascii_lowercase(), self.entries.len());
+                self.entries.push((key, value));
+            }
         }
     }
 
@@ -543,6 +580,7 @@ impl VbDictionary {
         if self.exists(&key) {
             return Err(format!("`Dictionary` 里已经有键 `{key}`"));
         }
+        self.index.insert(key.to_ascii_lowercase(), self.entries.len());
         self.entries.push((key, value));
         Ok(())
     }
@@ -552,6 +590,11 @@ impl VbDictionary {
             return Err(format!("`Dictionary` 里没有键 `{key}`"));
         };
         self.entries.remove(index);
+        // 被删元素之后的下标整体前移一位；重建索引表的代价是 O(n)，与 `Vec::remove` 同阶。
+        self.index.clear();
+        for (position, (name, _)) in self.entries.iter().enumerate() {
+            self.index.insert(name.to_ascii_lowercase(), position);
+        }
         Ok(())
     }
 
@@ -563,13 +606,14 @@ impl VbDictionary {
     }
 
     pub fn values(&self) -> Vec<Value> {
-        self.entries.iter().map(|(_, value)| value.clone()).collect()
+        self.entries
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect()
     }
 
     fn position(&self, key: &str) -> Option<usize> {
-        self.entries
-            .iter()
-            .position(|(name, _)| name.eq_ignore_ascii_case(key))
+        self.index.get(&key.to_ascii_lowercase()).copied()
     }
 }
 
@@ -586,6 +630,8 @@ impl Default for VbDictionary {
 #[derive(Debug)]
 pub struct VbInstance {
     class_name: String,
+    /// 小写类名：类定义表按小写名索引，缓存下来省掉每次成员访问的字符串转换。
+    key: String,
     fields: Vec<InstanceField>,
     /// `Class_Terminate` 是否已经跑过。
     terminated: std::cell::Cell<bool>,
@@ -601,8 +647,11 @@ pub struct InstanceField {
 
 impl VbInstance {
     pub fn new(class_name: impl Into<String>) -> Self {
+        let class_name = class_name.into();
+        let key = class_name.to_ascii_lowercase();
         Self {
-            class_name: class_name.into(),
+            class_name,
+            key,
             fields: Vec::new(),
             terminated: std::cell::Cell::new(false),
         }
@@ -615,6 +664,11 @@ impl VbInstance {
 
     pub fn type_name(&self) -> &str {
         &self.class_name
+    }
+
+    /// 小写类名（`classes` 表的键）。
+    pub fn key(&self) -> &str {
+        &self.key
     }
 
     /// 追加一条实例变量；重名时覆盖旧值。
@@ -632,10 +686,7 @@ impl VbInstance {
     }
 
     pub fn field(&self, name: &str) -> Option<InstanceField> {
-        self.fields
-            .iter()
-            .find(|field| field.name == name)
-            .cloned()
+        self.fields.iter().find(|field| field.name == name).cloned()
     }
 
     pub fn fields(&self) -> &[InstanceField] {
@@ -660,7 +711,7 @@ impl PartialEq for ClassRef {
     }
 }
 
-/// 运行期值：VB 的 `Variant` 只分「整数 / 浮点 / 字符串 / 布尔 / 空」几类。
+/// 运行期值：保留 VB 标量子类型身份，并用引用值表示数组与对象。
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     /// 尚未赋值（VB 的 `Empty`）。
@@ -671,6 +722,10 @@ pub enum Value {
     /// 所有整数类型统一用 `i64` 承载，赋值时按声明类型截断。
     Int(i64),
     Float(f64),
+    /// VB Currency：有符号 64 位定点数，最低 4 位表示小数（精度 1/10000）。
+    Currency(i64),
+    /// OLE Automation 日期序列（Double），与普通浮点数保持独立类型身份。
+    Date(f64),
     Str(String),
     /// VB 数组（`Dim a(10)`、`ReDim`、`Split`、`Array` 都会产生它）。
     Array(Rc<RefCell<VbArray>>),
@@ -684,6 +739,8 @@ pub enum Value {
     FuncPtr(String),
     /// `Class ... End Class` 的实例（引用语义）。
     Class(ClassRef),
+    /// Windows COM Automation 对象。
+    ComObject(ComObject),
 }
 
 impl Value {
@@ -755,11 +812,11 @@ impl Value {
         matches!(self, Self::Dictionary(_))
     }
 
-    /// 是否是对象值：`Collection` / `Dictionary` / `Class` 实例。
+    /// 是否是对象值：`Collection` / `Dictionary` / 类实例 / COM 对象。
     pub fn is_object(&self) -> bool {
         matches!(
             self,
-            Self::Collection(_) | Self::Dictionary(_) | Self::Class(_)
+            Self::Collection(_) | Self::Dictionary(_) | Self::Class(_) | Self::ComObject(_)
         )
     }
 
@@ -779,15 +836,11 @@ impl Value {
         }
     }
 
-    /// 按值复制：记录与数组会深拷贝（VB 的赋值语义），集合是引用语义（共享同一份）。
+    /// 按值复制：记录与数组会深拷贝；集合、类与 COM 对象保留引用语义。
     pub fn copy_value(&self) -> Value {
         match self {
-            Self::Record(record) => {
-                Value::Record(Rc::new(RefCell::new(record.borrow().copy())))
-            }
-            Self::Array(array) => {
-                Value::Array(Rc::new(RefCell::new(array.borrow().copy())))
-            }
+            Self::Record(record) => Value::Record(Rc::new(RefCell::new(record.borrow().copy()))),
+            Self::Array(array) => Value::Array(Rc::new(RefCell::new(array.borrow().copy()))),
             other => other.clone(),
         }
     }
@@ -799,6 +852,8 @@ impl Value {
             Self::Bool(_) => "Boolean".into(),
             Self::Int(_) => "Long".into(),
             Self::Float(_) => "Double".into(),
+            Self::Currency(_) => "Currency".into(),
+            Self::Date(_) => "Date".into(),
             Self::Str(_) => "String".into(),
             Self::Array(array) => array.borrow().type_name(),
             Self::Record(record) => record.borrow().type_name().to_string(),
@@ -806,24 +861,44 @@ impl Value {
             Self::Dictionary(_) => "Dictionary".into(),
             Self::FuncPtr(_) => "LongPtr".into(),
             Self::Class(instance) => instance.0.borrow().type_name().to_string(),
+            Self::ComObject(_) => "Object".into(),
         }
     }
 
     /// 求值用的真假判定（`If`、`Do While` 等）。
+    ///
+    /// 字符串只接受 `True`/`False`（大小写不敏感）与数字文本，其余按 VB 报类型不匹配，
+    /// 避免 `If "abc" Then` 这类明显写错的代码被当成真。
     pub fn to_bool(&self) -> Result<bool, String> {
         Ok(match self {
             Self::Empty => false,
-            Self::Null => return Err("Null 不能用作条件".into()),
+            Self::Null => return Err("无效使用 Null：Null 不能用作条件".into()),
             Self::Bool(value) => *value,
             Self::Int(value) => *value != 0,
             Self::Float(value) => *value != 0.0,
-            Self::Str(value) => !value.is_empty() && !value.eq_ignore_ascii_case("false"),
-            Self::Array(_) => return Err("数组不能用作条件".into()),
-            Self::Record(_) => return Err("记录不能用作条件".into()),
-            Self::Collection(_) => return Err("集合不能用作条件".into()),
-            Self::Dictionary(_) => return Err("字典不能用作条件".into()),
+            Self::Currency(value) => *value != 0,
+            Self::Date(value) => *value != 0.0,
+            Self::Str(text) => {
+                if text.eq_ignore_ascii_case("true") {
+                    true
+                } else if text.eq_ignore_ascii_case("false") {
+                    false
+                } else {
+                    match parse_number(text) {
+                        Some(number) => number != 0.0,
+                        None => {
+                            return Err(format!("类型不匹配：字符串 \"{text}\" 不能转换为布尔值"));
+                        }
+                    }
+                }
+            }
+            Self::Array(_) => return Err("类型不匹配：数组不能用作条件".into()),
+            Self::Record(_) => return Err("类型不匹配：记录不能用作条件".into()),
+            Self::Collection(_) => return Err("类型不匹配：集合不能用作条件".into()),
+            Self::Dictionary(_) => return Err("类型不匹配：字典不能用作条件".into()),
             Self::FuncPtr(_) => true,
-            Self::Class(_) => return Err("对象不能用作条件".into()),
+            Self::Class(_) => return Err("类型不匹配：对象不能用作条件".into()),
+            Self::ComObject(_) => return Err("类型不匹配：对象不能用作条件".into()),
         })
     }
 
@@ -832,20 +907,22 @@ impl Value {
         match self {
             Self::Empty => Ok(0),
             Self::Null => Err("Null 不能转换为数值".into()),
-            Self::Bool(value) => Ok(i64::from(*value)),
+            // VB 的 `True` 转成整数是 -1，与 [`Self::as_float`] 保持一致。
+            Self::Bool(value) => Ok(if *value { -1 } else { 0 }),
             Self::Int(value) => Ok(*value),
             Self::Float(value) => Ok(round_half_even(*value) as i64),
+            Self::Currency(value) => Ok(round_half_even(*value as f64 / 10_000.0) as i64),
+            Self::Date(value) => Ok(round_half_even(*value) as i64),
             Self::Str(text) => parse_number(text)
                 .map(|value| round_half_even(value) as i64)
-                .ok_or_else(|| format!("无法把字符串 \"{text}\" 转换为数值")),
+                .ok_or_else(|| format!("类型不匹配：无法把字符串 \"{text}\" 转换为数值")),
             Self::Array(_) => Err("数组不能转换为数值".into()),
             Self::Record(_) => Err("记录不能转换为数值".into()),
             Self::Collection(_) => Err("集合不能转换为数值".into()),
             Self::Dictionary(_) => Err("字典不能转换为数值".into()),
-            Self::FuncPtr(name) => Err(format!(
-                "`AddressOf {name}` 只能传给 `Declare` 的指针参数"
-            )),
+            Self::FuncPtr(name) => Err(format!("`AddressOf {name}` 只能传给 `Declare` 的指针参数")),
             Self::Class(_) => Err("对象不能转换为数值".into()),
+            Self::ComObject(_) => Err("对象不能转换为数值".into()),
         }
     }
 
@@ -857,31 +934,42 @@ impl Value {
             Self::Bool(value) => Ok(if *value { -1.0 } else { 0.0 }),
             Self::Int(value) => Ok(*value as f64),
             Self::Float(value) => Ok(*value),
-            Self::Str(text) => parse_number(text)
-                .ok_or_else(|| format!("无法把字符串 \"{text}\" 转换为数值")),
+            Self::Currency(value) => Ok(*value as f64 / 10_000.0),
+            Self::Date(value) => Ok(*value),
+            Self::Str(text) => {
+                parse_number(text).ok_or_else(|| format!("类型不匹配：无法把字符串 \"{text}\" 转换为数值"))
+            }
             Self::Array(_) => Err("数组不能转换为数值".into()),
             Self::Record(_) => Err("记录不能转换为数值".into()),
             Self::Collection(_) => Err("集合不能转换为数值".into()),
             Self::Dictionary(_) => Err("字典不能转换为数值".into()),
-            Self::FuncPtr(name) => Err(format!(
-                "`AddressOf {name}` 只能传给 `Declare` 的指针参数"
-            )),
+            Self::FuncPtr(name) => Err(format!("`AddressOf {name}` 只能传给 `Declare` 的指针参数")),
             Self::Class(_) => Err("对象不能转换为数值".into()),
+            Self::ComObject(_) => Err("对象不能转换为数值".into()),
+        }
+    }
+
+    pub fn as_currency(&self) -> Result<i64, String> {
+        match self {
+            Self::Currency(value) => Ok(*value),
+            _ => currency_from_float(self.as_float()?),
         }
     }
 
     /// 是否可当作数值参与运算（字符串里是数字也算）。
     pub fn is_numeric_like(&self) -> bool {
         match self {
-            Self::Int(_) | Self::Float(_) | Self::Bool(_) | Self::Empty => true,
+            Self::Int(_) | Self::Float(_) | Self::Currency(_) | Self::Bool(_) | Self::Empty => true,
             Self::Str(text) => parse_number(text).is_some(),
             Self::Null
+            | Self::Date(_)
             | Self::Array(_)
             | Self::Record(_)
             | Self::Collection(_)
             | Self::Dictionary(_)
             | Self::FuncPtr(_)
-            | Self::Class(_) => false,
+            | Self::Class(_)
+            | Self::ComObject(_) => false,
         }
     }
 
@@ -899,13 +987,15 @@ impl Value {
             }
             Self::Int(value) => value.to_string(),
             Self::Float(value) => format_float(*value),
+            Self::Currency(value) => format_currency(*value),
+            Self::Date(value) => crate::interpreter::builtins::format_date_display(*value),
             Self::Str(text) => text.clone(),
             Self::Array(array) => {
                 let array = array.borrow();
                 let joined = array
-                    .values()
+                    .cells()
                     .iter()
-                    .map(Value::to_display)
+                    .map(|cell| cell.borrow().to_display())
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("Array({joined})")
@@ -924,6 +1014,7 @@ impl Value {
             Self::Dictionary(entries) => format!("Dictionary({})", entries.borrow().count()),
             Self::FuncPtr(name) => format!("AddressOf {name}"),
             Self::Class(instance) => instance.0.borrow().type_name().to_string(),
+            Self::ComObject(_) => "COM Object".into(),
         }
     }
 
@@ -933,7 +1024,7 @@ impl Value {
     /// 大数组会让暂停时的界面卡住，所以调试面板改用它。
     pub fn debug_preview(&self, max_chars: usize) -> String {
         let text = match self {
-            Self::Array(array) => format!("Array({})", array.borrow().values().len()),
+            Self::Array(array) => format!("Array({})", array.borrow().cells().len()),
             Self::Record(record) => {
                 let record = record.borrow();
                 format!("{}（{} 个字段）", record.type_name(), record.fields().len())
@@ -943,7 +1034,10 @@ impl Value {
         if text.chars().count() <= max_chars {
             return text;
         }
-        let mut preview = text.chars().take(max_chars.saturating_sub(1)).collect::<String>();
+        let mut preview = text
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>();
         preview.push('…');
         preview
     }
@@ -964,7 +1058,8 @@ impl Value {
                 ty,
                 VbType::Variant
                     | VbType::Object
-                    | VbType::Any                    | VbType::LongPtr
+                    | VbType::Any
+                    | VbType::LongPtr
                     | VbType::LongLong
                     | VbType::Long
             )
@@ -973,6 +1068,13 @@ impl Value {
         }
         Ok(match ty {
             VbType::Variant | VbType::Object | VbType::Any => self.copy_value(),
+            VbType::Date => match self {
+                Self::Date(value) => Value::Date(*value),
+                Self::Str(text) => crate::interpreter::builtins::parse_date_value(text)
+                    .map(Value::Date)
+                    .ok_or_else(|| format!("类型不匹配：无法把字符串 \"{text}\" 转换为日期"))?,
+                _ => Value::Date(self.as_float()?),
+            },
             VbType::Byte => Value::Int(i64::from(
                 u8::try_from(self.as_int()?).map_err(|_| "溢出".to_string())?,
             )),
@@ -992,9 +1094,31 @@ impl Value {
                 Value::Float(f64::from(narrowed))
             }
             VbType::Double => Value::Float(self.as_float()?),
+            VbType::Currency => Value::Currency(self.as_currency()?),
             VbType::Boolean => Value::Bool(self.to_bool()?),
             VbType::Str => Value::Str(self.to_display()),
         })
+    }
+}
+
+pub fn currency_from_float(value: f64) -> Result<i64, String> {
+    let scaled = value * 10_000.0;
+    if !scaled.is_finite() || scaled < i64::MIN as f64 || scaled >= -(i64::MIN as f64) {
+        return Err("溢出".into());
+    }
+    Ok(round_half_even(scaled) as i64)
+}
+
+fn format_currency(value: i64) -> String {
+    let negative = value < 0;
+    let magnitude = value.unsigned_abs();
+    let whole = magnitude / 10_000;
+    let fraction = magnitude % 10_000;
+    if fraction == 0 {
+        format!("{}{whole}", if negative { "-" } else { "" })
+    } else {
+        let fraction = format!("{fraction:04}").trim_end_matches('0').to_string();
+        format!("{}{whole}.{fraction}", if negative { "-" } else { "" })
     }
 }
 
@@ -1022,15 +1146,59 @@ pub fn round_half_even(value: f64) -> f64 {
     }
 }
 
-/// 数字转字符串：整数不带小数点，浮点去掉多余的 0。
+/// 数字转字符串：整数不带小数点，浮点按 VB6 的 15 位有效数字显示。
+///
+/// VB6 的 `Debug.Print` / `CStr` 只显示 15 位有效数字，因此 `0.1 + 0.2` 显示 `0.3`
+/// 而不是最短往返表示 `0.30000000000000004`；绝对值 ≥ 1E+15 或 ≤ 1E-04 时改用科学计数法。
 pub fn format_float(value: f64) -> String {
     if !value.is_finite() {
         return format!("{value}");
     }
-    if value == value.trunc() && value.abs() < 1e15 {
-        return format!("{}", value as i64);
+    if value == 0.0 {
+        return "0".into();
     }
-    let text = format!("{value}");
+    let exponent = value.abs().log10().floor();
+    if !(-3.0..15.0).contains(&exponent) {
+        return format_scientific(value);
+    }
+    // 15 位有效数字：整数部分占 (exponent + 1) 位，其余留给小数。
+    let decimals = (14.0 - exponent).max(0.0) as usize;
+    trim_float_text(format!("{value:.decimals$}"))
+}
+
+/// 科学计数法（`1.5E+20`、`1E-05`），尾数同样保留 15 位有效数字。
+fn format_scientific(value: f64) -> String {
+    let mut exponent = value.abs().log10().floor() as i32;
+    let mut mantissa = value / 10f64.powi(exponent);
+    if !mantissa.is_finite() {
+        // 极端次正规数：`10f64.powi` 已经下溢，退回最短表示。
+        return format!("{value}");
+    }
+    let mut text = format!("{mantissa:.14}");
+    // 舍入可能把尾数推到 10，需要进位到下一档指数。
+    if text.trim_start_matches('-').starts_with("10") {
+        exponent += 1;
+        mantissa /= 10.0;
+        text = format!("{mantissa:.14}");
+    }
+    format!(
+        "{}E{}{:02}",
+        trim_float_text(text),
+        if exponent < 0 { '-' } else { '+' },
+        exponent.abs()
+    )
+}
+
+/// 去掉定点小数里多余的 0（`2.000` → `2`、`0.30` → `0.3`）。
+fn trim_float_text(mut text: String) -> String {
+    if text.contains('.') {
+        while text.ends_with('0') {
+            text.pop();
+        }
+        if text.ends_with('.') {
+            text.pop();
+        }
+    }
     text
 }
 
@@ -1049,15 +1217,24 @@ mod tests {
 
     #[test]
     fn integer_and_float_coerce() {
-        assert_eq!(Value::Float(3.9).coerce(VbType::Long).unwrap(), Value::Int(4));
+        assert_eq!(
+            Value::Float(3.9).coerce(VbType::Long).unwrap(),
+            Value::Int(4)
+        );
         assert_eq!(Value::Int(300).coerce(VbType::Byte).unwrap_err(), "溢出");
         assert_eq!(Value::Int(-1).coerce(VbType::Byte).unwrap_err(), "溢出");
-        assert_eq!(Value::Int(70000).coerce(VbType::Integer).unwrap_err(), "溢出");
+        assert_eq!(
+            Value::Int(70000).coerce(VbType::Integer).unwrap_err(),
+            "溢出"
+        );
         assert_eq!(
             Value::Int(2_200_000_000).coerce(VbType::Long).unwrap_err(),
             "溢出"
         );
-        assert_eq!(Value::Int(255).coerce(VbType::Byte).unwrap(), Value::Int(255));
+        assert_eq!(
+            Value::Int(255).coerce(VbType::Byte).unwrap(),
+            Value::Int(255)
+        );
         assert_eq!(
             Value::Float(1.0e39).coerce(VbType::Single).unwrap_err(),
             "溢出"
@@ -1065,6 +1242,28 @@ mod tests {
         assert_eq!(
             Value::Str("12".into()).coerce(VbType::Integer).unwrap(),
             Value::Int(12)
+        );
+    }
+
+    #[test]
+    fn currency_coercion_is_fixed_point_and_uses_bankers_rounding() {
+        assert_eq!(
+            Value::Float(1.23455).coerce(VbType::Currency).unwrap(),
+            Value::Currency(12_346)
+        );
+        assert_eq!(
+            Value::Float(1.23445).coerce(VbType::Currency).unwrap(),
+            Value::Currency(12_344)
+        );
+        assert_eq!(
+            Value::Float(-1.23455).coerce(VbType::Currency).unwrap(),
+            Value::Currency(-12_346)
+        );
+        assert_eq!(Value::Currency(12_340).to_display(), "1.234");
+        assert_eq!(Value::Currency(12_345).to_display(), "1.2345");
+        assert_eq!(
+            Value::Float(1.0e15).coerce(VbType::Currency).unwrap_err(),
+            "溢出"
         );
     }
 

@@ -1,8 +1,9 @@
 //! VB 语法脚本解释器。
 //!
-//! 设计目标：用 VB6/VBA 的语法写「能直接调用 Win32 API」的小脚本。
+//! 设计目标：以 VB6 语法子集写「能直接调用 Win32 API」的小脚本，并提供少量 Win64 API 类型扩展。
 //!
-//! - [`lexer`] / [`parser`]：词法与语法分析（大小写不敏感、`'` 注释、`_` 续行、`Dim/If/For/Do`）；
+//! - [`lexer`] / [`parser`]：词法与语法分析（大小写不敏感、`'` 注释、`_` 续行、`Dim/If/For/Do`、
+//!   `Like`/`Eqv`/`Imp`、`GoSub`/`Return` 和整数枚举常量表达式）；
 //! - [`runtime`]：树遍历求值，支持 `Sub`/`Function`、默认 `ByRef` 传参、数组与 `For Each`、
 //!   `Type ... End Type` 记录与 `With ... End With`、静态作用域（过程只见自己的局部变量与模块级变量）、
 //!   `Option Explicit`/`Option Base`/`Option Compare Binary|Text`、`Static` 局部变量，
@@ -17,16 +18,18 @@
 //! interpreter::run("Debug.Print 1 + 2", |line| lines.push(line.to_string()), &flag)?;
 //! ```
 //!
-//! 已知边界：COM 对象与 `Property Set` 尚不支持；
-//! Win32 调用支持 `ByRef` / `ByVal` 结构体（字段为整型/浮点/`String * n`/标量数组；
-//! `ByVal` 按 x64 ABI：≤ 8 字节进寄存器，更大的传临时副本指针）、整数参数、全 `Double`、
-//! 全 `Single`，以及最多 4 个参数的整数/`Double` 混合调用，返回值可为整数或 `Single`/`Double`；
-//! 不支持 `Single` 与 `Double` 混用、超过 4 个参数的混合浮点调用，
-//! 结构体里的变长 `String` 与 UDT 数组字段也不能用于 Win32 调用。
+//! COM Automation 支持 `CreateObject`、活动对象/新对象/moniker `GetObject`、属性与
+//! 位置/命名参数调用、标量/字符串 ByRef 和一维 Variant 数组封送；
+//! 多维/强类型数组、记录封送与 COM 事件尚不支持。
+//! Win32 调用支持 `ByRef` / `ByVal` 结构体（字段为整型/浮点/`String * n`/标量或 UDT 数组；
+//! `ByVal` 按 x64 ABI：≤ 8 字节进寄存器，更大的传临时副本指针）、最多 64 个整数与
+//! `Single`/`Double`/`Date` 混合的标量参数，返回值可为整数或 `Single`/`Double`/`Date`；
+//! 结构体里的变长 `String` 仍不能用于 Win32 调用。
 //! `AddressOf 过程名` 可以把自己的过程当成回调交给 API：参数经机器码跳板进入解释器，
-//! 支持最多 4 个 `Byte`/`Integer`/`Long`/`Boolean`/`LongLong`/`LongPtr`/`Single`/`Double`
+//! 支持最多 64 个 `Byte`/`Integer`/`Long`/`Boolean`/`LongLong`/`LongPtr`/`Currency`/`Single`/`Double`/`Date`
 //! 或 `String` 形参（`ByVal String` 是 `LPCWSTR`，`ByRef` 是 `LPWSTR *`），
-//! 返回值可为整数类型（`Sub` 视为 0），不支持返回 `String`/浮点、记录与数组形参；
+//! 返回值可为整数、`Single`、`Double`/`Date` 或 NUL 结尾的 `String`（`Sub` 视为 0）；
+//! 支持 ByRef UDT 形参，不支持数组形参；
 //! 直接作为 `Declare` 实参的跳板只在该次调用期间有效（`EnumWindows`、`InitOnceExecuteOnce` 等）；
 //! 写进 UDT 字段（如 `WNDCLASSW.lpfnWndProc`）时会生成持久跳板，存活到脚本结束，
 //! 因此 `RegisterClassW` + `CreateWindowExW` 这类窗口过程也能用。
@@ -37,7 +40,8 @@
 //! 过程支持 `Sub`/`Function`、`Optional` 默认值、`ParamArray`（收集剩余实参为 0 基数组），
 //! 以及模块级 `Property Get`/`Property Let`：`X = 值` 与 `X(下标) = 值` 会分派到同名 Let，
 //! 读 `X` / `X(下标)` 会调用 Get（`Exit Property` 也可用）。
-//! `Enum ... End Enum` 的成员注册为模块级常量，`Dim c As Color` 按 `Long` 处理。
+//! `Enum ... End Enum` 的成员注册为模块级常量，显式值支持整数常量表达式，
+//! `Dim c As Color` 按 `Long` 处理。
 //! 对象支持 `Collection`、`Dictionary`（`Scripting.Dictionary` 子集）与自定义 `Class`：
 //! `Dim c As New Collection` / `Set d = New Dictionary` / `Set x = Nothing`、
 //! `c.Add 元素[, 键]`、`c.Remove 下标或键`、`c.Count`、`c.Item(下标或键)`；
@@ -50,7 +54,10 @@
 //! 实例是引用语义（赋值、传参共享同一份），`TypeOf x Is 类名` 判断实例类型。
 //! `Private WithEvents m As New 类名` 让类订阅另一个类的事件，`RaiseEvent 事件(实参)`
 //! 会回调订阅者的 `源类名_事件名` 方法（订阅表用弱引用，对象被回收后自动失效）。
-//! 简化之处：`Public`/`Private` 只做语法接受（成员都从外部可见）、没有 `Implements`、
+//! 类成员字段未标注时默认为 `Private`，方法和属性未标注时默认为 `Public`；显式访问修饰符生效，
+//! 同类成员可以访问私有成员。类可用 `Implements 接口类` 声明接口，并以私有
+//! `接口类_成员名` 方法/属性实现接口；当前没有独立的接口变量类型或编译期接口成员检查。
+//! 简化之处：
 //! 类内裸赋值 `Name = v` 不触发同名 `Property Let`（写 `Me.Name = v`）、
 //! `Dim x As 类名` 需要类在同文件里先定义。
 //! 错误处理支持 `On Error Resume Next`、`On Error GoTo 标签`、`On Error GoTo 0`、`GoTo 标签`、
@@ -58,7 +65,14 @@
 //! `Resume`/`Resume Next` 的恢复点是「出错语句所在的根块语句」。
 //! 与 VB 一致，整数与 `Single` 的赋值超出目标类型范围时报错误号 6（`溢出`），
 //! 不会静默截断；`Variant`/`Double` 不做范围检查。
-//! 数组支持 `Dim a(10)`、`a(1 To n)`、多维、`ReDim [Preserve]`、`Erase` 与 `For Each`，
+//! `CInt`/`CLng` 按银行家舍入并检查目标类型范围（越界错误号 6），`CBool` 与 `If` 条件里的字符串
+//! 只接受 `True`/`False` 与数字文本（其余错误号 13）；`Str` 给非负数加前导空格，`Val` 认识
+//! `&H`/`&O` 前缀；`Double` 按 VB6 的 15 位有效数字显示（`0.1 + 0.2` 打印 `0.3`）。
+//! `For` 在起止值与步长都是整数时按整数精确步进；`Space`/`String` 与定长字段都有大小上限。
+//! 过程递归会同时看 `max_depth` 与线程剩余栈空间，栈不够时报错误号 28 而不是让进程被终止；
+//! 宿主应当用 [`SCRIPT_STACK_SIZE`] 开脚本线程（见 [`spawn_script_thread`]）。
+//! `Date` 以独立值类型表示，内部存储 OLE Automation 日期序列，边界上按 Double/`VT_DATE` 封送。
+//! 数组支持 `Dim a(10)`、`a(1 To n)`、多维、`ReDim [Preserve]`（只保留最后一维的数据）、`Erase` 与 `For Each`，
 //! 元素也可以是 UDT（`Dim pts(2) As Point`、`pts(0).X = 1`）；UDT 支持成员访问、嵌套记录与 `With`。
 //! 数组与记录**赋值按值复制**，`ByRef` 传参（`Bump a(0)`、`Bump p.X`）仍共享同一份存储。
 //! 文件 I/O 支持 `Open ... For Input/Output/Append/Binary/Random`（`As #n` 可省略，自动分配空闲文件号）、
@@ -101,6 +115,7 @@
 
 pub mod ast;
 pub mod builtins;
+pub mod com;
 pub mod debug;
 pub mod dialog;
 pub mod error;
@@ -120,6 +135,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+/// 运行脚本的线程至少需要多大的栈。
+///
+/// 过程递归到 [`RunOptions::max_depth`] 时每层要占几十 KB（debug 构建下的
+/// `Runtime::exec` 每层约 80 KB），标准库给新线程的默认栈只有 2 MiB，
+/// 深递归的脚本会直接触发栈溢出、让整个进程退出（0xC00000FD），
+/// 而不是报一个「调用层次过深」的错误。宿主在后台线程跑脚本时用这个值开线程。
+pub const SCRIPT_STACK_SIZE: usize = 64 * 1024 * 1024;
+
 /// 运行限制，避免脚本把编辑器拖死。
 #[derive(Clone, Debug)]
 pub struct RunOptions {
@@ -131,6 +154,16 @@ pub struct RunOptions {
     pub command_line: String,
     /// 脚本文件路径：文件操作里的相对路径按它所在目录解析，`App.Path` 也返回这个目录。
     pub script_path: Option<PathBuf>,
+    /// `#Include` 在脚本目录里找不到时再搜索的目录。
+    ///
+    /// `None` 时用可执行文件旁的 `assets/`：IDE 里是程序自带的公共定义，
+    /// 而 DLL / 命令行宿主里 `current_exe()` 指向别的程序，应当显式传进来。
+    pub include_dir: Option<PathBuf>,
+    /// 是否允许 `MsgBox` / `InputBox` 弹窗。
+    ///
+    /// headless 宿主（命令行、外部 agent）设 `false`：`MsgBox` 直接返回 0（`vbOK`），
+    /// `InputBox` 返回空串，脚本不会因为等不到人点按钮而卡死。
+    pub allow_ui: bool,
 }
 
 impl Default for RunOptions {
@@ -140,8 +173,24 @@ impl Default for RunOptions {
             max_depth: 200,
             command_line: String::new(),
             script_path: None,
+            include_dir: None,
+            allow_ui: true,
         }
     }
+}
+
+/// 在后台线程跑脚本。
+///
+/// 用 [`SCRIPT_STACK_SIZE`] 而不是标准库默认的 2 MiB：过程递归到 `max_depth` 时
+/// 每层要占几十 KB，栈不够会让进程被直接终止（0xC00000FD），界面上什么也看不到。
+pub fn spawn_script_thread<F>(work: F) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name("vb-script".to_string())
+        .stack_size(SCRIPT_STACK_SIZE)
+        .spawn(work)
 }
 
 /// 解析并执行脚本；`out` 接收 `Print` / `Debug.Print` 的每一行。
@@ -163,7 +212,11 @@ pub fn run_with<F>(
 where
     F: FnMut(&str),
 {
-    let (program, map) = parse_with_source_map(source, options.script_path.as_deref())?;
+    let (program, map) = parse_with_include_dir(
+        source,
+        options.script_path.as_deref(),
+        options.include_dir.as_deref(),
+    )?;
     runtime::run_program(&program, &mut out, interrupt, &options, None)
         .map_err(|error| Error::Runtime(remap_runtime(error, &map)))?;
     Ok(())
@@ -181,15 +234,14 @@ pub fn run_debug<F>(
 where
     F: FnMut(&str),
 {
-    let (program, map) = parse_with_source_map(source, options.script_path.as_deref())?;
-    let outcome = runtime::run_program(
-        &program,
-        &mut out,
-        interrupt,
-        &options,
-        Some(debug.clone()),
-    )
-    .map_err(|error| Error::Runtime(remap_runtime(error, &map)));
+    let (program, map) = parse_with_include_dir(
+        source,
+        options.script_path.as_deref(),
+        options.include_dir.as_deref(),
+    )?;
+    let outcome =
+        runtime::run_program(&program, &mut out, interrupt, &options, Some(debug.clone()))
+            .map_err(|error| Error::Runtime(remap_runtime(error, &map)));
     debug.finish();
     outcome?;
     Ok(())
@@ -206,7 +258,16 @@ pub fn parse_with_source_map(
     source: &str,
     path: Option<&Path>,
 ) -> Result<(ast::Program, include::SourceMap), Error> {
-    let expanded = include::expand(source, path)
+    parse_with_include_dir(source, path, None)
+}
+
+/// 同 [`parse_with_source_map`]，但可以指定 `#Include` 的备用搜索目录（`assets/` 的替代）。
+pub fn parse_with_include_dir(
+    source: &str,
+    path: Option<&Path>,
+    include_dir: Option<&Path>,
+) -> Result<(ast::Program, include::SourceMap), Error> {
+    let expanded = include::expand(source, path, include_dir)
         .map_err(|error| Error::Parse(ParseError::new(error.message, error.line)))?;
     let program = parser::parse_mapped(&expanded.text, &expanded.logical_lines)
         .map_err(|error| remap_parse(error, &expanded.map))?;
@@ -368,9 +429,15 @@ Debug.Print Factorial(5)
 
     #[test]
     fn format_covers_numbers_percent_and_sections() {
-        assert_eq!(output("Debug.Print Format(1234.5, \"#,##0.00\")"), ["1,234.50"]);
+        assert_eq!(
+            output("Debug.Print Format(1234.5, \"#,##0.00\")"),
+            ["1,234.50"]
+        );
         assert_eq!(output("Debug.Print Format(0.256, \"0.0%\")"), ["25.6%"]);
-        assert_eq!(output("Debug.Print Format(-12.3, \"0.00;(0.00)\")"), ["(12.30)"]);
+        assert_eq!(
+            output("Debug.Print Format(-12.3, \"0.00;(0.00)\")"),
+            ["(12.30)"]
+        );
         assert_eq!(output("Debug.Print Format(7, \"0000\")"), ["0007"]);
         assert_eq!(output("Debug.Print Format(1.5, \"0.##\")"), ["1.5"]);
         assert_eq!(output("Debug.Print Format(\"abc\", \">\")"), ["ABC"]);
@@ -399,8 +466,10 @@ Debug.Print Join(Split("a b  c", " "), "|")
 
     #[test]
     fn array_index_out_of_range_reports_line() {
-        let error = run_lines("Dim items As Variant\nitems = Split(\"a,b\", \",\")\nDebug.Print items(5)\n")
-            .unwrap_err();
+        let error = run_lines(
+            "Dim items As Variant\nitems = Split(\"a,b\", \",\")\nDebug.Print items(5)\n",
+        )
+        .unwrap_err();
         assert!(error.message().contains("超出"), "{error}");
         assert_eq!(error.line(), 3);
     }
@@ -482,8 +551,8 @@ Debug.Print UBound(a)
 
     #[test]
     fn erase_dynamic_array_requires_redim() {
-        let error = run_lines("Dim a() As Long\nReDim a(1)\nErase a\nDebug.Print UBound(a)\n")
-            .unwrap_err();
+        let error =
+            run_lines("Dim a() As Long\nReDim a(1)\nErase a\nDebug.Print UBound(a)\n").unwrap_err();
         assert!(error.message().contains("尚未初始化"), "{error}");
         assert_eq!(error.line(), 4);
     }
@@ -647,10 +716,7 @@ Debug.Print TypeName(d)
 Debug.Print IsNumeric("12.5")
 Debug.Print IsNumeric("abc")
 "#;
-        assert_eq!(
-            output(source),
-            ["String", "12", "Double", "True", "False"]
-        );
+        assert_eq!(output(source), ["String", "12", "Double", "True", "False"]);
     }
 
     #[test]
@@ -832,10 +898,9 @@ Debug.Print p.X & "," & p.Y
 
     #[test]
     fn unknown_member_reports_line() {
-        let error = run_lines(
-            "Type Point\n    X As Long\nEnd Type\nDim p As Point\nDebug.Print p.Z\n",
-        )
-        .unwrap_err();
+        let error =
+            run_lines("Type Point\n    X As Long\nEnd Type\nDim p As Point\nDebug.Print p.Z\n")
+                .unwrap_err();
         assert!(error.message().contains("没有字段"), "{error}");
         assert_eq!(error.line(), 5);
     }
@@ -1137,9 +1202,7 @@ Close #1
         let path = std::env::temp_dir().join("vb_interp_binary_bad.dat");
         let _ = std::fs::remove_file(&path);
         let display = path.display().to_string();
-        let source = format!(
-            "Dim s As String\nOpen \"{display}\" For Binary As #1\nPut #1, , s\n"
-        );
+        let source = format!("Dim s As String\nOpen \"{display}\" For Binary As #1\nPut #1, , s\n");
         let error = run_lines(&source).unwrap_err();
         assert!(error.message().contains("String"), "{error}");
         let _ = std::fs::remove_file(&path);
@@ -1261,9 +1324,8 @@ Close #1
         let path = std::env::temp_dir().join("vb_interp_not_binary.txt");
         let _ = std::fs::remove_file(&path);
         let display = path.display().to_string();
-        let source = format!(
-            "Dim v As Long\nOpen \"{display}\" For Output As #1\nPut #1, , v\nClose #1\n"
-        );
+        let source =
+            format!("Dim v As Long\nOpen \"{display}\" For Output As #1\nPut #1, , v\nClose #1\n");
         let error = run_lines(&source).unwrap_err();
         assert!(error.message().contains("Binary"), "{error}");
         let _ = std::fs::remove_file(&path);
@@ -1361,8 +1423,7 @@ Debug.Print total
         assert!(error.message().contains("未声明"), "{error}");
         assert_eq!(error.line(), 2);
 
-        let error =
-            run_lines("Option Explicit\nSub Foo()\n    z = 1\nEnd Sub\nFoo\n").unwrap_err();
+        let error = run_lines("Option Explicit\nSub Foo()\n    z = 1\nEnd Sub\nFoo\n").unwrap_err();
         assert!(error.message().contains("未声明"), "{error}");
         assert_eq!(error.line(), 3);
     }
@@ -1444,7 +1505,8 @@ Debug.Print handle <> 0
 
     #[cfg(windows)]
     #[test]
-    fn declare_can_call_win32() {        let source = r#"
+    fn declare_can_call_win32() {
+        let source = r#"
 Declare Function GetTickCount Lib "kernel32" () As Long
 Declare Function GetModuleHandleW Lib "kernel32" (ByVal name As LongPtr) As LongPtr
 Declare Function lstrlenW Lib "kernel32" (ByVal text As String) As Long
@@ -1609,14 +1671,6 @@ Declare Function ldexp Lib "msvcrt" (ByVal x As Double, ByVal e As Long) As Doub
 Debug.Print ldexp(1.5, 3)
 "#;
         assert_eq!(output(source), ["12"]);
-
-        // 超过 4 个参数的混合调用仍明确报错。
-        let source = r#"
-Declare Function pow Lib "msvcrt" (ByVal a As Long, ByVal b As Long, ByVal c As Long, ByVal d As Long, ByVal e As Double) As Long
-Debug.Print pow(1, 2, 3, 4, 5)
-"#;
-        let error = run_lines(source).unwrap_err();
-        assert!(error.message().contains("混合"), "{error}");
     }
 
     #[test]
@@ -1634,8 +1688,13 @@ Debug.Print pow(1, 2, 3, 4, 5)
             max_steps: 4096,
             ..RunOptions::default()
         };
-        let error = run_with("Do\nLoop", |line| lines.push(line.to_string()), &flag, options)
-            .unwrap_err();
+        let error = run_with(
+            "Do\nLoop",
+            |line| lines.push(line.to_string()),
+            &flag,
+            options,
+        )
+        .unwrap_err();
         assert!(error.message().contains("步数"), "{error}");
     }
 
@@ -1670,8 +1729,8 @@ Debug.Print TypeName(c)
 
     #[test]
     fn duplicate_enum_members_are_rejected() {
-        let error = run_lines("Enum A\n    X = 1\nEnd Enum\nEnum B\n    X = 2\nEnd Enum\n")
-            .unwrap_err();
+        let error =
+            run_lines("Enum A\n    X = 1\nEnd Enum\nEnum B\n    X = 2\nEnd Enum\n").unwrap_err();
         assert!(error.message().contains("重名"), "{error}");
         let error = run_lines("Enum A\nEnd Enum\n").unwrap_err();
         assert!(error.message().contains("至少需要一个成员"), "{error}");
@@ -1820,10 +1879,7 @@ d.Name = "e"
 Debug.Print g_log
 Debug.Print TypeOf d Is Res
 "#;
-        assert_eq!(
-            output(source),
-            ["", "b;", "b;c;", "b;c;d;", "True"]
-        );
+        assert_eq!(output(source), ["", "b;", "b;c;", "b;c;d;", "True"]);
     }
 
     #[test]
@@ -2033,7 +2089,9 @@ Close #1
         );
         assert_eq!(
             output(&source),
-            ["4", "[abc ]", "12", "12", "[abc ]", "False", "True", "7", "4", "abcd"]
+            [
+                "4", "[abc ]", "12", "12", "[abc ]", "False", "True", "7", "4", "abcd"
+            ]
         );
 
         // `String * 4` 按 UTF-16 写 8 字节：`abc` + 空格（定长字符串用空格补齐）。
@@ -2280,10 +2338,7 @@ Debug.Print "a", "b", "c"
         assert_eq!(lines[1], format!("12345678901234{}x", " ".repeat(14)));
         assert_eq!(lines[2], format!("1234567890123{}x", " "));
         assert_eq!(lines[3], format!("123456789012345{}x", " ".repeat(13)));
-        assert_eq!(
-            lines[4],
-            format!("a{}b{}c", " ".repeat(13), " ".repeat(13))
-        );
+        assert_eq!(lines[4], format!("a{}b{}c", " ".repeat(13), " ".repeat(13)));
     }
 
     #[test]
@@ -2548,7 +2603,9 @@ Debug.Print Err.Number
 "#;
         assert_eq!(
             output(source),
-            ["True", "False", "True", "7", "False", "False", "True", "424"]
+            [
+                "True", "False", "True", "7", "False", "False", "True", "424"
+            ]
         );
     }
 
@@ -2737,8 +2794,22 @@ Debug.Print Join(Filter(Split("apple,banana,avocado", ","), "an"), "|")
         assert_eq!(
             output(source),
             [
-                "4", "Wednesday", "February", "True", "True", "0.5", "True", "True", "True",
-                "False", "cba", "1", "0", "65", "B", "banana",
+                "4",
+                "Wednesday",
+                "February",
+                "True",
+                "True",
+                "1899-12-30 12:00:00",
+                "True",
+                "True",
+                "True",
+                "False",
+                "cba",
+                "1",
+                "0",
+                "65",
+                "B",
+                "banana",
             ]
         );
     }
@@ -2983,12 +3054,11 @@ Debug.Print d.Count
 
     #[test]
     fn dictionary_errors_are_reported() {
-        let error = run_lines("Dim d As New Dictionary\nd.Add \"k\", 1\nd.Add \"K\", 2\n")
-            .unwrap_err();
+        let error =
+            run_lines("Dim d As New Dictionary\nd.Add \"k\", 1\nd.Add \"K\", 2\n").unwrap_err();
         assert!(error.message().contains("已经有键"), "{error}");
 
-        let error = run_lines("Dim d As New Dictionary\nDebug.Print d(\"missing\")\n")
-            .unwrap_err();
+        let error = run_lines("Dim d As New Dictionary\nDebug.Print d(\"missing\")\n").unwrap_err();
         assert!(error.message().contains("没有键"), "{error}");
     }
 
@@ -3200,15 +3270,19 @@ InitOnceExecuteOnce once, AddressOf Boom, 0, ctx
         let error = run_lines("Debug.Print AddressOf Missing\n").unwrap_err();
         assert!(error.message().contains("找不到"), "{error}");
 
-        let source = r#"
-Declare PtrSafe Function InitOnceExecuteOnce Lib "kernel32" (ByVal a As LongPtr, ByVal b As LongPtr) As Long
-Function TooMany(a As Long, b As Long, c As Long, d As Long, e As Long) As Long
-    TooMany = 0
-End Function
-InitOnceExecuteOnce AddressOf TooMany, 0
-"#;
-        let error = run_lines(source).unwrap_err();
-        assert!(error.message().contains("最多支持 4 个"), "{error}");
+        let params = (0..=crate::interpreter::trampoline::MAX_ABI_ARGS)
+            .map(|index| format!("p{index} As Long"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let source = format!(
+            "Declare PtrSafe Function InitOnceExecuteOnce Lib \"kernel32\" (ByVal a As LongPtr, ByVal b As LongPtr) As Long\n\
+             Function TooMany({params}) As Long\n\
+             TooMany = 0\n\
+             End Function\n\
+             InitOnceExecuteOnce AddressOf TooMany, 0\n"
+        );
+        let error = run_lines(&source).unwrap_err();
+        assert!(error.message().contains("最多支持 64 个"), "{error}");
 
         let source = r#"
 Declare PtrSafe Function MessageBoxA Lib "user32" (ByVal hwnd As LongPtr, ByVal text As String, ByVal title As String, ByVal flags As Long) As Long

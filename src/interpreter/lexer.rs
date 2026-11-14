@@ -52,6 +52,9 @@ pub enum Kw {
     Null,
     Empty,
     And,
+    Eqv,
+    Imp,
+    Like,
     Or,
     Not,
     Xor,
@@ -68,6 +71,7 @@ pub enum Kw {
     Static,
     Type,
     Class,
+    Implements,
     TypeOf,
     WithEvents,
     RaiseEvent,
@@ -75,6 +79,7 @@ pub enum Kw {
     On,
     Error,
     GoTo,
+    GoSub,
     Resume,
     AddressOf,
     Open,
@@ -134,6 +139,9 @@ impl Kw {
             Self::Null => "Null",
             Self::Empty => "Empty",
             Self::And => "And",
+            Self::Eqv => "Eqv",
+            Self::Imp => "Imp",
+            Self::Like => "Like",
             Self::Or => "Or",
             Self::Not => "Not",
             Self::Xor => "Xor",
@@ -150,6 +158,7 @@ impl Kw {
             Self::Static => "Static",
             Self::Type => "Type",
             Self::Class => "Class",
+            Self::Implements => "Implements",
             Self::TypeOf => "TypeOf",
             Self::WithEvents => "WithEvents",
             Self::RaiseEvent => "RaiseEvent",
@@ -157,6 +166,7 @@ impl Kw {
             Self::On => "On",
             Self::Error => "Error",
             Self::GoTo => "GoTo",
+            Self::GoSub => "GoSub",
             Self::Resume => "Resume",
             Self::AddressOf => "AddressOf",
             Self::Open => "Open",
@@ -234,6 +244,7 @@ pub enum TokenKind {
     Ident(String),
     Int(i64),
     Float(f64),
+    Date(f64),
     Str(String),
     Kw(Kw),
     Op(Op),
@@ -248,7 +259,11 @@ pub enum TokenKind {
 pub struct Token {
     pub kind: TokenKind,
     pub line: usize,
-    /// 标识符的原始拼写（关键字/符号为空）。`Declare` 依赖它保留导出名的正确大小写。
+    /// 标识符的原始拼写（关键字/符号为空）。
+    ///
+    /// 只有当拼写与 `TokenKind::Ident` 里的小写名不同（也就是源码写了大小写混合）时才存一份，
+    /// 全小写标识符留空以省掉每次词法分析的额外分配；`Declare` 需要原始拼写时用
+    /// [`Token::spelling`] 取。
     pub text: String,
     /// 标识符的类型后缀（`$ % & ! # @`），用于 `Dim s$` 之类的声明。
     pub suffix: Option<char>,
@@ -264,12 +279,20 @@ impl Token {
         }
     }
 
-    fn with_suffix(kind: TokenKind, line: usize, text: &str, suffix: Option<char>) -> Self {
+    fn with_suffix(kind: TokenKind, line: usize, text: String, suffix: Option<char>) -> Self {
         Self {
             kind,
             line,
-            text: text.to_string(),
+            text,
             suffix,
+        }
+    }
+
+    /// 标识符在源码里的原始拼写；全小写标识符没有单独保存，回退到 `Ident` 里的名字。
+    pub fn spelling(&self) -> &str {
+        match &self.kind {
+            TokenKind::Ident(name) if self.text.is_empty() => name,
+            _ => &self.text,
         }
     }
 
@@ -279,6 +302,7 @@ impl Token {
             TokenKind::Ident(name) => format!("标识符 `{name}`"),
             TokenKind::Int(value) => format!("数字 `{value}`"),
             TokenKind::Float(value) => format!("数字 `{value}`"),
+            TokenKind::Date(value) => format!("日期 `{value}`"),
             TokenKind::Str(value) => format!("字符串 \"{value}\""),
             TokenKind::Kw(kw) => format!("关键字 `{}`", kw.text()),
             TokenKind::Op(op) => format!("符号 `{}`", op.text()),
@@ -294,14 +318,88 @@ impl Token {
 /// 与 [`keyword`] 的匹配表保持一致；`keyword_list_covers_every_keyword` 测试会检查
 /// 这里的每一项都能被词法器识别。
 pub const KEYWORDS: &[&str] = &[
-    "dim", "as", "if", "then", "else", "elseif", "end", "for", "to", "step", "next", "do",
-    "loop", "while", "until", "wend", "select", "case", "is", "exit", "sub", "function", "call",
-    "let", "set", "print", "debug", "const", "byval", "byref", "optional", "declare", "lib",
-    "alias", "ptrsafe", "public", "private", "global", "true", "false", "nothing", "null",
-    "empty", "and", "or", "not", "xor", "mod", "stop", "return", "redim", "preserve", "each",
-    "in", "erase", "option", "explicit", "static", "type", "class", "typeof", "withevents",
-    "raiseevent", "with", "on", "error", "goto", "resume", "addressof", "open", "close", "input",
-    "output", "append", "property", "enum", "paramarray",
+    "dim",
+    "as",
+    "if",
+    "then",
+    "else",
+    "elseif",
+    "end",
+    "for",
+    "to",
+    "step",
+    "next",
+    "do",
+    "loop",
+    "while",
+    "until",
+    "wend",
+    "select",
+    "case",
+    "is",
+    "exit",
+    "sub",
+    "function",
+    "call",
+    "let",
+    "set",
+    "print",
+    "debug",
+    "const",
+    "byval",
+    "byref",
+    "optional",
+    "declare",
+    "lib",
+    "alias",
+    "ptrsafe",
+    "public",
+    "private",
+    "global",
+    "true",
+    "false",
+    "nothing",
+    "null",
+    "empty",
+    "and",
+    "eqv",
+    "imp",
+    "like",
+    "or",
+    "not",
+    "xor",
+    "mod",
+    "stop",
+    "return",
+    "redim",
+    "preserve",
+    "each",
+    "in",
+    "erase",
+    "option",
+    "explicit",
+    "static",
+    "type",
+    "class",
+    "implements",
+    "typeof",
+    "withevents",
+    "raiseevent",
+    "with",
+    "on",
+    "error",
+    "goto",
+    "gosub",
+    "resume",
+    "addressof",
+    "open",
+    "close",
+    "input",
+    "output",
+    "append",
+    "property",
+    "enum",
+    "paramarray",
 ];
 
 /// 判断一个词（小写）是否是关键字；编辑器高亮也用它。
@@ -360,6 +458,9 @@ fn keyword(word: &str) -> Option<Kw> {
         "null" => Kw::Null,
         "empty" => Kw::Empty,
         "and" => Kw::And,
+        "eqv" => Kw::Eqv,
+        "imp" => Kw::Imp,
+        "like" => Kw::Like,
         "or" => Kw::Or,
         "not" => Kw::Not,
         "xor" => Kw::Xor,
@@ -376,6 +477,7 @@ fn keyword(word: &str) -> Option<Kw> {
         "static" => Kw::Static,
         "type" => Kw::Type,
         "class" => Kw::Class,
+        "implements" => Kw::Implements,
         "typeof" => Kw::TypeOf,
         "withevents" => Kw::WithEvents,
         "raiseevent" => Kw::RaiseEvent,
@@ -383,6 +485,7 @@ fn keyword(word: &str) -> Option<Kw> {
         "on" => Kw::On,
         "error" => Kw::Error,
         "goto" => Kw::GoTo,
+        "gosub" => Kw::GoSub,
         "resume" => Kw::Resume,
         "addressof" => Kw::AddressOf,
         "open" => Kw::Open,
@@ -405,7 +508,8 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, ParseError> {
 /// 同 [`tokenize`]，但允许把物理行映射成逻辑行号（`#Include` 展开用）。
 pub fn tokenize_mapped(source: &str, lines: &[usize]) -> Result<Vec<Token>, ParseError> {
     let chars: Vec<char> = source.chars().collect();
-    let mut tokens = Vec::new();
+    // 典型脚本约每 4 个字符一个 token，预分配避免反复扩容。
+    let mut tokens = Vec::with_capacity(source.len() / 4 + 1);
     let mut index = 0usize;
     let mut physical_line = 1usize;
     let mut line = logical_line(lines, physical_line);
@@ -449,13 +553,26 @@ pub fn tokenize_mapped(source: &str, lines: &[usize]) -> Result<Vec<Token>, Pars
                 index = next;
                 at_statement_start = false;
             }
+            '#' => {
+                if let Some((serial, next)) = scan_date_literal(&chars, index) {
+                    tokens.push(Token::new(TokenKind::Date(serial), line));
+                    index = next;
+                    at_statement_start = false;
+                } else {
+                    tokens.push(Token::new(TokenKind::Op(Op::Hash), line));
+                    index += 1;
+                    at_statement_start = false;
+                }
+            }
             '&' if matches!(chars.get(index + 1), Some('h' | 'H' | 'o' | 'O')) => {
                 let (value, next) = scan_radix_number(&chars, index, line)?;
                 tokens.push(Token::new(TokenKind::Int(value), line));
                 index = next;
                 at_statement_start = false;
             }
-            c if c.is_ascii_digit() || (c == '.' && matches!(chars.get(index + 1), Some(d) if d.is_ascii_digit())) => {
+            c if c.is_ascii_digit()
+                || (c == '.' && matches!(chars.get(index + 1), Some(d) if d.is_ascii_digit())) =>
+            {
                 let (kind, next) = scan_number(&chars, index, line)?;
                 tokens.push(Token::new(kind, line));
                 index = next;
@@ -463,10 +580,11 @@ pub fn tokenize_mapped(source: &str, lines: &[usize]) -> Result<Vec<Token>, Pars
             }
             c if c.is_alphabetic() || c == '_' => {
                 let start = index;
-                while index < chars.len() && (chars[index].is_alphanumeric() || chars[index] == '_') {
+                while index < chars.len() && (chars[index].is_alphanumeric() || chars[index] == '_')
+                {
                     index += 1;
                 }
-                let word: String = chars[start..index].iter().collect();
+                let word = &chars[start..index];
                 // 类型后缀，例如 `Left$`、`x%`，去掉后缀但保留名字。
                 let mut suffix = None;
                 if let Some(next) = chars.get(index).copied()
@@ -475,7 +593,13 @@ pub fn tokenize_mapped(source: &str, lines: &[usize]) -> Result<Vec<Token>, Pars
                     suffix = Some(next);
                     index += 1;
                 }
-                let lower = word.to_ascii_lowercase();
+                // 全小写标识符不必另存一份原始拼写（`Token::spelling` 会回退到小写名）。
+                let mut lower = String::with_capacity(word.len());
+                let mut has_upper = false;
+                for ch in word {
+                    lower.push(ch.to_ascii_lowercase());
+                    has_upper |= ch.is_ascii_uppercase();
+                }
                 if lower == "rem" && at_statement_start {
                     while index < chars.len() && chars[index] != '\n' {
                         index += 1;
@@ -484,12 +608,20 @@ pub fn tokenize_mapped(source: &str, lines: &[usize]) -> Result<Vec<Token>, Pars
                 }
                 match keyword(&lower) {
                     Some(kw) => tokens.push(Token::new(TokenKind::Kw(kw), line)),
-                    None => tokens.push(Token::with_suffix(
-                        TokenKind::Ident(lower),
-                        line,
-                        &word,
-                        suffix,
-                    )),
+                    None => {
+                        // 只在真正需要（`Declare` 的导出名）时才留一份原始拼写。
+                        let original = if has_upper {
+                            word.iter().collect()
+                        } else {
+                            String::new()
+                        };
+                        tokens.push(Token::with_suffix(
+                            TokenKind::Ident(lower),
+                            line,
+                            original,
+                            suffix,
+                        ));
+                    }
                 }
                 at_statement_start = false;
             }
@@ -506,6 +638,18 @@ pub fn tokenize_mapped(source: &str, lines: &[usize]) -> Result<Vec<Token>, Pars
 
     tokens.push(Token::new(TokenKind::Eof, line));
     Ok(tokens)
+}
+
+fn scan_date_literal(chars: &[char], start: usize) -> Option<(f64, usize)> {
+    let tail = &chars[start + 1..];
+    let line_end = tail
+        .iter()
+        .position(|ch| matches!(ch, '\n' | '\r'))
+        .unwrap_or(tail.len());
+    let end = tail[..line_end].iter().position(|ch| *ch == '#')? + start + 1;
+    let text: String = chars[start + 1..end].iter().collect();
+    let serial = crate::interpreter::builtins::parse_date_value(&text)?;
+    Some((serial, end + 1))
 }
 
 /// 物理行 → 逻辑行号；映射表用完后沿用最后一项（EOF 行）。
@@ -552,7 +696,11 @@ fn scan_radix_number(
     start: usize,
     line: usize,
 ) -> Result<(i64, usize), ParseError> {
-    let radix = if matches!(chars[start + 1], 'h' | 'H') { 16 } else { 8 };
+    let radix = if matches!(chars[start + 1], 'h' | 'H') {
+        16
+    } else {
+        8
+    };
     let mut index = start + 2;
     let mut digits = String::new();
     while index < chars.len() && chars[index].is_ascii_alphanumeric() {
@@ -668,7 +816,11 @@ mod tests {
     use super::*;
 
     fn kinds(source: &str) -> Vec<TokenKind> {
-        tokenize(source).unwrap().into_iter().map(|t| t.kind).collect()
+        tokenize(source)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.kind)
+            .collect()
     }
 
     #[test]
@@ -689,7 +841,11 @@ mod tests {
                 .count(),
             3
         );
-        assert!(!tokens.iter().any(|token| matches!(token, TokenKind::Ident(name) if name == "rem")));
+        assert!(
+            !tokens
+                .iter()
+                .any(|token| matches!(token, TokenKind::Ident(name) if name == "rem"))
+        );
     }
 
     #[test]
@@ -701,5 +857,26 @@ mod tests {
         assert_eq!(tokens[3], TokenKind::Float(1.5));
         assert_eq!(tokens[4], TokenKind::Ident("left".into()));
         assert_eq!(tokens[5], TokenKind::Ident("x".into()));
+    }
+
+    #[test]
+    fn spelling_keeps_the_source_case() {
+        let tokens = tokenize("MessageBoxW msgboxw 中文名").unwrap();
+        let spellings: Vec<&str> = tokens
+            .iter()
+            .filter(|token| matches!(token.kind, TokenKind::Ident(_)))
+            .map(Token::spelling)
+            .collect();
+        // 全小写标识符不单独存拼写（用完就丢），`spelling` 会回退到小写名。
+        assert_eq!(spellings, ["MessageBoxW", "msgboxw", "中文名"]);
+    }
+
+    #[test]
+    fn type_suffix_stays_out_of_the_identifier_name() {
+        let tokens = tokenize("Left$ x%").unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::Ident("left".into()));
+        assert_eq!(tokens[0].suffix, Some('$'));
+        assert_eq!(tokens[0].spelling(), "Left");
+        assert_eq!(tokens[1].suffix, Some('%'));
     }
 }

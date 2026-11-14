@@ -405,10 +405,10 @@ pub const AI_MODEL_OPTIONS: &[(&str, &str)] = &[
     ("deepseek-reasoner", "deepseek-reasoner（推理，不改文件）"),
 ];
 
-/// AI 写文件时的确认方式。
+/// AI 写文件与脚本执行操作时的确认方式。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AiApproval {
-    /// 每次写入前在对话里询问（默认）。
+    /// 写入文件或启动/推进脚本前在对话里询问（默认）。
     #[default]
     Ask,
     /// 自动允许所有工具操作，不再询问。
@@ -418,7 +418,7 @@ pub enum AiApproval {
 impl AiApproval {
     /// 所有可选项：`(值, 界面文字)`。
     pub const OPTIONS: &'static [(&'static str, &'static str)] = &[
-        ("ask", "每次写入前确认"),
+        ("ask", "执行前确认"),
         ("auto", "自动允许所有操作"),
     ];
 
@@ -433,7 +433,7 @@ impl AiApproval {
     /// AI 面板底栏上显示的短标签。
     pub fn short_label(self) -> &'static str {
         match self {
-            Self::Ask => "每次确认",
+            Self::Ask => "执行前确认",
             Self::Auto => "全部允许",
         }
     }

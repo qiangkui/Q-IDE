@@ -3,7 +3,8 @@
 use crate::interpreter::ast::*;
 use crate::interpreter::error::ParseError;
 use crate::interpreter::lexer::{Kw, Op, Token, TokenKind, tokenize, tokenize_mapped};
-use crate::interpreter::value::{VbType, Value};
+use crate::interpreter::value::{Value, VbType};
+use std::collections::HashMap;
 
 /// 解析一段 VB 源码。
 #[allow(dead_code)] // 供 `interpreter::parse` 与测试使用。
@@ -17,11 +18,13 @@ pub fn parse_mapped(source: &str, lines: &[usize]) -> Result<Program, ParseError
     Parser {
         tokens,
         pos: 0,
+        depth: 0,
         option_explicit: false,
         option_base: 0,
         option_compare_text: false,
         record_types: Vec::new(),
         enum_types: Vec::new(),
+        enum_values: HashMap::new(),
         class_types: Vec::new(),
     }
     .parse_program()
@@ -33,11 +36,13 @@ pub fn parse_expression(source: &str) -> Result<Expr, ParseError> {
     let mut parser = Parser {
         tokens,
         pos: 0,
+        depth: 0,
         option_explicit: false,
         option_base: 0,
         option_compare_text: false,
         record_types: Vec::new(),
         enum_types: Vec::new(),
+        enum_values: HashMap::new(),
         class_types: Vec::new(),
     };
     let expr = parser.parse_expr()?;
@@ -49,6 +54,48 @@ pub fn parse_expression(source: &str) -> Result<Expr, ParseError> {
         ));
     }
     Ok(expr)
+}
+
+fn eval_enum_constant(expr: &Expr, members: &HashMap<String, i64>) -> Option<i64> {
+    match expr {
+        Expr::Literal(Value::Int(value)) => Some(*value),
+        Expr::Var(name) => members.get(name).copied(),
+        Expr::Unary { op, expr } => {
+            let value = eval_enum_constant(expr, members)?;
+            match op {
+                UnOp::Negate => value.checked_neg(),
+                UnOp::Not => Some(!value),
+            }
+        }
+        Expr::Binary { op, left, right } => {
+            let left = eval_enum_constant(left, members)?;
+            let right = eval_enum_constant(right, members)?;
+            match op {
+                BinOp::Add => left.checked_add(right),
+                BinOp::Subtract => left.checked_sub(right),
+                BinOp::Multiply => left.checked_mul(right),
+                BinOp::Divide if right != 0 && left.checked_rem(right) == Some(0) => {
+                    left.checked_div(right)
+                }
+                BinOp::IntDivide if right != 0 => left.checked_div(right),
+                BinOp::Modulo if right != 0 => left.checked_rem(right),
+                BinOp::Power => u32::try_from(right).ok().and_then(|n| left.checked_pow(n)),
+                BinOp::Eq => Some(-i64::from(left == right)),
+                BinOp::NotEq => Some(-i64::from(left != right)),
+                BinOp::Lt => Some(-i64::from(left < right)),
+                BinOp::Gt => Some(-i64::from(left > right)),
+                BinOp::LtEq => Some(-i64::from(left <= right)),
+                BinOp::GtEq => Some(-i64::from(left >= right)),
+                BinOp::And => Some(left & right),
+                BinOp::Or => Some(left | right),
+                BinOp::Xor => Some(left ^ right),
+                BinOp::Eqv => Some(!(left ^ right)),
+                BinOp::Imp => Some((!left) | right),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// 代码块（`If` / 循环 / 过程体）的结束标记。
@@ -68,9 +115,23 @@ enum Stop {
     EndProperty,
 }
 
+/// 语法树允许的最大嵌套层数：防止超长嵌套（括号、`If` 块、单行 `If`）把栈耗尽。
+///
+/// 递归下降的每层都要占不少栈（`parse_statement` 的栈帧尤其大），测试线程默认只有
+/// 2 MiB 栈，所以这个上限取得比较保守；正常脚本的嵌套远达不到。
+const MAX_PARSE_DEPTH: usize = 96;
+
+/// `Type` 里定长数组字段最多允许的元素数（每个记录实例都会按它分配）。
+const MAX_RECORD_ARRAY_ELEMENTS: i64 = 1_000_000;
+
+/// `String * n` 的最大长度，与 VB6 一致。
+const MAX_FIXED_STRING_LEN: i64 = 65_535;
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// 当前递归深度；超限时报错而不是把调用栈耗尽。
+    depth: usize,
     /// `Option Explicit`。
     option_explicit: bool,
     /// `Option Base`：数组默认下界。
@@ -81,12 +142,26 @@ struct Parser {
     record_types: Vec<TypeDef>,
     /// 已解析的 `Enum` 名字：`Dim c As Color` 按 `Long` 处理。
     enum_types: Vec<String>,
+    /// 已解析枚举成员，供后续枚举常量表达式引用。
+    enum_values: HashMap<String, i64>,
     /// 已解析的 `Class` 名字：`Dim p As Point3D` 按对象处理。
     class_types: Vec<String>,
 }
 
 impl Parser {
     // ---------- token 辅助 ----------
+
+    /// 进入一层递归；超过上限时给出普通语法错误，避免栈溢出把进程带走。
+    fn enter_nesting(&mut self) -> Result<(), ParseError> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            return Err(ParseError::new(
+                format!("嵌套层次过深（上限 {MAX_PARSE_DEPTH} 层）"),
+                self.line(),
+            ));
+        }
+        Ok(())
+    }
 
     fn peek(&self) -> &TokenKind {
         &self.tokens[self.pos].kind
@@ -122,7 +197,10 @@ impl Parser {
     }
 
     fn at_statement_end(&self) -> bool {
-        matches!(self.peek(), TokenKind::Newline | TokenKind::Colon | TokenKind::Eof)
+        matches!(
+            self.peek(),
+            TokenKind::Newline | TokenKind::Colon | TokenKind::Eof
+        )
     }
 
     fn at_kw(&self, kw: Kw) -> bool {
@@ -338,10 +416,7 @@ impl Parser {
                     value
                 }
                 _ => {
-                    return Err(ParseError::new(
-                        "`Option Base` 只支持 0 或 1",
-                        line,
-                    ));
+                    return Err(ParseError::new("`Option Base` 只支持 0 或 1", line));
                 }
             };
             self.option_base = value;
@@ -372,7 +447,7 @@ impl Parser {
     fn parse_class(&mut self) -> Result<ClassDef, ParseError> {
         let line = self.line();
         self.expect_kw(Kw::Class, "需要 Class")?;
-        let display = self.token().text.clone();
+        let display = self.token().spelling().to_string();
         let name = self.expect_ident("类名")?;
         self.eat_line_end();
         let mut def = ClassDef {
@@ -380,7 +455,9 @@ impl Parser {
             display,
             line,
             fields: Vec::new(),
+            private_fields: Vec::new(),
             methods: Vec::new(),
+            implements: Vec::new(),
         };
         loop {
             self.skip_separators();
@@ -392,18 +469,44 @@ impl Parser {
                 self.advance();
                 break;
             }
-            // `Public` / `Private` 修饰对解释器没有实质区别（成员都从外部可见）。
-            while matches!(
-                self.peek(),
-                TokenKind::Kw(Kw::Public | Kw::Private | Kw::Global)
-            ) {
-                self.advance();
+            if self.eat_kw(Kw::Implements) {
+                let interface = self.expect_ident("接口类名")?;
+                if !self.class_types.iter().any(|name| name == &interface) {
+                    return Err(ParseError::new(
+                        format!("`Implements` 需要先定义接口类 `{interface}`"),
+                        self.line(),
+                    ));
+                }
+                if def.implements.contains(&interface) {
+                    return Err(ParseError::new(
+                        format!("接口 `{interface}` 重复实现"),
+                        self.line(),
+                    ));
+                }
+                def.implements.push(interface);
+                self.eat_line_end();
+                continue;
             }
+            let visibility = match self.peek() {
+                TokenKind::Kw(Kw::Private) => {
+                    self.advance();
+                    Some(false)
+                }
+                TokenKind::Kw(Kw::Public | Kw::Global) => {
+                    self.advance();
+                    Some(true)
+                }
+                _ => None,
+            };
             match self.peek() {
                 TokenKind::Kw(Kw::Dim) => {
                     let line = self.line();
                     self.advance();
                     if let Stmt::Dim { items, .. } = self.parse_dim(line, false)? {
+                        if !visibility.unwrap_or(false) {
+                            def.private_fields
+                                .extend(items.iter().map(|item| item.name.clone()));
+                        }
                         def.fields.extend(items);
                     }
                 }
@@ -413,28 +516,54 @@ impl Parser {
                     self.advance();
                     self.eat_kw(Kw::Dim);
                     if let Stmt::Dim { items, .. } = self.parse_dim(line, false)? {
+                        if !visibility.unwrap_or(false) {
+                            def.private_fields
+                                .extend(items.iter().map(|item| item.name.clone()));
+                        }
                         def.fields.extend(items.into_iter().map(|item| Declared {
                             with_events: true,
                             ..item
                         }));
                     }
                 }
-                TokenKind::Kw(Kw::Sub) => def.methods.push(self.parse_procedure(false)?),
-                TokenKind::Kw(Kw::Function) => def.methods.push(self.parse_procedure(true)?),
-                TokenKind::Kw(Kw::Property) => def.methods.push(self.parse_property()?),
+                TokenKind::Kw(Kw::Sub) => {
+                    let mut method = self.parse_procedure(false)?;
+                    method.is_private = visibility == Some(false);
+                    def.methods.push(method);
+                }
+                TokenKind::Kw(Kw::Function) => {
+                    let mut method = self.parse_procedure(true)?;
+                    method.is_private = visibility == Some(false);
+                    def.methods.push(method);
+                }
+                TokenKind::Kw(Kw::Property) => {
+                    let mut property = self.parse_property()?;
+                    property.is_private = visibility == Some(false);
+                    def.methods.push(property);
+                }
                 TokenKind::Kw(Kw::Static) => {
                     self.advance();
-                    if !matches!(self.peek(), TokenKind::Kw(Kw::Sub | Kw::Function)) {
-                        return Err(ParseError::new(
-                            "`Class` 里只支持变量声明与 Sub/Function/Property",
-                            self.line(),
-                        ));
-                    }
+                    let mut method = match self.peek() {
+                        TokenKind::Kw(Kw::Sub) => self.parse_procedure(false)?,
+                        TokenKind::Kw(Kw::Function) => self.parse_procedure(true)?,
+                        _ => {
+                            return Err(ParseError::new(
+                                "`Class` 里只支持变量声明与 Sub/Function/Property",
+                                self.line(),
+                            ));
+                        }
+                    };
+                    method.is_private = visibility == Some(false);
+                    def.methods.push(method);
                 }
                 TokenKind::Ident(_) => {
                     // `Private x As Long`（不带 `Dim` 的成员声明）。
                     let line = self.line();
                     if let Stmt::Dim { items, .. } = self.parse_dim(line, false)? {
+                        if !visibility.unwrap_or(false) {
+                            def.private_fields
+                                .extend(items.iter().map(|item| item.name.clone()));
+                        }
                         def.fields.extend(items);
                     }
                 }
@@ -451,9 +580,10 @@ impl Parser {
     }
 
     /// `Type Point ... End Type`。
-    fn parse_typedef(&mut self) -> Result<TypeDef, ParseError> {        let line = self.line();
+    fn parse_typedef(&mut self) -> Result<TypeDef, ParseError> {
+        let line = self.line();
         self.expect_kw(Kw::Type, "需要 Type")?;
-        let display = self.token().text.clone();
+        let display = self.token().spelling().to_string();
         let name = self.expect_ident("类型名")?;
         self.eat_line_end();
 
@@ -486,6 +616,16 @@ impl Parser {
                         self.line(),
                     ));
                 }
+                // 每个记录都要按这个数量分配元素，先挡住明显失控的写法。
+                let count = bounds.1 - bounds.0 + 1;
+                if count > MAX_RECORD_ARRAY_ELEMENTS {
+                    return Err(ParseError::new(
+                        format!(
+                            "数组字段的元素数 {count} 超过上限（{MAX_RECORD_ARRAY_ELEMENTS}）"
+                        ),
+                        self.line(),
+                    ));
+                }
                 Some(bounds)
             } else {
                 None
@@ -499,6 +639,15 @@ impl Parser {
                 let len = self.expect_int_literal("定长字符串的长度")?;
                 if len < 0 {
                     return Err(ParseError::new("定长字符串的长度不能为负", self.line()));
+                }
+                // VB6 的定长字符串上限是 65535 个字符。
+                if len > MAX_FIXED_STRING_LEN {
+                    return Err(ParseError::new(
+                        format!(
+                            "定长字符串长度 {len} 超过上限（{MAX_FIXED_STRING_LEN}）"
+                        ),
+                        self.line(),
+                    ));
                 }
                 Some(len as usize)
             } else {
@@ -534,7 +683,7 @@ impl Parser {
             self.expect_kw(Kw::Sub, "Declare 后需要 Function 或 Sub")?;
             false
         };
-        let symbol_default = self.token().text.clone();
+        let symbol_default = self.token().spelling().to_string();
         let (name, suffix) = self.expect_ident_typed("函数名")?;
         self.expect_kw(Kw::Lib, "Declare 需要 `Lib \"库名\"`")?;
         let lib = self.expect_string("库名")?;
@@ -551,9 +700,7 @@ impl Parser {
         let ret = if self.eat_kw(Kw::As) {
             self.parse_type()?
         } else if is_function {
-            suffix
-                .and_then(VbType::from_suffix)
-                .unwrap_or(VbType::Long)
+            suffix.and_then(VbType::from_suffix).unwrap_or(VbType::Long)
         } else {
             VbType::Variant
         };
@@ -611,6 +758,7 @@ impl Parser {
             is_function,
             is_let: false,
             is_set: false,
+            is_private: false,
             ret,
             line,
         })
@@ -660,6 +808,7 @@ impl Parser {
                 is_function: true,
                 is_let: false,
                 is_set: false,
+                is_private: false,
                 ret,
                 line,
             });
@@ -688,6 +837,7 @@ impl Parser {
             is_function: false,
             is_let: true,
             is_set,
+            is_private: false,
             ret: VbType::Variant,
             line,
         })
@@ -702,7 +852,7 @@ impl Parser {
     fn parse_enum(&mut self) -> Result<EnumDef, ParseError> {
         let line = self.line();
         self.expect_kw(Kw::Enum, "需要 Enum")?;
-        let display = self.token().text.clone();
+        let display = self.token().spelling().to_string();
         let name = self.expect_ident("枚举名")?;
         self.eat_line_end();
 
@@ -720,16 +870,14 @@ impl Parser {
             }
             let member = self.expect_ident("枚举成员名")?;
             let value = if self.eat_op(Op::Eq) {
-                let negative = self.eat_op(Op::Minus);
-                let TokenKind::Int(value) = self.peek().clone() else {
-                    return Err(ParseError::new("枚举成员的值必须是整数字面量", self.line()));
-                };
-                self.advance();
-                if negative { -value } else { value }
+                let expr = self.parse_expr()?;
+                eval_enum_constant(&expr, &self.enum_values)
+                    .ok_or_else(|| ParseError::new("枚举成员的值必须是整型常量表达式", self.line()))?
             } else {
                 next
             };
             next = value.saturating_add(1);
+            self.enum_values.insert(member.clone(), value);
             members.push((member, value));
             self.eat_line_end();
         }
@@ -893,6 +1041,13 @@ impl Parser {
     }
 
     fn parse_block(&mut self, stops: &[Stop]) -> Result<Vec<Stmt>, ParseError> {
+        self.enter_nesting()?;
+        let result = self.parse_block_inner(stops);
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_block_inner(&mut self, stops: &[Stop]) -> Result<Vec<Stmt>, ParseError> {
         let mut stmts = Vec::new();
         loop {
             self.skip_separators();
@@ -914,6 +1069,13 @@ impl Parser {
     // ---------- 语句 ----------
 
     fn parse_statement(&mut self) -> Result<Stmt, ParseError> {
+        self.enter_nesting()?;
+        let result = self.parse_statement_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_statement_inner(&mut self) -> Result<Stmt, ParseError> {
         let line = self.line();
 
         // 标签：`Again:`
@@ -930,6 +1092,10 @@ impl Parser {
         if self.eat_kw(Kw::GoTo) {
             let label = self.expect_ident("标签名")?;
             return Ok(Stmt::Goto(label, line));
+        }
+        if self.eat_kw(Kw::GoSub) {
+            let label = self.expect_ident("标签名")?;
+            return Ok(Stmt::Gosub(label, line));
         }
         if self.eat_kw(Kw::Resume) {
             let target = if self.at_statement_end() {
@@ -1045,7 +1211,8 @@ impl Parser {
                 start,
                 end,
                 line,
-            });        }
+            });
+        }
         if self.at_ident_pair("line", Kw::Input) {
             self.advance();
             self.advance();
@@ -1122,7 +1289,11 @@ impl Parser {
             } else {
                 Some(self.parse_expr()?)
             };
-            return Ok(Stmt::Return { value, line });
+            return if value.is_some() {
+                Ok(Stmt::Return { value, line })
+            } else {
+                Ok(Stmt::GosubReturn { line })
+            };
         }
         if self.eat_kw(Kw::RaiseEvent) {
             let name = self.expect_ident("事件名")?;
@@ -1144,12 +1315,17 @@ impl Parser {
         }
         if self.eat_kw(Kw::Call) {
             let name = self.expect_ident("过程名")?;
-            let args = if self.at_op(Op::LParen) {
-                self.parse_paren_args()?
+            let (args, by_value_args) = if self.at_op(Op::LParen) {
+                self.parse_call_args()?
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             };
-            return Ok(Stmt::Call { name, args, line });
+            return Ok(Stmt::Call {
+                name,
+                args,
+                by_value_args,
+                line,
+            });
         }
         if self.at_kw(Kw::Set) {
             self.advance();
@@ -1267,13 +1443,27 @@ impl Parser {
     }
 
     /// `With` 块里的 `.X = 1`（也允许 `.A.B = 1`）。
-    fn parse_with_member(&mut self, line: usize) -> Result<Stmt, ParseError> {        let mut path = Vec::new();
+    fn parse_with_member(&mut self, line: usize) -> Result<Stmt, ParseError> {
+        let mut path = Vec::new();
         while self.eat_op(Op::Dot) {
             path.push(self.expect_ident("成员名")?);
         }
-        self.expect_op(Op::Eq, "`With` 块内只支持 `.成员 = 值` 赋值")?;
-        let value = self.parse_expr()?;
-        Ok(Stmt::AssignWithMember { path, value, line })
+        if self.eat_op(Op::Eq) {
+            let value = self.parse_expr()?;
+            return Ok(Stmt::AssignWithMember { path, value, line });
+        }
+        let args = if self.at_op(Op::LParen) {
+            self.parse_paren_args()?
+        } else if self.at_statement_end() {
+            Vec::new()
+        } else {
+            let mut args = vec![self.parse_expr()?];
+            while self.eat_op(Op::Comma) {
+                args.push(self.parse_expr()?);
+            }
+            args
+        };
+        Ok(Stmt::WithCall { path, args, line })
     }
 
     /// 尝试把 `成员路径 = 值` 解析成成员赋值；不是赋值时回退到原位置。
@@ -1345,6 +1535,7 @@ impl Parser {
             return Ok(Stmt::Call {
                 name: "rename".into(),
                 args: vec![from, to],
+                by_value_args: Vec::new(),
                 line,
             });
         }
@@ -1404,7 +1595,7 @@ impl Parser {
                 });
             }
             self.pos = start;
-        }        // `a(0) = 1` / `a(0).X = 1` / `Mid(s, 2, 3) = "x"` / 普通调用
+        } // `a(0) = 1` / `a(0).X = 1` / `Mid(s, 2, 3) = "x"` / 普通调用
         if self.at_op(Op::LParen) {
             let args = self.parse_paren_args()?;
             if self.eat_op(Op::Eq) {
@@ -1449,18 +1640,33 @@ impl Parser {
             {
                 return Ok(stmt);
             }
-            return Ok(Stmt::Call { name, args, line });
+            return Ok(Stmt::Call {
+                name,
+                by_value_args: Vec::new(),
+                args,
+                line,
+            });
         }
         // 无括号的过程调用：`MsgBox "hi", 0`；也可以是完全无参的 `Foo`。
         let mut args = Vec::new();
         if self.at_statement_end() {
-            return Ok(Stmt::Call { name, args, line });
+            return Ok(Stmt::Call {
+                name,
+                args,
+                by_value_args: Vec::new(),
+                line,
+            });
         }
         args.push(self.parse_expr()?);
         while self.eat_op(Op::Comma) {
             args.push(self.parse_expr()?);
         }
-        Ok(Stmt::Call { name, args, line })
+        Ok(Stmt::Call {
+            name,
+            args,
+            by_value_args: Vec::new(),
+            line,
+        })
     }
 
     fn parse_assignment(&mut self, line: usize) -> Result<Stmt, ParseError> {
@@ -1541,7 +1747,10 @@ impl Parser {
         let name = self.expect_ident("数组名")?;
         let bounds = self.parse_bounds()?;
         if bounds.is_empty() {
-            return Err(ParseError::new("`ReDim` 需要至少一个维度，例如 `ReDim a(10)`", line));
+            return Err(ParseError::new(
+                "`ReDim` 需要至少一个维度，例如 `ReDim a(10)`",
+                line,
+            ));
         }
         let ty = if self.eat_kw(Kw::As) {
             Some(self.parse_type()?)
@@ -1594,7 +1803,12 @@ impl Parser {
         };
         self.expect_op(Op::Eq, "常量需要 `=`")?;
         let value = self.parse_expr()?;
-        Ok(Stmt::Const { name, ty, value, line })
+        Ok(Stmt::Const {
+            name,
+            ty,
+            value,
+            line,
+        })
     }
 
     fn parse_print(&mut self, line: usize) -> Result<Stmt, ParseError> {
@@ -1911,7 +2125,10 @@ impl Parser {
             }
             if !self.eat_kw(Kw::Case) {
                 return Err(ParseError::new(
-                    format!("`Select Case` 里需要 `Case`，但遇到 {}", self.token().describe()),
+                    format!(
+                        "`Select Case` 里需要 `Case`，但遇到 {}",
+                        self.token().describe()
+                    ),
                     self.line(),
                 ));
             }
@@ -1956,7 +2173,10 @@ impl Parser {
             TokenKind::Op(op) => *op,
             _ => {
                 return Err(ParseError::new(
-                    format!("`Case Is` 后需要比较运算符，但遇到 {}", self.token().describe()),
+                    format!(
+                        "`Case Is` 后需要比较运算符，但遇到 {}",
+                        self.token().describe()
+                    ),
                     self.line(),
                 ));
             }
@@ -2009,32 +2229,42 @@ impl Parser {
     fn peek_binary(&self) -> Option<(BinOp, u8)> {
         match self.peek() {
             TokenKind::Op(op) => match op {
-                Op::Plus => Some((BinOp::Add, 5)),
-                Op::Minus => Some((BinOp::Subtract, 5)),
-                Op::Star => Some((BinOp::Multiply, 8)),
-                Op::Slash => Some((BinOp::Divide, 8)),
-                Op::Backslash => Some((BinOp::IntDivide, 7)),
-                Op::Caret => Some((BinOp::Power, 9)),
-                Op::Amp => Some((BinOp::Concat, 4)),
-                Op::Eq => Some((BinOp::Eq, 3)),
-                Op::NotEq => Some((BinOp::NotEq, 3)),
-                Op::Lt => Some((BinOp::Lt, 3)),
-                Op::Gt => Some((BinOp::Gt, 3)),
-                Op::LtEq => Some((BinOp::LtEq, 3)),
-                Op::GtEq => Some((BinOp::GtEq, 3)),
+                Op::Plus => Some((BinOp::Add, 8)),
+                Op::Minus => Some((BinOp::Subtract, 8)),
+                Op::Star => Some((BinOp::Multiply, 10)),
+                Op::Slash => Some((BinOp::Divide, 10)),
+                Op::Backslash => Some((BinOp::IntDivide, 9)),
+                Op::Caret => Some((BinOp::Power, 12)),
+                Op::Amp => Some((BinOp::Concat, 7)),
+                Op::Eq => Some((BinOp::Eq, 6)),
+                Op::NotEq => Some((BinOp::NotEq, 6)),
+                Op::Lt => Some((BinOp::Lt, 6)),
+                Op::Gt => Some((BinOp::Gt, 6)),
+                Op::LtEq => Some((BinOp::LtEq, 6)),
+                Op::GtEq => Some((BinOp::GtEq, 6)),
                 _ => None,
             },
-            TokenKind::Kw(Kw::Mod) => Some((BinOp::Modulo, 6)),
-            TokenKind::Kw(Kw::And) => Some((BinOp::And, 2)),
-            TokenKind::Kw(Kw::Or) => Some((BinOp::Or, 1)),
-            TokenKind::Kw(Kw::Xor) => Some((BinOp::Xor, 1)),
+            TokenKind::Kw(Kw::Mod) => Some((BinOp::Modulo, 9)),
+            TokenKind::Kw(Kw::And) => Some((BinOp::And, 5)),
+            TokenKind::Kw(Kw::Or) => Some((BinOp::Or, 4)),
+            TokenKind::Kw(Kw::Xor) => Some((BinOp::Xor, 3)),
+            TokenKind::Kw(Kw::Eqv) => Some((BinOp::Eqv, 2)),
+            TokenKind::Kw(Kw::Imp) => Some((BinOp::Imp, 1)),
+            TokenKind::Kw(Kw::Like) => Some((BinOp::Like, 6)),
             // `obj Is Nothing` / `a Is b`：对象同一性，优先级与比较运算相同。
-            TokenKind::Kw(Kw::Is) => Some((BinOp::Is, 3)),
+            TokenKind::Kw(Kw::Is) => Some((BinOp::Is, 6)),
             _ => None,
         }
     }
 
     fn parse_binary(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
+        self.enter_nesting()?;
+        let result = self.parse_binary_inner(min_bp);
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_binary_inner(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
         let mut left = self.parse_unary()?;
         while let Some((op, bp)) = self.peek_binary() {
             if bp < min_bp {
@@ -2056,7 +2286,7 @@ impl Parser {
         if self.eat_op(Op::Minus) {
             return Ok(Expr::Unary {
                 op: UnOp::Negate,
-                expr: Box::new(self.parse_binary(9)?),
+                expr: Box::new(self.parse_binary(12)?),
             });
         }
         if self.eat_op(Op::Plus) {
@@ -2065,12 +2295,12 @@ impl Parser {
         if self.eat_kw(Kw::Not) {
             return Ok(Expr::Unary {
                 op: UnOp::Not,
-                expr: Box::new(self.parse_binary(3)?),
+                expr: Box::new(self.parse_binary(6)?),
             });
         }
         if self.eat_kw(Kw::TypeOf) {
-            // `TypeOf 对象 Is 类名`：按 4 级优先级解析操作数，免得把 `Is` 吃掉。
-            let target = self.parse_binary(4)?;
+            // `TypeOf 对象 Is 类名`：不让比较运算级的 `Is` 被操作数解析器吃掉。
+            let target = self.parse_binary(7)?;
             self.expect_kw(Kw::Is, "`TypeOf` 需要 `Is 类名`")?;
             let class_name = self.expect_ident("类名")?;
             return Ok(Expr::TypeOf {
@@ -2090,6 +2320,10 @@ impl Parser {
             TokenKind::Float(value) => {
                 self.advance();
                 Expr::Literal(Value::Float(value))
+            }
+            TokenKind::Date(value) => {
+                self.advance();
+                Expr::Literal(Value::Date(value))
             }
             TokenKind::Str(text) => {
                 self.advance();
@@ -2118,7 +2352,11 @@ impl Parser {
             TokenKind::Ident(name) => {
                 self.advance();
                 if self.at_op(Op::LParen) {
-                    let args = self.parse_paren_args()?;
+                    let args = if name == "getobject" {
+                        self.parse_optional_paren_args()?
+                    } else {
+                        self.parse_paren_args()?
+                    };
                     Expr::Call { name, args }
                 } else {
                     Expr::Var(name)
@@ -2207,8 +2445,15 @@ impl Parser {
         if self.eat_op(Op::RParen) {
             return Ok(args);
         }
+        let mut has_named_argument = false;
         loop {
-            args.push(self.parse_expr()?);
+            let argument = self.parse_argument()?;
+            if matches!(argument, Expr::NamedArg { .. }) {
+                has_named_argument = true;
+            } else if has_named_argument {
+                return Err(ParseError::new("位置参数必须写在命名参数之前", self.line()));
+            }
+            args.push(argument);
             self.skip_newlines();
             if !self.eat_op(Op::Comma) {
                 break;
@@ -2217,5 +2462,75 @@ impl Parser {
         }
         self.expect_op(Op::RParen, "调用需要 `)`")?;
         Ok(args)
+    }
+
+    fn parse_argument(&mut self) -> Result<Expr, ParseError> {
+        if matches!(self.peek(), TokenKind::Ident(_))
+            && matches!(self.peek_at(1), TokenKind::Colon)
+            && matches!(self.peek_at(2), TokenKind::Op(Op::Eq))
+        {
+            let name = self.expect_ident("命名参数")?;
+            self.advance();
+            self.expect_op(Op::Eq, "命名参数需要 `:=`")?;
+            return Ok(Expr::NamedArg {
+                name,
+                value: Box::new(self.parse_expr()?),
+            });
+        }
+        self.parse_expr()
+    }
+
+    /// `GetObject(, "ProgID")` 的省略路径参数。
+    fn parse_optional_paren_args(&mut self) -> Result<Vec<Expr>, ParseError> {
+        self.expect_op(Op::LParen, "调用需要 `(`")?;
+        self.skip_newlines();
+        let mut args = Vec::new();
+        if self.eat_op(Op::RParen) {
+            return Ok(args);
+        }
+        loop {
+            if self.at_op(Op::Comma) || self.at_op(Op::RParen) {
+                args.push(Expr::Literal(Value::Empty));
+            } else {
+                args.push(self.parse_expr()?);
+            }
+            self.skip_newlines();
+            if !self.eat_op(Op::Comma) {
+                break;
+            }
+            self.skip_newlines();
+        }
+        self.expect_op(Op::RParen, "调用需要 `)`")?;
+        Ok(args)
+    }
+
+    /// `Call Foo(ByVal value)` 的实参列表；按值标记只影响对应这一项。
+    fn parse_call_args(&mut self) -> Result<(Vec<Expr>, Vec<bool>), ParseError> {
+        self.expect_op(Op::LParen, "调用需要 `(`")?;
+        self.skip_newlines();
+        let mut args = Vec::new();
+        let mut by_value_args = Vec::new();
+        if self.eat_op(Op::RParen) {
+            return Ok((args, by_value_args));
+        }
+        let mut has_named_argument = false;
+        loop {
+            let by_value = self.eat_kw(Kw::ByVal);
+            let argument = self.parse_argument()?;
+            if matches!(argument, Expr::NamedArg { .. }) {
+                has_named_argument = true;
+            } else if has_named_argument {
+                return Err(ParseError::new("位置参数必须写在命名参数之前", self.line()));
+            }
+            args.push(argument);
+            by_value_args.push(by_value);
+            self.skip_newlines();
+            if !self.eat_op(Op::Comma) {
+                break;
+            }
+            self.skip_newlines();
+        }
+        self.expect_op(Op::RParen, "调用需要 `)`")?;
+        Ok((args, by_value_args))
     }
 }

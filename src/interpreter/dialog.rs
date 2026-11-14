@@ -500,9 +500,12 @@ pub(crate) mod platform {
 
         let mut stopped = false;
         while unsafe { IsWindow(hwnd) } != 0 {
-            unsafe { MsgWaitForMultipleObjects(0, std::ptr::null(), 0, WAIT_SLICE_MS, QS_ALLINPUT) };
+            unsafe {
+                MsgWaitForMultipleObjects(0, std::ptr::null(), 0, WAIT_SLICE_MS, QS_ALLINPUT)
+            };
             let mut message = Msg::default();
-            while unsafe { PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {
+            while unsafe { PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0
+            {
                 if unsafe { IsDialogMessageW(hwnd, &mut message) } == 0 {
                     unsafe {
                         TranslateMessage(&message);

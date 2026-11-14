@@ -223,7 +223,7 @@ fn ai_approval_round_trips_through_text() {
         assert_eq!(AiApproval::from_str(value).as_str(), *value);
     }
     // 面板底栏用的是短标签，必须有字且各不相同。
-    assert_eq!(AiApproval::Ask.short_label(), "每次确认");
+    assert_eq!(AiApproval::Ask.short_label(), "执行前确认");
     assert_eq!(AiApproval::Auto.short_label(), "全部允许");
 }
 

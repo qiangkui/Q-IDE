@@ -1406,7 +1406,7 @@ impl Render for SearchPanel {
         let mut input = Input::new(&self.query)
             .xsmall()
             .cleanable(true)
-            .bg(rgb(palette.panel_bg))
+            .bg(rgb(palette.side_panel_bg))
             // 不要组件自带的聚焦外圈：焦点只用更亮的边框表示。
             .focus_ring(false);
         if focused {
@@ -1416,7 +1416,7 @@ impl Render for SearchPanel {
             .px(px(8.0))
             .pt(px(6.0))
             .pb(px(4.0))
-            .bg(rgb(palette.panel_bg))
+            .bg(rgb(palette.side_panel_bg))
             .on_action(move |_: &Enter, window, cx| enter(window, cx))
             .on_action(move |_: &Escape, window, cx| escape(window, cx))
             .child(input)
@@ -1426,7 +1426,7 @@ impl Render for SearchPanel {
         let mut replace_field = Input::new(&self.replace)
             .xsmall()
             .cleanable(true)
-            .bg(rgb(palette.panel_bg))
+            .bg(rgb(palette.side_panel_bg))
             .focus_ring(false);
         if replace_focused {
             replace_field = replace_field.border_color(rgb(palette.sidebar_text));

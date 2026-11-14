@@ -118,7 +118,7 @@ impl Palette {
             window_bg: 0xf3f3f3,
             editor_bg: 0xf3f3f3,
             activity_bar_bg: 0xe7e7e7,
-            activity_bar_selected: 0xffffffd9,
+            activity_bar_selected: 0xffffffe6,
             sidebar_bg: 0xf8f8f8,
             panel_bg: 0xffffff,
             side_panel_bg: 0xffffff,

@@ -109,8 +109,9 @@ cargo clippy --all-targets
 
 - **窗口/任务栏图标**：gpui 的 Windows 后端在启动时执行 `LoadImageW(模块句柄, MAKEINTRESOURCE(1), IMAGE_ICON, ...)`，也就是**只认可执行文件里资源 id 1 的图标组**（`WindowOptions::icon` 那个字段是 X11 专用，Windows 上会被忽略）。所以图标必须编进 exe：
   - `assets/app.ico`：从 `assets/icon.png` 生成的 16/24/32/48/64/128（BMP）+ 256（PNG）多尺寸 ICO；
-  - `app.rc`：只有一行 `1 ICON "assets/app.ico"`；
-  - `build.rs`：`embed_resource::compile("app.rc", embed_resource::NONE)`（build-dependency `embed-resource`），它会找到 Windows SDK 里的 `rc.exe` 编出 `.res` 并 `cargo:rustc-link-arg-bins`。换图标只要替换 `assets/app.ico` 后重新构建。
+  - `assets/run.ico`：`qide-run.exe` 用同一张图的浅绿版本（浅绿底 `#AED581` + 深绿字形 `#1B5E20`，`assets/run.png` 是 256 的预览图），与深蓝的 `first.exe` 一眼可分；
+  - `app.rc` / `run.rc`：各一行 `1 ICON "assets/xxx.ico"`；
+  - `build.rs`：`embed_resource::compile_for("app.rc", ["first"], ...)` 与 `compile_for("run.rc", ["qide-run"], ...)`（build-dependency `embed-resource`），它找到 Windows SDK 里的 `rc.exe` 编出 `.res` 并只链进对应 bin（两个都链成 `--bins` 的话后编译的会覆盖前一个）。换图标只要替换 ico 后重新构建。
 - **发布**：`cargo build --release` 后把 `target\release\first.exe` 复制出去即可；exe 已包含图标与全部内置资源（图标字体是 `gpui-kit-assets` 编译进二进制的 SVGs）。
   - 运行期唯一的外部依赖是 MSVC 运行库 `vcruntime140.dll`（导入表里还有 `icuuc.dll`，那是 Windows 10 1903+ 自带的系统组件，不用带）。目标机器没装 VC++ 运行时的话，把 VS 的 `VC\Redist\MSVC\<ver>\x64\Microsoft.VC143.CRT\vcruntime140.dll` 放到 exe 同目录。
   - 布局/设置文件在 `%APPDATA%\gpui-first\layout.txt`，随程序自动创建，不需要预置配置文件。
@@ -119,4 +120,4 @@ cargo clippy --all-targets
 
 - VB 的自动缩进目前只跟上一行缩进走（组件默认规则按括号判断），**块关键字规则装不上**：`gpui-base` 的 `LanguageConfig` 是 crate 私有类型，`set_language_config` 虽然被 re-export，外部无法构造参数。想支持 `Sub`/`If ... Then`/`For`/`Do`/`With` 的自动缩进，需要给 `gpui-base` 打本地补丁（仓库目前只 patch 了 `gpui-component`）。
 - 资源管理器暂不提供多选（`ListItem` 的行选中态在这个后端下同时只有一个生效，`Ctrl+点击` 表现成「换了选中项」），目前只支持单选右键菜单与拖动。
-- 仓库根目录只保留 `Cargo.toml` / `Cargo.lock` / `.gitignore` / `ROADMAP.md` / `app.rc` / `build.rs` / `assets/`（图标与资源脚本；历史调试日志已于 2026-11-06 清理）。
+- 仓库根目录只保留 `Cargo.toml` / `Cargo.lock` / `.gitignore` / `ROADMAP.md` / `app.rc` / `run.rc` / `build.rs` / `assets/`（图标与资源脚本；历史调试日志已于 2026-11-06 清理）。

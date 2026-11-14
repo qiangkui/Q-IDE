@@ -1,6 +1,6 @@
 //! 抽象语法树。
 
-use crate::interpreter::value::{VbType, Value};
+use crate::interpreter::value::{Value, VbType};
 
 /// 一个完整的 VB 脚本：`Declare` / `Sub` / `Function` 定义，加上模块级语句。
 #[derive(Clone, Debug, Default)]
@@ -30,10 +30,18 @@ pub struct ClassDef {
     pub line: usize,
     /// `Private x As Long` 这类实例变量。
     pub fields: Vec<Declared>,
+    /// 私有实例变量名（未标注访问修饰符的字段也属于私有）。
+    pub private_fields: Vec<String>,
     pub methods: Vec<Procedure>,
+    /// `Implements` 声明的接口类。
+    pub implements: Vec<String>,
 }
 
 impl ClassDef {
+    pub fn field_is_private(&self, name: &str) -> bool {
+        self.private_fields.iter().any(|field| field == name)
+    }
+
     /// 按名字找成员过程（`Property Get` / `Function` / `Sub`，不含 `Property Let/Set`）。
     pub fn method(&self, name: &str) -> Option<&Procedure> {
         self.methods
@@ -53,6 +61,27 @@ impl ClassDef {
         self.methods
             .iter()
             .find(|method| method.name == name && method.is_set)
+    }
+
+    pub fn implemented_method(&self, name: &str) -> Option<&Procedure> {
+        self.implements
+            .iter()
+            .filter_map(|interface| self.method(&format!("{interface}_{name}")))
+            .next()
+    }
+
+    pub fn implemented_property_let(&self, name: &str) -> Option<&Procedure> {
+        self.implements
+            .iter()
+            .filter_map(|interface| self.property_let(&format!("{interface}_{name}")))
+            .next()
+    }
+
+    pub fn implemented_property_set(&self, name: &str) -> Option<&Procedure> {
+        self.implements
+            .iter()
+            .filter_map(|interface| self.property_set(&format!("{interface}_{name}")))
+            .next()
     }
 }
 
@@ -80,6 +109,8 @@ pub struct Procedure {
     pub is_let: bool,
     /// `Property Set`：只能通过 `Set x = 对象` 调用。
     pub is_set: bool,
+    /// 类成员显式声明为 `Private`。
+    pub is_private: bool,
     pub ret: VbType,
     pub line: usize,
 }
@@ -184,9 +215,12 @@ pub enum BinOp {
     Gt,
     LtEq,
     GtEq,
+    Like,
     And,
     Or,
     Xor,
+    Eqv,
+    Imp,
     /// `a Is b` / `obj Is Nothing`：对象同一性。
     Is,
 }
@@ -212,6 +246,11 @@ pub enum Expr {
     WithMember {
         path: Vec<String>,
     },
+    /// `name:=value`：COM Automation 调用的命名实参。
+    NamedArg {
+        name: String,
+        value: Box<Expr>,
+    },
     /// `New Collection` / `New Dictionary`：新建空对象。
     NewObject(NewObject),
     /// `AddressOf 过程名`：取过程的回调入口（只能传给 `Declare` 的指针参数）。
@@ -221,9 +260,19 @@ pub enum Expr {
         expr: Box<Expr>,
         class_name: String,
     },
-    Call { name: String, args: Vec<Expr> },
-    Unary { op: UnOp, expr: Box<Expr> },
-    Binary { op: BinOp, left: Box<Expr>, right: Box<Expr> },
+    Call {
+        name: String,
+        args: Vec<Expr>,
+    },
+    Unary {
+        op: UnOp,
+        expr: Box<Expr>,
+    },
+    Binary {
+        op: BinOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
 }
 
 /// `Select Case` 的一个分支条件。
@@ -347,6 +396,12 @@ pub enum Stmt {
         value: Expr,
         line: usize,
     },
+    /// `With` 块内的 `.Method args` / `.Method(args)`。
+    WithCall {
+        path: Vec<String>,
+        args: Vec<Expr>,
+        line: usize,
+    },
     /// `With subject ... End With`。
     With {
         subject: Expr,
@@ -356,6 +411,8 @@ pub enum Stmt {
     Call {
         name: String,
         args: Vec<Expr>,
+        /// `Call Foo(ByVal value)`：实参位置对应的显式按值传递标记。
+        by_value_args: Vec<bool>,
         line: usize,
     },
     /// `Print` / `Debug.Print`。
@@ -412,6 +469,10 @@ pub enum Stmt {
     Label(String, usize),
     /// `GoTo 标签`。
     Goto(String, usize),
+    /// `GoSub 标签`。
+    Gosub(String, usize),
+    /// `Return`：从最近一次 `GoSub` 返回。
+    GosubReturn { line: usize },
     /// `On Error ...`。
     OnError {
         mode: ErrorMode,

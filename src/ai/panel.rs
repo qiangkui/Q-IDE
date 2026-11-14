@@ -123,6 +123,13 @@ struct PendingWrite {
     done: String,
 }
 
+/// 等用户确认的脚本/调试操作。
+struct PendingAction {
+    call_id: String,
+    summary: String,
+    action: tools::AppAction,
+}
+
 /// 右侧 AI 编程面板。
 pub struct AiPanel {
     app: WeakEntity<CodeWindow>,
@@ -144,6 +151,8 @@ pub struct AiPanel {
     expanded_code: HashSet<(usize, usize)>,
     /// 等用户确认的写文件操作。
     approval: Option<PendingWrite>,
+    /// 等用户确认的脚本执行操作。
+    action_approval: Option<PendingAction>,
     /// 同一轮里还没执行的工具调用。
     tool_queue: VecDeque<ToolCall>,
     /// 这次提问已经连续跑了多少轮工具，用来防死循环。
@@ -172,6 +181,7 @@ impl AiPanel {
             scroll: ScrollHandle::new(),
             expanded_code: HashSet::new(),
             approval: None,
+            action_approval: None,
             tool_queue: VecDeque::new(),
             tool_rounds: 0,
             cancel: None,
@@ -192,7 +202,7 @@ impl AiPanel {
 
     /// 把输入框里的内容发给 DeepSeek。
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending || self.approval.is_some() {
+        if self.pending || self.approval.is_some() || self.action_approval.is_some() {
             return;
         }
         let text = self.input.read(cx).value().trim().to_string();
@@ -471,10 +481,12 @@ impl AiPanel {
                 let root = this.ai_project_root().unwrap_or_default();
                 let read = |path: &Path| this.file_content(path);
                 let output = || this.ai_output_tail(cx);
+                let debug_state = || this.ai_debug_state();
                 let ctx = tools::PlanCtx {
                     root: &root,
                     read: &read,
                     output: &output,
+                    debug_state: &debug_state,
                 };
                 tools::plan(&ctx, &call)
             });
@@ -506,6 +518,22 @@ impl AiPanel {
                     self.approval = Some(pending);
                     self.scroll.scroll_to_bottom();
                     cx.notify();
+                    return;
+                }
+                tools::ToolPlan::Action { action, summary } => {
+                    if action.requires_confirmation()
+                        && SettingsStore::snapshot(cx).ai.approval == AiApproval::Ask
+                    {
+                        self.action_approval = Some(PendingAction {
+                            call_id: call.id.clone(),
+                            summary,
+                            action,
+                        });
+                        self.scroll.scroll_to_bottom();
+                        cx.notify();
+                        return;
+                    }
+                    self.spawn_action(call.id, summary, action, window, cx);
                     return;
                 }
             }
@@ -557,6 +585,43 @@ impl AiPanel {
         .detach();
     }
 
+    /// 在主窗口实体更新之外执行脚本/调试操作，避免与 AI 面板形成重入更新。
+    fn spawn_action(
+        &mut self,
+        call_id: String,
+        summary: String,
+        action: tools::AppAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let app = self.app.clone();
+        let request_id = self.request_id;
+        self.pending = true;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = app.update_in(cx, |app, window, cx| {
+                app.ai_execute_action(action, window, cx)
+            });
+            let text = match result {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => format!("操作失败：{error}"),
+                Err(_) => "主窗口已关闭，操作被取消".to_string(),
+            };
+            this.update_in(cx, |panel, window, cx| {
+                if panel.request_id != request_id {
+                    cx.notify();
+                    return;
+                }
+                panel.pending = false;
+                panel.push_tool_result(&call_id, text, summary);
+                cx.notify();
+                panel.process_tools(window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn push_tool_result(&mut self, call_id: &str, content: String, note: String) {
         self.messages.push(ChatEntry::tool(call_id, content, note));
         self.scroll.scroll_to_bottom();
@@ -564,6 +629,11 @@ impl AiPanel {
 
     /// 同意写入：落盘后把结果告诉模型，继续后面的工具。
     fn approve(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(pending) = self.action_approval.take() {
+            cx.notify();
+            self.spawn_action(pending.call_id, pending.summary, pending.action, window, cx);
+            return;
+        }
         let Some(pending) = self.approval.take() else {
             return;
         };
@@ -573,6 +643,16 @@ impl AiPanel {
 
     /// 拒绝写入：告诉模型文件没动，让它换个办法或结束。
     fn reject(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(pending) = self.action_approval.take() {
+            self.push_tool_result(
+                &pending.call_id,
+                "用户拒绝了这次脚本/调试操作，未执行。".to_string(),
+                format!("已拒绝：{}", pending.summary),
+            );
+            cx.notify();
+            self.process_tools(window, cx);
+            return;
+        }
         let Some(pending) = self.approval.take() else {
             return;
         };
@@ -587,13 +667,18 @@ impl AiPanel {
 
     /// 停止当前请求：网络请求、工具循环和待确认的写入都取消。
     fn stop(&mut self, cx: &mut Context<Self>) {
-        if !self.pending && self.approval.is_none() && self.cancel.is_none() {
+        if !self.pending
+            && self.approval.is_none()
+            && self.action_approval.is_none()
+            && self.cancel.is_none()
+        {
             return;
         }
         self.cancel_current();
         self.request_id += 1;
         self.pending = false;
         self.approval = None;
+        self.action_approval = None;
         self.tool_queue.clear();
         self.tool_rounds = 0;
         self.close_unfinished_tool_calls();
@@ -636,6 +721,7 @@ impl AiPanel {
         self.notice = None;
         self.pending = false;
         self.approval = None;
+        self.action_approval = None;
         self.tool_queue.clear();
         self.tool_rounds = 0;
         self.expanded_code.clear();
@@ -930,7 +1016,8 @@ impl Render for AiPanel {
                 self.messages.is_empty()
                     && self.error.is_none()
                     && !self.pending
-                    && self.approval.is_none(),
+                    && self.approval.is_none()
+                    && self.action_approval.is_none(),
             )
             .on_click(cx.listener(|this, _, _, cx| this.clear(cx)));
 
@@ -956,7 +1043,8 @@ impl Render for AiPanel {
             && !self.pending
             && self.error.is_none()
             && self.notice.is_none()
-            && self.approval.is_none();
+            && self.approval.is_none()
+            && self.action_approval.is_none();
         let body: AnyElement = if empty {
             placeholder(palette, chat_font).into_any_element()
         } else {
@@ -978,6 +1066,9 @@ impl Render for AiPanel {
             let mut list = v_flex().gap_2().w_full().children(bubbles);
             if let Some(pending) = &self.approval {
                 list = list.child(approval_card(pending, &palette, chat_font, cx));
+            }
+            if let Some(pending) = &self.action_approval {
+                list = list.child(action_approval_card(pending, &palette, chat_font, cx));
             }
             if let Some(error) = &self.error {
                 list = list.child(
@@ -1008,7 +1099,7 @@ impl Render for AiPanel {
                 .into_any_element()
         };
 
-        let busy = self.pending || self.approval.is_some();
+        let busy = self.pending || self.approval.is_some() || self.action_approval.is_some();
         let focused = self.input.read(cx).has_selection_focus(window, cx);
         let mut input = Input::new(&self.input)
             .xsmall()
@@ -1062,7 +1153,7 @@ impl Render for AiPanel {
             .label(approval_label)
             .text_color(footer_text)
             .child(Icon::new(IconName::ChevronDown).xsmall().text_color(footer_text))
-            .tooltip("AI 改文件前是否先询问")
+            .tooltip("AI 写入文件、运行或推进脚本前是否先询问")
             // 底栏在面板最下面，菜单要往上弹：BottomLeft = 开在触发按钮上方、左对齐。
             .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
                 let mut menu = menu;
@@ -1261,6 +1352,55 @@ fn approval_card(
                 )
                 .child(
                     Button::new("ai-reject")
+                        .small()
+                        .label("拒绝")
+                        .on_click(cx.listener(|this, _, window, cx| this.reject(window, cx))),
+                ),
+        )
+        .into_any_element()
+}
+
+/// 脚本执行确认卡片。
+fn action_approval_card(
+    pending: &PendingAction,
+    palette: &Palette,
+    font_size: Pixels,
+    cx: &Context<AiPanel>,
+) -> AnyElement {
+    v_flex()
+        .w_full()
+        .gap_2()
+        .p(px(10.0))
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(rgba(palette.border))
+        .bg(rgb(palette.side_panel_raised_bg))
+        .child(
+            div()
+                .text_size(font_size)
+                .text_color(rgb(palette.sidebar_text))
+                .child("AI 请求执行脚本操作"),
+        )
+        .child(
+            div()
+                .text_size(font_size)
+                .text_color(rgb(palette.muted_text))
+                .child(format!(
+                    "{}。脚本可能产生文件或其他外部副作用。",
+                    pending.summary
+                )),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new("ai-approve-action")
+                        .small()
+                        .label("同意执行")
+                        .on_click(cx.listener(|this, _, window, cx| this.approve(window, cx))),
+                )
+                .child(
+                    Button::new("ai-reject-action")
                         .small()
                         .label("拒绝")
                         .on_click(cx.listener(|this, _, window, cx| this.reject(window, cx))),

@@ -40,8 +40,8 @@
 - 主题：设置窗口「主题」页选择内置深色 / 浅色（只读）、已保存的自定义主题或「新建主题」；自定义主题可改名、改颜色（取色器或手填十六进制），改动直接替换同名主题并写入 `themes.txt`。设置窗口按分类分页（布局 / 主题 / 排版 / 保存 / 语法分析器 / 输出 / AI），点左侧导航直接切换。
 - AI 设置：设置窗口「AI」页里先是 **DeepSeek** 分组（以后接入其它模型时按模型分组），组内填 API 密钥、接口地址（默认 `https://api.deepseek.com`）与模型（默认 `deepseek-chat`）。密钥一行是「标签在前、输入框在后」，内容始终遮罩，只存进 Windows 凭据管理器，不写进 `layout.txt`；清空输入或点「清除」即删除。
 - AI 对话：右侧 AI 编程面板里输入需求，回车或点「发送」发给 DeepSeek（OpenAI 兼容的 `/chat/completions`，`stream: true`）。发送时会**自动带上当前打开文件的路径与内容**（文件超过 4 万字符时在整行末尾截断并注明总长度与后续读取方式）。**请求长度有上限**：对话越积越多时先丢最早的那几轮（带「已省略」标记），仍然过长就把最长的工具输出截断（带「已截断」标记），面板里保存的对话始终是完整原文。回答**边生成边显示**：用户消息靠右、AI 消息靠左，各是一个圆角气泡；回复按 Markdown 渲染，代码块单独成块（更深底色 + 圆角边框，右上角浮着「复制」「写入」「展开/收起」，默认只露前 5 行）；消息文字可拖选，`Ctrl+C` 复制。标题栏右侧的「＋」开始新对话（清空内容与输入框、滚动回顶部、焦点回输入框并取消进行中的请求），「清空」只清掉对话内容、输入框里的草稿保留。
-- AI 固定规则：程序目录下的 `ai-rules/`（启动时自动补齐默认文件，不覆盖用户修改）。`common.md` 总是加载；VB 脚本加载 `vb.md`，其它语言加载 `<语言>.md`（例如 `rust.md` / `json.md`），没有就 `default.md`。每次请求重新读取，改完下一条消息生效；`QIDE_AI_RULES_DIR` 可改用其它目录。
-- AI 工具调用：模型可以自己调工具把活干完——`read_file` / `list_files` 看代码，`replace_in_file`（精确替换唯一片段）或 `write_file` 改文件，`check_syntax` 自查语法，`read_output` 看运行输出。**交互方式、工具轮数与模型都在 AI 面板底栏（聊天输入框下方）切换**：左边按钮选「每次确认」（默认，改文件前在对话里弹确认卡片）或「全部允许」（读写都直接执行）；旁边按钮选「6 轮」（默认）/「12 轮」/「一直执行」；右边按钮选当前用的 AI 模型（`deepseek-chat` / `deepseek-reasoner`，也可显示设置里的自定义模型）。生成过程中「发送」旁边会出现「停止」，可中断网络请求、工具循环或待确认的写入；停止后未完成的工具调用会补一条「已停止」结果，保证下一轮对话仍符合接口协议。推理模型 `deepseek-reasoner` 不支持函数调用，选中它时只聊天、不改文件。路径限制在项目根目录内。
+- AI 固定规则：程序目录下的 `ai-rules/`（启动时自动补齐默认文件，不覆盖用户修改）。`common.md` 总是加载；VB 脚本加载 `vb.md`，Rust 源码加载内置的 `rust.md`，其它语言加载 `<语言>.md`（也可自行添加 `json.md`），没有就 `default.md`。每次请求重新读取，改完下一条消息生效；`QIDE_AI_RULES_DIR` 可改用其它目录。
+- AI 工具调用：模型可以自己调工具把活干完——`read_file` / `list_files` 看代码，`replace_in_file`（精确替换唯一片段）或 `write_file` 改文件，`check_syntax` 自查语法，`read_output` 看运行输出；用户明确要求运行或调试时，还可调用 `run_script` / `start_debug` / `debug_continue` / `debug_step` 执行脚本，使用 `set_breakpoint` 设置普通或条件断点，使用 `get_debug_state` 查看暂停行、调用栈和变量值，并用 `add_watch` 添加监视表达式。**交互方式、工具轮数与模型都在 AI 面板底栏（聊天输入框下方）切换**：左边按钮选「执行前确认」（默认，写文件或启动/推进脚本前弹确认卡片）或「全部允许」；旁边按钮选「6 轮」（默认）/「12 轮」/「一直执行」；右边按钮选当前用的 AI 模型（`deepseek-chat` / `deepseek-reasoner`，也可显示设置里的自定义模型）。生成过程中「发送」旁边会出现「停止」，可中断网络请求、工具循环或待确认的操作；停止后未完成的工具调用会补一条「已停止」结果，保证下一轮对话仍符合接口协议。推理模型 `deepseek-reasoner` 不支持函数调用，选中它时只聊天、不调用工具。路径限制在项目根目录内。
 - AI 写入文件：代码块右上角的「写入」会弹出路径输入框（默认是当前打开的文件，相对路径按项目根目录解析），确认后**用这段代码覆盖目标文件的全部内容**：文件已打开就直接替换编辑器内容并按原编码保存，没打开就写到磁盘再打开，同时刷新资源管理器与输出日志。
 
 ### 运行与调试
@@ -64,6 +64,39 @@
 - 文件 I/O：`Open ... For Input|Output|Append|Binary|Random`、`Print #`、`Write #`、`Line Input #`、`Input #`、`Get #`/`Put #`、`Seek #`、`Lock`/`Unlock`、`EOF`/`LOF`/`Loc`/`FreeFile`。
 - Win32：`Declare ... Lib "user32"`（`ByVal`/`ByRef` 结构体、整数与浮点参数），`AddressOf` 把 VB 过程当回调传给 API（同步回调）。
 - 90 多个内置函数：字符串、数值、类型转换、日期、文件系统、`Shell` / `Command` / `MsgBox` / `InputBox` 等。
+
+### 主程序命令行（`first.exe`）
+
+界面版也能接住命令行里的路径，所以 `.vb` 的“打开方式”既可以是 `qide-run.exe`（只跑不编辑），也可以是 `first.exe`（打开编辑器）：
+
+```powershell
+first.exe                      # 按上次保存的布局启动
+first.exe D:\脚本\demo.vb       # 启动并打开这个文件（所在文件夹自动加进资源管理器）
+first.exe D:\脚本 e.vb         # 多个路径按顺序处理：文件开成标签页，文件夹加进资源管理器
+first.exe --help               # 用法说明（有控制台就输出到控制台，否则弹消息框）
+first.exe --version            # 版本号，例如 Q-IDE 0.1.0
+```
+
+- `--` 之后的参数一律当作路径；未知选项会提示用法并以退出码 `2` 结束。
+- 路径不存在时在“输出”面板报错，其余路径照常打开。
+
+### 命令行运行（`qide-run`）
+
+不开界面也能跑脚本，供批处理、文件关联和外部 agent 调用（`cargo build` 会同时产出 `target\debug\qide-run.exe`）：
+
+```powershell
+qide-run demo.vb                   # 只给路径就等于 run（文件关联用）
+qide-run run  demo.vb              # 跑脚本：脚本输出走 stdout，诊断走 stderr
+qide-run run  demo.vb --json       # 每行一个 JSON 事件，交给程序 / agent 解析
+qide-run check demo.vb --json      # 只做语法与语义检查，不执行
+```
+
+- 常用选项：`--json`、`-q/--quiet`、`--max-steps N`、`--max-depth N`、`--timeout 30s`（也接受 `500ms`、`2m`）、`--include-dir DIR`、`--arg 文本`、`--ui/--no-ui`、`--pause/--no-pause`。
+- **双击 / 文件关联**：把 `.vb` 的打开方式指向 `qide-run.exe`，命令行写 `"...\qide-run.exe" "%1"` 即可。检测到「独占控制台且 stdout 没被重定向」时，会自动允许 `MsgBox`/`InputBox` 弹窗，并在结束时停住等回车（窗口不会一闪就没）；从终端或 agent 调用（输出被管道接走）时不会暂停。
+- 退出码：`0` 成功、`2` 语法/语义问题、`3` 运行时错误、`4` 超时或 Ctrl+C、`5` 读不到脚本或内部错误、`64` 参数用法错误。
+- `--json` 的结束事件带结构化错误：`{"type":"finished","ok":false,"kind":"runtime","number":6,"line":12,"message":"溢出"}`。
+- 相对路径按脚本所在目录解析（与编辑器里运行一致），控制台代码页会切到 UTF-8。
+- `qide-run.exe` 只链接解释器，不链接界面，体积约 1.7 MB（GUI 版约 32 MB）；图标是浅绿色（`assets/run.ico`），与深蓝色的 `first.exe` 一眼可分。
 
 ## 界面布局
 
@@ -96,7 +129,7 @@
 ```powershell
 git clone git@github.com:qiangkui/Q-IDE.git
 cd Q-IDE
-cargo build      # 产物：target\debug\first.exe
+cargo build      # 产物：target\debug\first.exe（界面）与 target\debug\qide-run.exe（命令行运行器）
 cargo run
 ```
 
@@ -150,10 +183,12 @@ Debug.Print "名字个数：" & names.Count
 
 | 路径 | 说明 |
 | --- | --- |
-| `src/main.rs` | 入口：初始化 GPUI、设置与主题，按上次记录的窗口矩形开窗 |
+| `src/main.rs` | 入口：解析命令行（`src/startup.rs`）、初始化 GPUI、设置与主题，按上次记录的窗口矩形开窗 |
+| `src/startup.rs` | 主程序命令行：文件/文件夹路径、`--help`、`--version`，以及没有控制台时的消息框兜底 |
 | `src/app.rs` | `CodeWindow` 主体：窗口构造、共享状态、设置同步与通用辅助函数 |
 | `src/app/*.rs` | 子模块：`ai`（AI 写入文件）、`dock`（面板停靠）、`debug` / `breakpoints`（运行调试与断点）、`editor`（导航与编辑动作）、`files` / `session`（文件与会话）、`dialogs`（通用对话框）、`view`（界面渲染） |
 | `src/interpreter/` | VB 解释器：`lexer` / `parser` / `ast`、`runtime`、`ffi`、`builtins`、`debug`、`sema`、`dialog`、`filelock`、`trampoline` |
+| `src/bin/qide-run.rs` / `src/cli.rs` | 命令行运行器：只链接解释器与编码模块（不链接界面），提供 `run` / `check` 子命令、JSONL 事件与退出码 |
 | `src/panels.rs` | Dock 面板注册、面板标题栏按钮、面板右键菜单项 |
 | `src/ai/client.rs` | DeepSeek 网络层：地址解析、请求体（含 tools）/应答解析、WinHTTP 流式调用；不依赖界面，可整体移植 |
 | `src/ai/stream.rs` | SSE 增量解析（纯逻辑，可单测）：字节流 → 文本增量 / 工具调用增量 |
@@ -171,7 +206,7 @@ Debug.Print "名字个数：" & names.Count
 | `src/menu.rs` / `src/title_bar.rs` / `src/window_frame.rs` | 顶部菜单、自绘标题栏、窗口外框 |
 | `src/theme.rs` | 内置深/浅配色、自定义主题解析结果与尺寸常量 |
 | `src/*_tests.rs` | crate 级测试文件（在 `src/main.rs` 里用 `#[cfg(test)] mod ...;` 引入） |
-| `assets/`、`app.rc`、`build.rs` | 窗口与任务栏图标 |
+| `assets/`、`app.rc`、`run.rc`、`build.rs` | 图标：`first.exe` 用深蓝的 `app.ico`，`qide-run.exe` 用浅绿的 `run.ico` |
 | `vendor/gpui-component/` | gpui-component 本地补丁 |
 | `docs/` | 项目文档 |
 
@@ -198,22 +233,23 @@ Debug.Print "名字个数：" & names.Count
 ## 开发与验证
 
 ```powershell
-cargo build              # 通过
-cargo test               # 360 passed / 5 ignored
+cargo build              # 通过：first.exe（界面）+ qide-run.exe（命令行）
+cargo test               # 通过：界面 crate 520 条 + qide-run crate 170 条（含解释器自带测试）
 cargo clippy --all-targets
 ```
 
 - 这是二进制 crate，没有 lib target，别用 `cargo test --lib`。
+- `qide-run` 用 `#[path = "../interpreter/mod.rs"]` 直接包含解释器源码，所以解释器自带的测试会在两个 crate 里各跑一遍（互不影响）。
 - 新增测试放 crate 级文件（如 `src/xxx_tests.rs`），在 `src/main.rs` 里用 `#[cfg(test)] mod xxx_tests;` 注册；写在模块内部的 `#[cfg(test)] mod tests` 会触发 rustc 的宏展开递归上限。
 - 界面与交互需要人工验证，自动化测试只覆盖模型与纯逻辑。
 - 源码是 UTF-8：不要用 Windows PowerShell 5.1 的 `Get-Content` / `Set-Content` / `Out-File` 读写源码（前者按 GBK 解码，后者会写 BOM）。
 
 ## 已知限制
 
-- 只支持 Windows 后端；界面与窗口处理有 Windows 专属代码（`#![windows_subsystem = "windows"]`、`app.rc` 图标、自绘窗口外框）。
-- 解释器不支持 COM 自动化（`CreateObject` / `GetObject`），也没有 `Currency` 类型；日期用 `Double` 序列值。
-- Win32 调用不支持 `Single` 与 `Double` 混用、超过 4 个参数的混合浮点调用、结构体里的变长 `String` 与 UDT 数组字段。
-- `AddressOf` 只适用于「调用期间同步回调」的 API（把指针存起来以后再回调的 API 不能用）。
+- 只支持 Windows 后端；界面与窗口处理有 Windows 专属代码（`#![windows_subsystem = "windows"]`、`app.rc`/`run.rc` 图标、自绘窗口外框）。
+- 解释器支持基础 COM Automation（`CreateObject`、活动对象/新对象/moniker `GetObject`、文件和 ProgID `GetObject`、位置/命名参数方法与属性读写）；命名参数要求 COM 组件通过 `IDispatch` 暴露形参名，可写标量/字符串变量按 `ByRef VARIANT` 传递，一维 Variant 数组按值转换为 `SAFEARRAY`；多维/强类型数组、UDT 记录封送、COM 事件及 `Implements` 尚不支持。文件中的 `GetObject` 依赖已注册且支持 `IPersistFile` 的类。`Currency` 使用四位小数定点数；`Date` 是独立类型，内部以 OLE Automation `Double` 序列存储。
+- Win32 调用最多支持 64 个标量参数；结构体里的变长 `String` 仍不支持。
+- `AddressOf` 回调最多支持 64 个参数，需在脚本仍运行的同一线程执行；其他线程的回调会返回默认值。可在 API 调用返回后由脚本持有回调指针，但脚本结束后不会再进入解释器，数组形参因原生指针不包含长度/边界信息而不支持。
 - 资源管理器暂不支持多选（受当前树组件的行选中态限制）。
 
 ## 声明

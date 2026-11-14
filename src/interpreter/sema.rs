@@ -123,10 +123,7 @@ impl Checker {
             }
             Stmt::Const { value, line, .. } => self.check_expr(value, names, *line),
             Stmt::Redim {
-                name,
-                bounds,
-                line,
-                ..
+                name, bounds, line, ..
             } => {
                 self.check_undefined(name, names, *line, "未定义的数组");
                 for (lower, upper) in bounds {
@@ -134,7 +131,10 @@ impl Checker {
                     self.check_expr(upper, names, *line);
                 }
             }
-            Stmt::Erase { names: erased, line } => {
+            Stmt::Erase {
+                names: erased,
+                line,
+            } => {
                 for name in erased {
                     self.check_undefined(name, names, *line, "未定义的数组");
                 }
@@ -180,21 +180,23 @@ impl Checker {
                 self.check_expr(value, names, *line);
             }
             Stmt::AssignWithMember { value, line, .. } => self.check_expr(value, names, *line),
+            Stmt::WithCall { args, line, .. } => {
+                for arg in args {
+                    self.check_expr(arg, names, *line);
+                }
+            }
             // `With` 块里的裸名字可能是对象的成员，整块跳过。
-            Stmt::With {
-                subject, line, ..
-            } => self.check_expr(subject, names, *line),
-            Stmt::Call { name, args, line } => {
+            Stmt::With { subject, line, .. } => self.check_expr(subject, names, *line),
+            Stmt::Call {
+                name, args, line, ..
+            } => {
                 self.check_call(name, names, *line);
                 for arg in args {
                     self.check_expr(arg, names, *line);
                 }
             }
             Stmt::CallMethod {
-                object,
-                args,
-                line,
-                ..
+                object, args, line, ..
             } => {
                 self.check_undefined(object, names, *line, "未声明的变量");
                 for arg in args {
@@ -257,7 +259,10 @@ impl Checker {
                 self.check_block(body, names);
             }
             Stmt::DoLoop {
-                pre, post, body, line,
+                pre,
+                post,
+                body,
+                line,
             } => {
                 if let Some((_, condition)) = pre {
                     self.check_expr(condition, names, *line);
@@ -421,7 +426,11 @@ impl Checker {
                 self.check_expr(number, names, *line);
                 self.check_expr(position, names, *line);
             }
-            Stmt::Set { target, value, line } => {
+            Stmt::Set {
+                target,
+                value,
+                line,
+            } => {
                 self.check_undefined(target, names, *line, "未声明的变量");
                 self.check_expr(value, names, *line);
             }
@@ -433,6 +442,8 @@ impl Checker {
             Stmt::Exit { .. }
             | Stmt::Label(..)
             | Stmt::Goto(..)
+            | Stmt::Gosub(..)
+            | Stmt::GosubReturn { .. }
             | Stmt::OnError { .. }
             | Stmt::Resume { .. }
             | Stmt::ErrClear { .. }
@@ -458,6 +469,7 @@ impl Checker {
             }
             // `With` 里的 `.X`：主体是隐藏的，无法静态判断。
             Expr::WithMember { .. } => {}
+            Expr::NamedArg { value, .. } => self.check_expr(value, names, line),
             Expr::TypeOf { expr, .. } => self.check_expr(expr, names, line),
             Expr::Call { name, args } => {
                 self.check_call(name, names, line);
@@ -475,7 +487,8 @@ impl Checker {
 
     /// 调用点：名字既不是过程/内置函数，也不是变量（可能是数组下标）时报错。
     fn check_call(&mut self, name: &str, variables: &HashSet<String>, line: usize) {
-        if self.callables.contains(name) || variables.contains(name) || self.globals.contains(name) {
+        if self.callables.contains(name) || variables.contains(name) || self.globals.contains(name)
+        {
             return;
         }
         let message = format!("未定义的函数或过程 `{name}`");
@@ -484,13 +497,7 @@ impl Checker {
         }
     }
 
-    fn check_undefined(
-        &mut self,
-        name: &str,
-        names: &HashSet<String>,
-        line: usize,
-        kind: &str,
-    ) {
+    fn check_undefined(&mut self, name: &str, names: &HashSet<String>, line: usize, kind: &str) {
         if names.contains(name) {
             return;
         }

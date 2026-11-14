@@ -93,9 +93,16 @@ impl SourceMap {
 }
 
 /// 展开 `#Include`。`path` 是主脚本路径，相对路径先按它所在目录解析，
-/// 找不到时再查程序目录下的 `assets/`（放程序自带的公共定义）。
-pub fn expand(source: &str, path: Option<&Path>) -> Result<Expanded, IncludeError> {
-    let assets = bundled_assets_dir();
+/// 找不到时再查 `include_dir`（`None` 时用程序目录下的 `assets/`，放程序自带的公共定义）。
+pub fn expand(
+    source: &str,
+    path: Option<&Path>,
+    include_dir: Option<&Path>,
+) -> Result<Expanded, IncludeError> {
+    let assets = match include_dir {
+        Some(dir) => Some(dir.to_path_buf()),
+        None => bundled_assets_dir(),
+    };
     expand_with_assets(source, path, assets.as_deref())
 }
 
@@ -209,8 +216,9 @@ impl Builder {
                 .map(|display| format!("（{display} 第 {line_no} 行）"))
                 .unwrap_or_default();
 
-            let names = parse_directive(raw_line)
-                .map_err(|message| IncludeError::new(format!("#Include {message}{suffix}"), include_line))?;
+            let names = parse_directive(raw_line).map_err(|message| {
+                IncludeError::new(format!("#Include {message}{suffix}"), include_line)
+            })?;
             let Some(name) = names else {
                 self.out.push((*raw_line).to_string());
                 self.logical.push(if display.is_some() {
@@ -373,7 +381,10 @@ mod tests {
             parse_directive("  #Include \"a.vb\" ' 注释").unwrap(),
             Some("a.vb".to_string())
         );
-        assert_eq!(parse_directive("#include\t\"a b.vb\"").unwrap(), Some("a b.vb".to_string()));
+        assert_eq!(
+            parse_directive("#include\t\"a b.vb\"").unwrap(),
+            Some("a b.vb".to_string())
+        );
         assert_eq!(parse_directive("' #Include \"a.vb\"").unwrap(), None);
         assert_eq!(parse_directive("Debug.Print 1").unwrap(), None);
         assert!(parse_directive("#Include").is_err());

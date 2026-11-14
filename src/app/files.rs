@@ -2,6 +2,7 @@
 
 use super::*;
 use super::dialogs::*;
+use crate::startup;
 
 impl CodeWindow {
     /// 切换标签：保留各标签自己的编辑器状态，只切换当前使用的编辑器实体。
@@ -766,6 +767,43 @@ impl CodeWindow {
         if changed {
             self.rebuild_tree(cx);
             self.save_layout(cx);
+        }
+    }
+
+    /// 打开命令行给出的路径：文件开成标签页，文件夹加进资源管理器。
+    ///
+    /// 从“打开方式”双击脚本时（Windows 把路径当第一个参数传进来），
+    /// 同一个文件夹通常还没有在资源管理器里，这里顺手加上，用户就能直接
+    /// 在树里看到旁边的文件。
+    pub(crate) fn open_startup_paths(
+        &mut self,
+        paths: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut folders = Vec::new();
+        for raw in paths {
+            let path = std::path::absolute(Path::new(raw)).unwrap_or_else(|_| PathBuf::from(raw));
+            match startup::classify(&path) {
+                startup::Target::Dir => folders.push(path),
+                startup::Target::File => {
+                    if let Some(dir) = path.parent() {
+                        let roots: Vec<PathBuf> =
+                            self.explorer.roots().iter().map(|root| root.path().to_path_buf()).collect();
+                        if !startup::covered_by_roots(&roots, dir) {
+                            folders.push(dir.to_path_buf());
+                        }
+                    }
+                    self.open_file(&path.to_string_lossy(), window, cx);
+                }
+                startup::Target::Missing => {
+                    let output = self.output();
+                    output.error(cx, format!("无法打开 {}：路径不存在", path.display()));
+                }
+            }
+        }
+        if !folders.is_empty() {
+            self.add_folders(folders, window, cx);
         }
     }
 

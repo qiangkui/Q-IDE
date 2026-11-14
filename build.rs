@@ -2,12 +2,19 @@
 //!
 //! gpui 的 Windows 后端按资源 id 1 读窗口图标（`app.rc` 里的 `1 ICON`），
 //! 所以不做这一步时窗口与任务栏会显示系统默认图标。
+//!
+//! 两个可执行文件用不同图标：`first.exe` 是深蓝（app.rc），
+//! 命令行运行器 `qide-run.exe` 是浅绿（run.rc），便于在“打开方式”里分辨。
 
 fn main() {
     println!("cargo:rerun-if-changed=app.rc");
     println!("cargo:rerun-if-changed=assets/app.ico");
-    // 非 Windows 平台上这个函数什么都不做。
-    let _ = embed_resource::compile("app.rc", embed_resource::NONE);
+    println!("cargo:rerun-if-changed=run.rc");
+    println!("cargo:rerun-if-changed=assets/run.ico");
+    // 非 Windows 平台上这两个函数什么都不做。
+    // 图标资源只链进对应 bin，否则后编译的那个会覆盖掉前一个的图标。
+    let _ = embed_resource::compile_for("app.rc", ["first"], embed_resource::NONE);
+    let _ = embed_resource::compile_for("run.rc", ["qide-run"], embed_resource::NONE);
 
     // GPUI 按元素树递归绘制界面；主窗口层级较深，AI 面板里的 Markdown 文本
     // 还会在最深处再占一层很大的栈帧，默认 1MB 的主线程栈会在发送消息时溢出。

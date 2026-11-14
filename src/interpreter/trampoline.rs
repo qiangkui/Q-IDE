@@ -1,9 +1,8 @@
 //! `AddressOf` 需要的机器码跳板。
 //!
 //! Win32 回调是原生函数指针，VB 过程却活在解释器里。这里为每个回调生成一段
-//! x64 机器码：把上下文指针塞进 `RCX`、把前三个实参寄存器整体后移一位，
-//! 第四个实参挪到栈上的第五个参数位置，再调用 [`crate::interpreter::runtime`]
-//! 里的转发函数。转发函数按 VB 过程的形参类型把寄存器值还原成
+//! x64 机器码：保存整数与浮点参数寄存器及栈参数，把上下文和寄存器快照传给
+//! [`crate::interpreter::runtime`] 里的转发函数。转发函数按 VB 过程的形参类型还原成
 //! [`crate::interpreter::value::Value`]。
 //!
 //! 直接作为 `Declare` 实参的跳板只在该次调用期间有效（同步回调）；
@@ -11,8 +10,14 @@
 
 use std::ffi::c_void;
 
-/// 一段跳板的机器码长度（字节）。
-pub const STUB_LEN: usize = 45;
+/// Win64 下调用桩与回调跳板统一支持的实参数量上限。
+pub const MAX_ABI_ARGS: usize = 64;
+
+#[repr(C)]
+pub struct CallbackRegisters {
+    pub integer: [usize; MAX_ABI_ARGS],
+    pub float: [u64; MAX_ABI_ARGS],
+}
 
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
@@ -29,11 +34,7 @@ unsafe extern "system" {
         protect: u32,
     ) -> *mut c_void;
     fn VirtualFree(address: *mut c_void, size: usize, free_type: u32) -> i32;
-    fn FlushInstructionCache(
-        process: *mut c_void,
-        base: *const c_void,
-        size: usize,
-    ) -> i32;
+    fn FlushInstructionCache(process: *mut c_void, base: *const c_void, size: usize) -> i32;
     fn GetCurrentProcess() -> *mut c_void;
 }
 
@@ -43,9 +44,12 @@ pub struct Trampoline {
 }
 
 impl Trampoline {
-    /// 生成一个把回调转发到 `thunk`、并把 `context` 作为第一个实参的跳板。
-    pub fn new(context: usize, thunk: usize) -> Result<Self, String> {
-        let bytes = stub_bytes(context, thunk);
+    /// 生成一个把上下文与原始寄存器快照转发给 `thunk` 的跳板。
+    pub fn new(context: usize, thunk: usize, arg_count: usize) -> Result<Self, String> {
+        if arg_count > MAX_ABI_ARGS {
+            return Err(format!("回调最多支持 {MAX_ABI_ARGS} 个参数"));
+        }
+        let bytes = stub_bytes(context, thunk, arg_count);
         // SAFETY: 只是申请一页可执行内存并写入我们自己生成的机器码。
         let code = unsafe {
             VirtualAlloc(
@@ -82,121 +86,500 @@ impl Drop for Trampoline {
     }
 }
 
-/// x64 跳板的机器码：
-///
-/// ```text
-/// sub rsp, 0x28         48 83 EC 28   ; 影子空间 + 第 5 个参数槽
-/// mov [rsp+0x20], r9    4C 89 4C 24 20 ; 原第 4 个实参 → 栈上第 5 个参数
-/// mov r9, r8            4D 8B C8      ; 原第 3 个实参 → r9
-/// mov r8, rdx           4C 8B C2      ; 原第 2 个实参 → r8
-/// mov rdx, rcx          48 8B D1      ; 原第 1 个实参 → rdx
-/// mov rcx, <context>    48 B9 ..      ; 上下文指针 → rcx
-/// mov rax, <thunk>      48 B8 ..
-/// call rax              FF D0         ; 调用转发函数
-/// add rsp, 0x28         48 83 C4 28
-/// ret                   C3
-/// ```
-///
-/// 因此转发函数签名是 `extern "system" fn(ctx, a1, a2, a3, a4) -> usize`，
-/// 最多支持 4 个回调参数。分配 `0x28` 字节后栈仍按 16 字节对齐：
-/// 入口 `rsp % 16 == 8`，减 40 后为 0，`call` 压入返回地址后转发函数看到 8。
-/// 四个搬移都用 `8B`（`MOV r64, r/m64`，目标在 `reg` 字段）这一种形式，
-/// 免得两种编码方向混着写。
-fn stub_bytes(context: usize, thunk: usize) -> [u8; STUB_LEN] {
-    let mut bytes = [0u8; STUB_LEN];
-    bytes[0..4].copy_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
-    bytes[4..9].copy_from_slice(&[0x4C, 0x89, 0x4C, 0x24, 0x20]);
-    bytes[9..12].copy_from_slice(&[0x4D, 0x8B, 0xC8]);
-    bytes[12..15].copy_from_slice(&[0x4C, 0x8B, 0xC2]);
-    bytes[15..18].copy_from_slice(&[0x48, 0x8B, 0xD1]);
-    bytes[18..20].copy_from_slice(&[0x48, 0xB9]);
-    bytes[20..28].copy_from_slice(&(context as u64).to_le_bytes());
-    bytes[28..30].copy_from_slice(&[0x48, 0xB8]);
-    bytes[30..38].copy_from_slice(&(thunk as u64).to_le_bytes());
-    bytes[38..40].copy_from_slice(&[0xFF, 0xD0]);
-    bytes[40..44].copy_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
-    bytes[44] = 0xC3;
+pub enum InvokeArg {
+    Integer(usize),
+    Single(f32),
+    Double(f64),
+}
+
+pub enum InvokeResult {
+    Integer(usize),
+    Single(f32),
+    Double(f64),
+}
+
+struct ExecutableCode {
+    code: *mut u8,
+}
+
+impl ExecutableCode {
+    fn new(bytes: &[u8]) -> Result<Self, String> {
+        let code = unsafe {
+            VirtualAlloc(
+                std::ptr::null_mut(),
+                PAGE_SIZE,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
+        } as *mut u8;
+        if code.is_null() {
+            return Err("无法申请可执行内存（Win32 ABI 调用）".into());
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), code, bytes.len());
+            FlushInstructionCache(GetCurrentProcess(), code.cast(), bytes.len());
+        }
+        Ok(Self { code })
+    }
+}
+
+impl Drop for ExecutableCode {
+    fn drop(&mut self) {
+        unsafe {
+            VirtualFree(self.code.cast(), 0, MEM_RELEASE);
+        }
+    }
+}
+
+/// 通过运行时生成的 Windows x64 调用桩处理任意标量参数组合。
+pub fn invoke(
+    address: usize,
+    args: &[InvokeArg],
+    return_type: crate::interpreter::value::VbType,
+) -> Result<InvokeResult, String> {
+    if args.len() > MAX_ABI_ARGS {
+        return Err(format!("Win32 调用最多支持 {MAX_ABI_ARGS} 个标量参数"));
+    }
+    let code = ExecutableCode::new(&invoke_stub(address, args))?;
+    unsafe {
+        match return_type {
+            crate::interpreter::value::VbType::Single => {
+                let function: unsafe extern "system" fn() -> f32 = std::mem::transmute(code.code);
+                Ok(InvokeResult::Single(function()))
+            }
+            crate::interpreter::value::VbType::Double | crate::interpreter::value::VbType::Date => {
+                let function: unsafe extern "system" fn() -> f64 = std::mem::transmute(code.code);
+                Ok(InvokeResult::Double(function()))
+            }
+            _ => {
+                let function: unsafe extern "system" fn() -> usize = std::mem::transmute(code.code);
+                Ok(InvokeResult::Integer(function()))
+            }
+        }
+    }
+}
+
+fn emit_u64(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn emit_rax(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&[0x48, 0xB8]);
+    emit_u64(bytes, value);
+}
+
+fn invoke_stub(address: usize, args: &[InvokeArg]) -> Vec<u8> {
+    let stack_args = args.len().saturating_sub(4);
+    let mut frame_size = 32 + stack_args * 8;
+    if frame_size.is_multiple_of(16) {
+        frame_size += 8;
+    }
+    let mut bytes = vec![0x48, 0x81, 0xEC];
+    bytes.extend_from_slice(&(frame_size as u32).to_le_bytes());
+
+    for (index, arg) in args.iter().enumerate().skip(4) {
+        let bits = match arg {
+            InvokeArg::Integer(value) => *value as u64,
+            InvokeArg::Single(value) => u64::from(value.to_bits()),
+            InvokeArg::Double(value) => value.to_bits(),
+        };
+        emit_rax(&mut bytes, bits);
+        let stack_offset = 0x20 + (index - 4) * 8;
+        if stack_offset <= i8::MAX as usize {
+            bytes.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, stack_offset as u8]);
+        } else {
+            bytes.extend_from_slice(&[0x48, 0x89, 0x84, 0x24]);
+            bytes.extend_from_slice(&(stack_offset as u32).to_le_bytes());
+        }
+    }
+    for (index, arg) in args.iter().take(4).enumerate() {
+        match arg {
+            InvokeArg::Integer(value) => {
+                let (rex, opcode) = match index {
+                    0 => (0x48, 0xB9),
+                    1 => (0x48, 0xBA),
+                    2 => (0x49, 0xB8),
+                    _ => (0x49, 0xB9),
+                };
+                bytes.extend_from_slice(&[rex, opcode]);
+                emit_u64(&mut bytes, *value as u64);
+            }
+            InvokeArg::Single(value) => {
+                emit_rax(&mut bytes, u64::from(value.to_bits()));
+                bytes.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC0 + index as u8 * 8]);
+            }
+            InvokeArg::Double(value) => {
+                emit_rax(&mut bytes, value.to_bits());
+                bytes.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC0 + index as u8 * 8]);
+            }
+        }
+    }
+    emit_rax(&mut bytes, address as u64);
+    bytes.extend_from_slice(&[0xFF, 0xD0, 0x48, 0x81, 0xC4]);
+    bytes.extend_from_slice(&(frame_size as u32).to_le_bytes());
+    bytes.push(0xC3);
+    bytes
+}
+
+/// 保存前四个位置参数寄存器，并把后续栈参数复制到同一快照布局。
+fn stub_bytes(context: usize, thunk: usize, arg_count: usize) -> Vec<u8> {
+    const REGISTER_SNAPSHOT_OFFSET: u32 = 0x20;
+    const FLOAT_SNAPSHOT_OFFSET: u32 =
+        REGISTER_SNAPSHOT_OFFSET + (MAX_ABI_ARGS * std::mem::size_of::<usize>()) as u32;
+    const FRAME_SIZE: u32 =
+        FLOAT_SNAPSHOT_OFFSET + (MAX_ABI_ARGS * std::mem::size_of::<usize>()) as u32;
+    const ALIGNED_FRAME_SIZE: u32 = FRAME_SIZE + 8;
+
+    let mut bytes = vec![0x48, 0x81, 0xEC];
+    bytes.extend_from_slice(&ALIGNED_FRAME_SIZE.to_le_bytes());
+    bytes.extend_from_slice(&[
+        0x48,
+        0x89,
+        0x4C,
+        0x24,
+        REGISTER_SNAPSHOT_OFFSET as u8, // mov [rsp+20h], rcx
+        0x48,
+        0x89,
+        0x54,
+        0x24,
+        (REGISTER_SNAPSHOT_OFFSET + 8) as u8, // mov [rsp+28h], rdx
+        0x4C,
+        0x89,
+        0x44,
+        0x24,
+        (REGISTER_SNAPSHOT_OFFSET + 16) as u8, // mov [rsp+30h], r8
+        0x4C,
+        0x89,
+        0x4C,
+        0x24,
+        (REGISTER_SNAPSHOT_OFFSET + 24) as u8, // mov [rsp+38h], r9
+    ]);
+    for index in 0..4u8 {
+        let offset = FLOAT_SNAPSHOT_OFFSET + u32::from(index) * 8;
+        bytes.extend_from_slice(&[0x66, 0x0F, 0xD6, 0x84 + index * 8, 0x24]);
+        bytes.extend_from_slice(&offset.to_le_bytes());
+    }
+    for index in 4..arg_count {
+        let source = ALIGNED_FRAME_SIZE + 0x28 + ((index - 4) * 8) as u32;
+        let integer_target =
+            REGISTER_SNAPSHOT_OFFSET + (index * std::mem::size_of::<usize>()) as u32;
+        let float_target = FLOAT_SNAPSHOT_OFFSET + (index * std::mem::size_of::<usize>()) as u32;
+        for target in [integer_target, float_target] {
+            bytes.extend_from_slice(&[0x48, 0x8B, 0x84, 0x24]);
+            bytes.extend_from_slice(&source.to_le_bytes());
+            bytes.extend_from_slice(&[0x48, 0x89, 0x84, 0x24]);
+            bytes.extend_from_slice(&target.to_le_bytes());
+        }
+    }
+    bytes.extend_from_slice(&[0x48, 0xB9]);
+    bytes.extend_from_slice(&(context as u64).to_le_bytes());
+    bytes.extend_from_slice(&[0x48, 0x8D, 0x94, 0x24]);
+    bytes.extend_from_slice(&REGISTER_SNAPSHOT_OFFSET.to_le_bytes());
+    bytes.extend_from_slice(&[0x48, 0xB8]);
+    bytes.extend_from_slice(&(thunk as u64).to_le_bytes());
+    bytes.extend_from_slice(&[0xFF, 0xD0, 0x48, 0x81, 0xC4]);
+    bytes.extend_from_slice(&ALIGNED_FRAME_SIZE.to_le_bytes());
+    bytes.push(0xC3);
     bytes
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    static CAPTURED: Mutex<[usize; 5]> = Mutex::new([0; 5]);
-
-    extern "system" fn probe(
-        context: usize,
-        first: usize,
-        second: usize,
-        third: usize,
-        fourth: usize,
+    extern "system" fn callback_stack_probe(
+        arg_count: usize,
+        args: *const CallbackRegisters,
     ) -> usize {
-        let mut slot = CAPTURED.lock().unwrap();
-        slot.copy_from_slice(&[context, first, second, third, fourth]);
-        drop(slot);
-        first + second + third + fourth
+        let args = unsafe { &*args };
+        args.integer[..arg_count].iter().sum()
     }
 
-    extern "system" fn probe_digits(
+    extern "system" fn sum_forty(
+        a0: usize,
+        a1: usize,
+        a2: usize,
+        a3: usize,
+        a4: usize,
+        a5: usize,
+        a6: usize,
+        a7: usize,
+        a8: usize,
+        a9: usize,
+        a10: usize,
+        a11: usize,
+        a12: usize,
+        a13: usize,
+        a14: usize,
+        a15: usize,
+        a16: usize,
+        a17: usize,
+        a18: usize,
+        a19: usize,
+        a20: usize,
+        a21: usize,
+        a22: usize,
+        a23: usize,
+        a24: usize,
+        a25: usize,
+        a26: usize,
+        a27: usize,
+        a28: usize,
+        a29: usize,
+        a30: usize,
+        a31: usize,
+        a32: usize,
+        a33: usize,
+        a34: usize,
+        a35: usize,
+        a36: usize,
+        a37: usize,
+        a38: usize,
+        a39: usize,
+    ) -> usize {
+        [
+            a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18,
+            a19, a20, a21, a22, a23, a24, a25, a26, a27, a28, a29, a30, a31, a32, a33, a34, a35,
+            a36, a37, a38, a39,
+        ]
+        .iter()
+        .sum()
+    }
+
+    extern "system" fn callback_probe(_context: usize, args: *const CallbackRegisters) -> usize {
+        let args = unsafe { &*args };
+        args.integer[0] + args.integer[1] + args.integer[2] + args.integer[3]
+    }
+
+    extern "system" fn callback_float_probe(
         _context: usize,
-        first: usize,
+        args: *const CallbackRegisters,
+    ) -> f64 {
+        let args = unsafe { &*args };
+        f64::from_bits(args.float[0]) + f64::from_bits(args.float[1])
+    }
+
+    extern "system" fn callback_single_probe(
+        _context: usize,
+        args: *const CallbackRegisters,
+    ) -> f32 {
+        let args = unsafe { &*args };
+        f32::from_bits(args.float[0] as u32) + f32::from_bits(args.float[1] as u32)
+    }
+
+    extern "system" fn mixed_probe(
+        first: f32,
         second: usize,
-        third: usize,
-        fourth: usize,
-    ) -> usize {
-        first * 1000 + second * 100 + third * 10 + fourth
+        third: f64,
+        fourth: i32,
+        fifth: f32,
+    ) -> f64 {
+        f64::from(first) + second as f64 + third + f64::from(fourth) + f64::from(fifth)
+    }
+
+    extern "system" fn single_probe(first: f64, second: usize, third: f32, fourth: usize) -> f32 {
+        (first + second as f64 + f64::from(third) + fourth as f64) as f32
     }
 
     #[test]
-    fn trampoline_passes_registers_in_order() {
-        let thunk: extern "system" fn(usize, usize, usize, usize, usize) -> usize = probe_digits;
-        let trampoline = Trampoline::new(0, thunk as usize).unwrap();
-        let expected = stub_bytes(0, thunk as usize);
-        let actual =
-            unsafe { std::slice::from_raw_parts(trampoline.code as *const u8, STUB_LEN) };
-        assert_eq!(actual, &expected[..], "写入的机器码不一致");
+    fn dynamic_call_stub_handles_mixed_floats_and_stack_arguments() {
+        let args = [
+            InvokeArg::Single(1.5),
+            InvokeArg::Integer(2),
+            InvokeArg::Double(3.0),
+            InvokeArg::Integer(4),
+            InvokeArg::Single(5.5),
+        ];
+        let result = invoke(
+            mixed_probe as *const () as usize,
+            &args,
+            crate::interpreter::value::VbType::Double,
+        )
+        .unwrap();
+        let InvokeResult::Double(value) = result else {
+            panic!("expected Double result");
+        };
+        assert_eq!(value, 16.0);
+    }
+
+    #[test]
+    fn dynamic_call_stub_preserves_single_return_register() {
+        let args = [
+            InvokeArg::Double(1.5),
+            InvokeArg::Integer(2),
+            InvokeArg::Single(3.0),
+            InvokeArg::Integer(4),
+        ];
+        let result = invoke(
+            single_probe as *const () as usize,
+            &args,
+            crate::interpreter::value::VbType::Single,
+        )
+        .unwrap();
+        let InvokeResult::Single(value) = result else {
+            panic!("expected Single result");
+        };
+        assert_eq!(value, 10.5);
+    }
+
+    #[test]
+    fn dynamic_call_stub_handles_forty_integer_arguments() {
+        let args: Vec<_> = (1..=40).map(InvokeArg::Integer).collect();
+        let result = invoke(
+            sum_forty as *const () as usize,
+            &args,
+            crate::interpreter::value::VbType::LongLong,
+        )
+        .unwrap();
+        let InvokeResult::Integer(value) = result else {
+            panic!("expected integer result");
+        };
+        assert_eq!(value, 820);
+    }
+
+    #[test]
+    fn trampoline_captures_integer_registers() {
+        let thunk: extern "system" fn(usize, *const CallbackRegisters) -> usize = callback_probe;
+        let trampoline = Trampoline::new(0, thunk as usize, 4).unwrap();
+        let expected = stub_bytes(0, thunk as usize, 4);
+        let actual = unsafe { std::slice::from_raw_parts(trampoline.code, expected.len()) };
+        assert_eq!(actual, expected);
         type F4 = unsafe extern "system" fn(usize, usize, usize, usize) -> usize;
-        // SAFETY: 跳板末尾跳到 `probe_digits`，签名与其一致。
         let callback: F4 = unsafe { std::mem::transmute(trampoline.address()) };
-        assert_eq!(unsafe { callback(1, 2, 3, 4) }, 1234);
-        assert_eq!(unsafe { callback(7, 5, 9, 2) }, 7592);
+        assert_eq!(unsafe { callback(1, 2, 3, 4) }, 10);
     }
 
     #[test]
-    fn stub_shifts_registers_and_embeds_pointers() {
-        let bytes = stub_bytes(0x1122_3344_5566_7788, 0x99AA_BBCC_DDEE_FF00);
-        assert_eq!(&bytes[0..4], &[0x48, 0x83, 0xEC, 0x28]);
-        assert_eq!(&bytes[4..9], &[0x4C, 0x89, 0x4C, 0x24, 0x20]);
-        assert_eq!(&bytes[9..12], &[0x4D, 0x8B, 0xC8]);
-        assert_eq!(&bytes[12..15], &[0x4C, 0x8B, 0xC2]);
-        assert_eq!(&bytes[15..18], &[0x48, 0x8B, 0xD1]);
-        assert_eq!(&bytes[18..20], &[0x48, 0xB9]);
+    fn trampoline_captures_stack_arguments_through_fourteen_parameters() {
+        let thunk: extern "system" fn(usize, *const CallbackRegisters) -> usize =
+            callback_stack_probe;
+        let trampoline = Trampoline::new(14, thunk as usize, 14).unwrap();
+        type F14 = unsafe extern "system" fn(
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+        ) -> usize;
+        let callback: F14 = unsafe { std::mem::transmute(trampoline.address()) };
         assert_eq!(
-            u64::from_le_bytes(bytes[20..28].try_into().unwrap()),
-            0x1122_3344_5566_7788
+            unsafe { callback(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14) },
+            105
         );
-        assert_eq!(&bytes[28..30], &[0x48, 0xB8]);
-        assert_eq!(
-            u64::from_le_bytes(bytes[30..38].try_into().unwrap()),
-            0x99AA_BBCC_DDEE_FF00
-        );
-        assert_eq!(&bytes[38..40], &[0xFF, 0xD0]);
-        assert_eq!(&bytes[40..44], &[0x48, 0x83, 0xC4, 0x28]);
-        assert_eq!(bytes[44], 0xC3);
     }
 
     #[test]
-    fn trampoline_forwards_context_and_four_arguments() {
-        let thunk: extern "system" fn(usize, usize, usize, usize, usize) -> usize = probe;
-        let trampoline = Trampoline::new(0xDEAD_BEEF, thunk as usize).unwrap();
-        type F4 = unsafe extern "system" fn(usize, usize, usize, usize) -> usize;
-        // SAFETY: 跳板末尾跳到 `probe`，签名与其一致。
-        let callback: F4 = unsafe { std::mem::transmute(trampoline.address()) };
-        let sum = unsafe { callback(1, 2, 3, 4) };
-        let captured = *CAPTURED.lock().unwrap();
-        assert_eq!(captured, [0xDEAD_BEEF, 1, 2, 3, 4]);
-        assert_eq!(sum, 10);
+    fn trampoline_captures_stack_arguments_past_byte_displacement_range() {
+        let thunk: extern "system" fn(usize, *const CallbackRegisters) -> usize =
+            callback_stack_probe;
+        let trampoline = Trampoline::new(40, thunk as usize, 40).unwrap();
+        type F40 = unsafe extern "system" fn(
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+        ) -> usize;
+        let callback: F40 = unsafe { std::mem::transmute(trampoline.address()) };
+        assert_eq!(
+            unsafe {
+                callback(
+                    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                    23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+                )
+            },
+            820
+        );
+    }
+
+    #[test]
+    fn trampoline_captures_floating_registers() {
+        let thunk: extern "system" fn(usize, *const CallbackRegisters) -> f64 =
+            callback_float_probe;
+        let trampoline = Trampoline::new(0, thunk as usize, 2).unwrap();
+        type F2 = unsafe extern "system" fn(f64, f64) -> f64;
+        let callback: F2 = unsafe { std::mem::transmute(trampoline.address()) };
+        assert_eq!(unsafe { callback(1.25, 2.5) }, 3.75);
+    }
+
+    #[test]
+    fn trampoline_preserves_single_return_register() {
+        let thunk: extern "system" fn(usize, *const CallbackRegisters) -> f32 =
+            callback_single_probe;
+        let trampoline = Trampoline::new(0, thunk as usize, 2).unwrap();
+        type F2 = unsafe extern "system" fn(f32, f32) -> f32;
+        let callback: F2 = unsafe { std::mem::transmute(trampoline.address()) };
+        assert_eq!(unsafe { callback(1.25, 2.5) }, 3.75);
+    }
+
+    #[test]
+    fn stub_saves_gp_and_xmm_arguments() {
+        let bytes = stub_bytes(0x1122_3344_5566_7788, 0x99AA_BBCC_DDEE_FF00, 4);
+        assert_eq!(&bytes[0..7], &[0x48, 0x81, 0xEC, 0x28, 0x04, 0, 0]);
+        assert_eq!(&bytes[7..12], &[0x48, 0x89, 0x4C, 0x24, 0x20]);
+        assert!(
+            bytes
+                .windows(9)
+                .any(|window| { window == [0x66, 0x0F, 0xD6, 0x84, 0x24, 0x20, 0x02, 0, 0] })
+        );
+        assert!(
+            bytes
+                .windows(8)
+                .any(|window| { window == 0x1122_3344_5566_7788u64.to_le_bytes() })
+        );
+        assert!(
+            bytes
+                .windows(8)
+                .any(|window| { window == 0x99AA_BBCC_DDEE_FF00u64.to_le_bytes() })
+        );
+        assert_eq!(
+            &bytes[bytes.len() - 9..],
+            &[0xD0, 0x48, 0x81, 0xC4, 0x28, 0x04, 0, 0, 0xC3]
+        );
+        assert_eq!(bytes.last(), Some(&0xC3));
     }
 }

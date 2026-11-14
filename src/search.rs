@@ -477,7 +477,7 @@ pub fn render(
         .gap_1()
         .px(px(8.0))
         .pb(px(4.0))
-        .bg(rgb(palette.panel_bg));
+        .bg(rgb(palette.side_panel_bg));
     for option in [SearchOption::CaseSensitive, SearchOption::WholeWord] {
         let selected = match option {
             SearchOption::CaseSensitive => query.case_sensitive,
@@ -514,7 +514,7 @@ pub fn render(
         .gap_1()
         .px(px(8.0))
         .pb(px(4.0))
-        .bg(rgb(palette.panel_bg))
+        .bg(rgb(palette.side_panel_bg))
         .items_center();
     scope_row = scope_row.child(
         div()
@@ -604,7 +604,7 @@ pub fn render(
                 .items_center()
                 .px(px(8.0))
                 .pb(px(4.0))
-                .bg(rgb(palette.panel_bg))
+                .bg(rgb(palette.side_panel_bg))
                 .child(div().flex_1().min_w_0().child(replace_input))
                 .child(
                     Button::new("search-replace-all")
@@ -625,7 +625,7 @@ pub fn render(
                 .flex_1()
                 .min_h_0()
                 .overflow_y_scroll()
-                .bg(rgb(palette.panel_bg))
+                .bg(rgb(palette.side_panel_bg))
                 .child(body),
         )
         .into_any_element()
@@ -689,7 +689,7 @@ fn status_row(
         .px(px(8.0))
         .pb(px(4.0))
         .gap_2()
-        .bg(rgb(palette.panel_bg))
+        .bg(rgb(palette.side_panel_bg))
         .text_xs()
         .text_color(rgb(palette.muted_text))
         .child(text)

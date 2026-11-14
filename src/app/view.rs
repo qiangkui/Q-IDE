@@ -30,8 +30,15 @@ impl CodeWindow {
 
     /// 最左侧活动栏。
     pub(super) fn activity_bar(&self, cx: &mut Context<Self>, appearance: &AppearanceSettings) -> AnyElement {
+        let palette = Palette::for_theme(cx);
         // 选中态用偏白的高亮盖掉组件默认的“按下变暗”。
-        let selected_bg = rgba(Palette::for_theme(cx).activity_bar_selected);
+        let selected_bg = rgba(palette.activity_bar_selected);
+        let icon_color = ui_theme::resolve(&appearance.theme, cx)
+            .mode
+            .is_dark()
+            .then_some(palette.sidebar_text)
+            .unwrap_or(0x666666);
+        let icon_color = Hsla::from(rgb(icon_color));
         v_flex()
             .id("activity-bar")
             .w(px(ui_theme::ACTIVITY_BAR_WIDTH))
@@ -58,7 +65,7 @@ impl CodeWindow {
             .child(
                 Button::new("toggle-explorer")
                     .ghost()
-                    .icon(IconName::PanelLeft)
+                    .icon(Icon::new(IconName::PanelLeft).text_color(icon_color))
                     .selected(appearance.show_explorer())
                     .when(appearance.show_explorer(), |button| {
                         button.bg(selected_bg)
@@ -70,7 +77,7 @@ impl CodeWindow {
             .child(
                 Button::new("toggle-outline")
                     .ghost()
-                    .icon(IconName::FileText)
+                    .icon(Icon::new(IconName::FileText).text_color(icon_color))
                     .selected(appearance.show_outline())
                     .when(appearance.show_outline(), |button| {
                         button.bg(selected_bg)
@@ -82,7 +89,7 @@ impl CodeWindow {
             .child(
                 Button::new("toggle-ai-panel")
                     .ghost()
-                    .icon(IconName::Bot)
+                    .icon(Icon::new(IconName::Bot).text_color(icon_color))
                     .tooltip("AI 编程")
                     .selected(appearance.show_ai())
                     .when(appearance.show_ai(), |button| button.bg(selected_bg))
@@ -93,7 +100,7 @@ impl CodeWindow {
             .child(
                 Button::new("toggle-search-panel")
                     .ghost()
-                    .icon(IconName::Search)
+                    .icon(Icon::new(IconName::Search).text_color(icon_color))
                     .selected(appearance.show_search())
                     .when(appearance.show_search(), |button| {
                         button.bg(selected_bg)
@@ -106,7 +113,7 @@ impl CodeWindow {
             .child(
                 Button::new("settings")
                     .ghost()
-                    .icon(IconName::Settings)
+                    .icon(Icon::new(IconName::Settings).text_color(icon_color))
                     .on_click(cx.listener(|_, _, _, cx| crate::settings::open_settings_window(cx))),
             )
             .into_any_element()

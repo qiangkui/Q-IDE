@@ -3,12 +3,11 @@
 //! 脚本里的 `Declare Function Foo Lib "user32" (...) As Long` 会在运行时通过
 //! `LoadLibraryW` + `GetProcAddress` 解析，再用与参数个数匹配的函数指针发起调用。
 //!
-//! 说明：Win64 下整数/指针参数都走通用寄存器，参数个数对上即可正确传递，
-//! 因此不需要 libffi。参数可以**全部用整数**（含指针）或**全部用 `Double`**（走 XMM 寄存器），
-//! 混用会给出明确错误；`Single`/`Double` 返回值从 XMM0 读取。
+//! 说明：Win64 下通过小型调用桩按参数位置装载通用寄存器、XMM 寄存器与栈参数，
+//! 支持最多 64 个整数、`Single`、`Double` 标量任意组合。
 //!
-//! `ByRef p As POINT` 这类结构体参数会按字段声明类型打包成字节缓冲（自然对齐），
-//! 调用结束后再回读；结构体字段暂不支持 `String` / 数组，`ByVal` 结构体也不支持。
+//! `ByRef` / `ByVal` UDT 按字段类型与自然对齐打包，支持嵌套记录、定长字符串与定长数组；
+//! 变长字符串字段不支持。
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -19,7 +18,7 @@ use std::ffi::c_void;
 
 use crate::interpreter::ast::{Declare, TypeDef};
 use crate::interpreter::runtime::Slot;
-use crate::interpreter::value::{VbRecord, VbType, Value, pad_fixed};
+use crate::interpreter::value::{Value, VbRecord, VbType, pad_fixed};
 
 /// 本地时间（`GetLocalTime` 的结果）。
 pub struct LocalTime {
@@ -103,8 +102,11 @@ enum Prepared {
     /// `ByRef p As POINT`：打包好的结构体字节缓冲。
     Struct(Vec<u8>),
     /// `ByVal p As POINT`：按 x64 ABI 传寄存器（≤ 8 字节）或临时副本指针。
-    ByValueStruct { buffer: Vec<u8>, size: usize },
-    /// `Double` 参数（走 XMM 寄存器）。
+    ByValueStruct {
+        buffer: Vec<u8>,
+        size: usize,
+    },
+    /// `Double` / `Date` 参数（走 XMM 寄存器）。
     Float(f64),
     /// `Single` 参数（走 XMM 寄存器的低 32 位）。
     Single(f32),
@@ -165,8 +167,12 @@ pub fn call(
             args.len()
         ));
     }
-    if decl.params.len() > 14 {
-        return Err(format!("`{}` 的参数超过 14 个，暂不支持", decl.symbol));
+    if decl.params.len() > crate::interpreter::trampoline::MAX_ABI_ARGS {
+        return Err(format!(
+            "`{}` 的参数超过 {} 个，暂不支持",
+            decl.symbol,
+            crate::interpreter::trampoline::MAX_ABI_ARGS
+        ));
     }
 
     let mut prepared = Vec::with_capacity(decl.params.len());
@@ -215,12 +221,15 @@ pub fn call(
             match args.get(index) {
                 Some(Arg::ByRef(slot)) if param.by_ref => match param.ty {
                     VbType::Str => Prepared::OutText(vec![0u16; OUT_TEXT_CAPACITY]),
-                    VbType::Double => {
+                    VbType::Double | VbType::Date => {
                         Prepared::OutNumber(Box::new(slot.value().as_float()?.to_bits()))
                     }
                     VbType::Single => Prepared::OutNumber(Box::new(
                         (slot.value().as_float()? as f32).to_bits() as u64,
                     )),
+                    VbType::Currency => {
+                        Prepared::OutNumber(Box::new(slot.value().as_currency()? as u64))
+                    }
                     _ => Prepared::OutNumber(Box::new(slot.value().as_int()? as u64)),
                 },
                 Some(Arg::ByRef(slot)) => prepare_by_value(&slot.value(), param.ty)?,
@@ -237,7 +246,7 @@ pub fn call(
         prepared.push(prepared_arg);
     }
 
-    // 参数分四类：全整数、全 `Double`、全 `Single`、整数与 `Double` 混合。
+    // 小规模调用仍用静态签名；扩展组合由动态调用桩处理。
     let float_count = prepared
         .iter()
         .filter(|item| matches!(item, Prepared::Float(_)))
@@ -246,26 +255,38 @@ pub fn call(
         .iter()
         .filter(|item| matches!(item, Prepared::Single(_)))
         .count();
-    let raw = if float_count == 0 && single_count == 0 {
-        if matches!(decl.ret, VbType::Single | VbType::Double) && prepared.len() > 4 {
-            return Err(format!(
-                "`{}` 的浮点返回值目前只支持最多 4 个参数",
-                decl.symbol
-            ));
+    let use_dynamic = prepared.len() > 4 || (single_count > 0 && single_count != prepared.len());
+    let raw = if use_dynamic {
+        let mut call_args = Vec::with_capacity(prepared.len());
+        for item in prepared.iter_mut() {
+            call_args.push(match item {
+                Prepared::Float(value) => crate::interpreter::trampoline::InvokeArg::Double(*value),
+                Prepared::Single(value) => {
+                    crate::interpreter::trampoline::InvokeArg::Single(*value)
+                }
+                other => {
+                    crate::interpreter::trampoline::InvokeArg::Integer(other.register_value()?)
+                }
+            });
         }
+        match crate::interpreter::trampoline::invoke(address, &call_args, decl.ret)? {
+            crate::interpreter::trampoline::InvokeResult::Integer(value) => Raw::Int(value),
+            crate::interpreter::trampoline::InvokeResult::Single(value) => Raw::F32(value),
+            crate::interpreter::trampoline::InvokeResult::Double(value) => Raw::F64(value),
+        }
+    } else if float_count == 0 && single_count == 0 {
         let mut raw_args = Vec::with_capacity(prepared.len());
         for item in prepared.iter_mut() {
             raw_args.push(item.register_value()?);
         }
         match decl.ret {
             VbType::Single => Raw::F32(unsafe { invoke_f32_return(address, &raw_args) }),
-            VbType::Double => Raw::F64(unsafe { invoke_f64_return(address, &raw_args) }),
+            VbType::Double | VbType::Date => {
+                Raw::F64(unsafe { invoke_f64_return(address, &raw_args) })
+            }
             _ => Raw::Int(unsafe { invoke(address, &raw_args) }),
         }
     } else if single_count == prepared.len() {
-        if prepared.len() > 4 {
-            return Err(format!("`{}` 的 `Single` 参数目前只支持最多 4 个", decl.symbol));
-        }
         let values: Vec<f32> = prepared
             .iter()
             .map(|item| match item {
@@ -274,23 +295,13 @@ pub fn call(
             })
             .collect::<Result<_, _>>()?;
         match decl.ret {
-            VbType::Single => Raw::F32(unsafe {
-                invoke_single_args_f32_return(address, &values)
-            }),
-            VbType::Double => Raw::F64(unsafe {
-                invoke_single_args_f64_return(address, &values)
-            }),
+            VbType::Single => Raw::F32(unsafe { invoke_single_args_f32_return(address, &values) }),
+            VbType::Double | VbType::Date => {
+                Raw::F64(unsafe { invoke_single_args_f64_return(address, &values) })
+            }
             _ => Raw::Int(unsafe { invoke_single_args_int_return(address, &values) }),
         }
-    } else if single_count > 0 && float_count > 0 {
-        return Err(format!(
-            "`{}` 的 `Single` 与 `Double` 参数不能混用",
-            decl.symbol
-        ));
     } else if float_count == prepared.len() {
-        if float_count > 4 {
-            return Err(format!("`{}` 的浮点参数目前只支持最多 4 个", decl.symbol));
-        }
         let float_args: Vec<f64> = prepared
             .iter()
             .map(|item| match item {
@@ -299,8 +310,10 @@ pub fn call(
             })
             .collect::<Result<_, _>>()?;
         match decl.ret {
-            VbType::Single => Raw::F32(unsafe { invoke_float_args_f32_return(address, &float_args) }),
-            VbType::Double => {
+            VbType::Single => {
+                Raw::F32(unsafe { invoke_float_args_f32_return(address, &float_args) })
+            }
+            VbType::Double | VbType::Date => {
                 Raw::F64(unsafe { invoke_float_args_f64_return(address, &float_args) })
             }
             _ => Raw::Int(unsafe { invoke_float_args_int_return(address, &float_args) }),
@@ -348,7 +361,9 @@ pub fn call(
                     VbType::Integer => Value::Int(raw as u16 as i16 as i64),
                     VbType::Long => Value::Int((raw as u32 as i32) as i64),
                     VbType::Double => Value::Float(f64::from_bits(raw)),
+                    VbType::Date => Value::Date(f64::from_bits(raw)),
                     VbType::Single => Value::Float(f32::from_bits(raw as u32) as f64),
+                    VbType::Currency => Value::Currency(raw as i64),
                     _ => Value::Int(raw as i64),
                 };
                 slot.set(value)?;
@@ -365,7 +380,11 @@ pub fn call(
     }
     match raw {
         Raw::F32(value) => Ok(Value::Float(value as f64)),
-        Raw::F64(value) => Ok(Value::Float(value)),
+        Raw::F64(value) => Ok(if decl.ret == VbType::Date {
+            Value::Date(value)
+        } else {
+            Value::Float(value)
+        }),
         Raw::Int(bits) => convert_return(decl.ret, bits),
     }
 }
@@ -378,7 +397,8 @@ fn prepare_by_value(value: &Value, ty: VbType) -> Result<Prepared, String> {
             Prepared::Text(buffer)
         }
         VbType::Single => Prepared::Single(value.as_float()? as f32),
-        VbType::Double => Prepared::Float(value.as_float()?),
+        VbType::Double | VbType::Date => Prepared::Float(value.as_float()?),
+        VbType::Currency => Prepared::Immediate(value.as_currency()? as usize),
         _ => Prepared::Immediate(value.as_int()? as usize),
     };
     Ok(prepared)
@@ -392,8 +412,11 @@ fn convert_return(ret: VbType, raw: usize) -> Result<Value, String> {
         VbType::Integer => Value::Int(raw as u16 as i16 as i64),
         VbType::Long => Value::Int((raw as u32 as i32) as i64),
         VbType::LongLong | VbType::LongPtr | VbType::Object | VbType::Any => Value::Int(raw as i64),
+        VbType::Currency => Value::Currency(raw as i64),
         VbType::Str => Value::Str(unsafe { read_utf16_ptr(raw as *const u16) }),
-        VbType::Single | VbType::Double => return Err("Win32 调用暂不支持浮点返回值".into()),
+        VbType::Single => Value::Float(f32::from_bits(raw as u32) as f64),
+        VbType::Double => Value::Float(f64::from_bits(raw as u64)),
+        VbType::Date => Value::Date(f64::from_bits(raw as u64)),
     })
 }
 
@@ -416,6 +439,11 @@ enum FieldKind {
     /// 定长标量数组字段。
     Scalars {
         ty: VbType,
+        lower: i32,
+        count: usize,
+    },
+    Records {
+        layout: Box<StructLayout>,
         lower: i32,
         count: usize,
     },
@@ -450,11 +478,13 @@ pub fn binary_width(ty: VbType) -> Result<usize, String> {
         | VbType::Long
         | VbType::Single
         | VbType::Double
+        | VbType::Date
+        | VbType::Currency
         | VbType::LongLong
         | VbType::LongPtr => Ok(scalar_size(ty)),
         VbType::Str => Err("不支持 `String`（请改用 `Print #` / `Line Input #`）".into()),
         VbType::Variant | VbType::Object | VbType::Any => Err(format!(
-            "不支持类型 {}（请声明为 Byte/Integer/Long/Single/Double/Boolean）",
+            "不支持类型 {}（请声明为 Byte/Integer/Long/Single/Double/Date/Currency/Boolean）",
             ty.name()
         )),
     }
@@ -505,7 +535,7 @@ fn scalar_layout(ty: VbType) -> Result<(usize, usize), String> {
         VbType::Byte => 1,
         VbType::Integer => 2,
         VbType::Boolean | VbType::Long | VbType::Single => 4,
-        VbType::Double | VbType::LongLong | VbType::LongPtr => 8,
+        VbType::Double | VbType::Date | VbType::Currency | VbType::LongLong | VbType::LongPtr => 8,
         VbType::Str => return Err("结构体字段暂不支持 `String`".into()),
         VbType::Variant | VbType::Object | VbType::Any => {
             return Err(format!("结构体字段不支持类型 {}", ty.name()));
@@ -530,9 +560,6 @@ fn struct_layout(
     let mut align = 1usize;
     for field in &def.fields {
         let (kind, size, field_align) = if let Some((lower, upper)) = field.array_bounds {
-            if field.record.is_some() {
-                return Err(format!("结构体字段 `{}` 暂不支持 UDT 数组", field.name));
-            }
             let count = (upper - lower + 1).max(0) as usize;
             if count > MAX_STRUCT_ARRAY {
                 return Err(format!(
@@ -542,16 +569,37 @@ fn struct_layout(
             }
             let lower = i32::try_from(lower)
                 .map_err(|_| format!("结构体字段 `{}` 的下界超出范围", field.name))?;
-            let (elem_size, elem_align) = scalar_layout(field.ty)?;
-            (
-                FieldKind::Scalars {
-                    ty: field.ty,
-                    lower,
-                    count,
-                },
-                elem_size * count,
-                elem_align,
-            )
+            match &field.record {
+                Some(record_name) => {
+                    let nested = struct_layout(record_name, types, depth + 1)?;
+                    let size = nested
+                        .size
+                        .checked_mul(count)
+                        .ok_or_else(|| format!("结构体字段 `{}` 的数组过大", field.name))?;
+                    let elem_align = nested.align;
+                    (
+                        FieldKind::Records {
+                            layout: Box::new(nested),
+                            lower,
+                            count,
+                        },
+                        size,
+                        elem_align,
+                    )
+                }
+                None => {
+                    let (elem_size, elem_align) = scalar_layout(field.ty)?;
+                    (
+                        FieldKind::Scalars {
+                            ty: field.ty,
+                            lower,
+                            count,
+                        },
+                        elem_size * count,
+                        elem_align,
+                    )
+                }
+            }
         } else if let Some(len) = field.fixed_len {
             (FieldKind::FixedStr(len), len * 2, 2)
         } else {
@@ -600,6 +648,29 @@ fn write_record(buffer: &mut [u8], layout: &StructLayout, record: &VbRecord) -> 
                     write_scalar(buffer, offset + index * scalar_size(*ty), *ty, &element)?;
                 }
             }
+            FieldKind::Records {
+                layout: nested,
+                lower,
+                count,
+            } => {
+                let value = field.value();
+                let array = value
+                    .as_array()
+                    .map_err(|_| format!("字段 `{}` 需要记录数组", field.name))?;
+                let array = array.borrow();
+                for index in 0..*count {
+                    let key = lower.saturating_add(index as i32);
+                    let element = array
+                        .get(&[key])?
+                        .as_record()
+                        .map_err(|_| format!("字段 `{}` 需要记录数组", field.name))?;
+                    write_record(
+                        &mut buffer[offset + index * nested.size..],
+                        nested,
+                        &element.borrow(),
+                    )?;
+                }
+            }
             FieldKind::Nested(nested) => {
                 let value = field.value();
                 let nested_record = value
@@ -612,12 +683,7 @@ fn write_record(buffer: &mut [u8], layout: &StructLayout, record: &VbRecord) -> 
     Ok(())
 }
 
-fn write_scalar(
-    buffer: &mut [u8],
-    offset: usize,
-    ty: VbType,
-    value: &Value,
-) -> Result<(), String> {
+fn write_scalar(buffer: &mut [u8], offset: usize, ty: VbType, value: &Value) -> Result<(), String> {
     let size = scalar_size(ty);
     let target = buffer
         .get_mut(offset..offset + size)
@@ -632,6 +698,8 @@ fn write_scalar(
         VbType::Long => target.copy_from_slice(&(value.as_int()? as i32).to_le_bytes()),
         VbType::Single => target.copy_from_slice(&(value.as_float()? as f32).to_le_bytes()),
         VbType::Double => target.copy_from_slice(&value.as_float()?.to_le_bytes()),
+        VbType::Date => target.copy_from_slice(&value.as_float()?.to_le_bytes()),
+        VbType::Currency => target.copy_from_slice(&value.as_currency()?.to_le_bytes()),
         VbType::LongLong | VbType::LongPtr => {
             target.copy_from_slice(&value.as_int()?.to_le_bytes())
         }
@@ -673,6 +741,28 @@ fn read_into_record(
                     let key = lower.saturating_add(index as i32);
                     let value = read_scalar(buffer, offset + index * scalar_size(*ty), *ty)?;
                     array.borrow_mut().set(&[key], value)?;
+                }
+            }
+            FieldKind::Records {
+                layout: nested,
+                lower,
+                count,
+            } => {
+                let field_value = record
+                    .borrow()
+                    .get(&name)
+                    .ok_or_else(|| format!("结构体缺少字段 `{name}`"))?;
+                let array = field_value
+                    .as_array()
+                    .map_err(|_| format!("字段 `{name}` 需要记录数组"))?;
+                for index in 0..*count {
+                    let key = lower.saturating_add(index as i32);
+                    let value = array
+                        .borrow()
+                        .get(&[key])?
+                        .as_record()
+                        .map_err(|_| format!("字段 `{name}` 需要记录数组"))?;
+                    read_into_record(&buffer[offset + index * nested.size..], nested, &value)?;
                 }
             }
             FieldKind::Nested(nested) => {
@@ -738,20 +828,27 @@ fn read_scalar(buffer: &[u8], offset: usize, ty: VbType) -> Result<Value, String
     };
     Ok(match ty {
         VbType::Byte => Value::Int(bytes[0] as i64),
-        VbType::Integer => Value::Int(i16::from_le_bytes(array(2)?[..2].try_into().unwrap()) as i64),
+        VbType::Integer => {
+            Value::Int(i16::from_le_bytes(array(2)?[..2].try_into().unwrap()) as i64)
+        }
         VbType::Boolean => Value::Bool(i32::from_le_bytes(array(4)?[..4].try_into().unwrap()) != 0),
         VbType::Long => Value::Int(i32::from_le_bytes(array(4)?[..4].try_into().unwrap()) as i64),
         VbType::Single => {
             Value::Float(f32::from_le_bytes(array(4)?[..4].try_into().unwrap()) as f64)
         }
         VbType::Double => Value::Float(f64::from_le_bytes(array(8)?)),
+        VbType::Date => Value::Date(f64::from_le_bytes(array(8)?)),
+        VbType::Currency => Value::Currency(i64::from_le_bytes(array(8)?)),
         VbType::LongLong | VbType::LongPtr => Value::Int(i64::from_le_bytes(array(8)?)),
         _ => return Err(format!("结构体字段不支持类型 {}", ty.name())),
     })
 }
 
 fn read_utf16(buffer: &[u16]) -> String {
-    let end = buffer.iter().position(|unit| *unit == 0).unwrap_or(buffer.len());
+    let end = buffer
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(buffer.len());
     String::from_utf16_lossy(&buffer[..end])
 }
 
@@ -786,13 +883,89 @@ unsafe fn invoke(address: usize, args: &[usize]) -> usize {
     type F5 = unsafe extern "system" fn(usize, usize, usize, usize, usize) -> usize;
     type F6 = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize) -> usize;
     type F7 = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize) -> usize;
-    type F8 = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
-    type F9 = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
-    type F10 = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
-    type F11 = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
-    type F12 = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
-    type F13 = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
-    type F14 = unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
+    type F8 =
+        unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize) -> usize;
+    type F9 = unsafe extern "system" fn(
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+    ) -> usize;
+    type F10 = unsafe extern "system" fn(
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+    ) -> usize;
+    type F11 = unsafe extern "system" fn(
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+    ) -> usize;
+    type F12 = unsafe extern "system" fn(
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+    ) -> usize;
+    type F13 = unsafe extern "system" fn(
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+    ) -> usize;
+    type F14 = unsafe extern "system" fn(
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+    ) -> usize;
 
     match args.len() {
         0 => {
@@ -825,7 +998,11 @@ unsafe fn invoke(address: usize, args: &[usize]) -> usize {
         }
         7 => {
             let function: F7 = unsafe { std::mem::transmute(address) };
-            unsafe { function(args[0], args[1], args[2], args[3], args[4], args[5], args[6]) }
+            unsafe {
+                function(
+                    args[0], args[1], args[2], args[3], args[4], args[5], args[6],
+                )
+            }
         }
         8 => {
             let function: F8 = unsafe { std::mem::transmute(address) };
@@ -839,8 +1016,7 @@ unsafe fn invoke(address: usize, args: &[usize]) -> usize {
             let function: F9 = unsafe { std::mem::transmute(address) };
             unsafe {
                 function(
-                    args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
-                    args[8],
+                    args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8],
                 )
             }
         }
@@ -1224,7 +1400,7 @@ macro_rules! mixed_dispatch {
 /// 整数与 `Double` 混合参数：按返回类型挑签名。
 fn dispatch_mixed(address: usize, args: &[MixedArg], ret: VbType) -> Result<Raw, String> {
     Ok(match ret {
-        VbType::Double => Raw::F64(mixed_dispatch!(f64, address, args)),
+        VbType::Double | VbType::Date => Raw::F64(mixed_dispatch!(f64, address, args)),
         VbType::Single => Raw::F32(mixed_dispatch!(f32, address, args)),
         _ => Raw::Int(mixed_dispatch!(usize, address, args)),
     })
@@ -1308,7 +1484,8 @@ mod platform {
         pub fn EnumWindows(procedure: Option<EnumProc>, data: isize) -> i32;
         pub fn GetWindowThreadProcessId(window: *mut c_void, process: *mut u32) -> u32;
         pub fn GetClassNameW(window: *mut c_void, name: *mut u16, max: i32) -> i32;
-        pub fn PostMessageW(window: *mut c_void, message: u32, wparam: usize, lparam: isize) -> i32;
+        pub fn PostMessageW(window: *mut c_void, message: u32, wparam: usize, lparam: isize)
+        -> i32;
     }
 
     pub type EnumProc = unsafe extern "system" fn(*mut c_void, isize) -> i32;

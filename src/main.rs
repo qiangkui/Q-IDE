@@ -43,6 +43,7 @@ mod panel_drag;
 mod search;
 mod secret_store;
 mod settings;
+mod startup;
 mod status_bar;
 mod syntax;
 mod theme;
@@ -120,6 +121,9 @@ mod brackets_tests;
 mod shortcut_tests;
 
 #[cfg(test)]
+mod startup_tests;
+
+#[cfg(test)]
 mod secret_store_tests;
 
 #[cfg(test)]
@@ -131,12 +135,33 @@ mod include_tests;
 use gpui_kit::*;
 
 fn main() {
+    // 命令行：`--help` / `--version` 直接输出后退出，其余参数是待打开的文件或文件夹。
+    // 文件的“打开方式”指到 first.exe 时，Windows 就是这样把路径传进来的。
+    let startup_paths = match startup::parse(std::env::args().skip(1)) {
+        startup::Command::Open(paths) => paths,
+        startup::Command::Help => {
+            startup::report(startup::USAGE, startup::Level::Info);
+            return;
+        }
+        startup::Command::Version => {
+            startup::report(&startup::version(), startup::Level::Info);
+            return;
+        }
+        startup::Command::Invalid(message) => {
+            startup::report(
+                &format!("{message}\n\n{}", startup::USAGE),
+                startup::Level::Warning,
+            );
+            std::process::exit(2);
+        }
+    };
+
     // 程序目录下的 ai-rules/：缺失的默认规则补齐，已有的用户修改不动。
     ai::rules::ensure_defaults();
 
     gpui_kit::application()
         .with_assets(assets::Assets)
-        .run(|cx| {
+        .run(move |cx| {
             // Must be called before using any GPUI Kit / Component features.
             gpui_kit::init(cx);
             app::init(cx);
@@ -184,7 +209,13 @@ fn main() {
             gpui_kit::open_window(options, cx, |window, cx| {
                 let background = theme::Palette::for_theme(cx).window_bg;
                 window_frame::setup(window, background);
-                cx.new(|cx| app::CodeWindow::new(window, cx))
+                let view = cx.new(|cx| app::CodeWindow::new(window, cx));
+                if !startup_paths.is_empty() {
+                    view.update(cx, |this, cx| {
+                        this.open_startup_paths(&startup_paths, window, cx)
+                    });
+                }
+                view
             })
             .expect("Failed to open window");
         });

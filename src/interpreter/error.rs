@@ -46,10 +46,19 @@ impl RuntimeError {
         }
     }
 
-    /// 把 `Value::coerce` 的错误转成运行时错误；整数溢出用 VB 的错误号 6。
+    /// 把值转换类错误转成运行时错误，并按 VB 约定补上错误号：
+    /// 溢出 6、类型不匹配 13、无效使用 `Null` 94，其余为 5。
     pub fn from_coerce(message: impl Into<String>, line: usize) -> Self {
         let message = message.into();
-        let number = if message.contains("溢出") { 6 } else { 5 };
+        let number = if message.contains("溢出") {
+            6
+        } else if message.contains("类型不匹配") {
+            13
+        } else if message.contains("Null 不能") || message.contains("无效使用 Null") {
+            94
+        } else {
+            5
+        };
         Self::new(message, line).with_number(number)
     }
 

@@ -20,6 +20,8 @@ pub struct Ctx<'a> {
     pub dir: &'a mut Option<DirState>,
     /// `Option Compare Text`：`StrComp`/`Filter` 不给比较方式时按它决定。
     pub compare_text: bool,
+    /// 是否允许弹窗；headless 宿主为 `false`，`MsgBox`/`InputBox` 直接返回默认值。
+    pub allow_ui: bool,
     /// 脚本运行时的命令行参数（`Command()`）。
     pub command: &'a str,
     /// 脚本视角的当前目录；相对路径按它解析，`ChDir` 修改它。
@@ -57,6 +59,8 @@ impl DirState {
 }
 
 const BUILTINS: &[&str] = &[
+    "createobject",
+    "getobject",
     "msgbox",
     "inputbox",
     "shell",
@@ -82,6 +86,8 @@ const BUILTINS: &[&str] = &[
     "clng",
     "cdbl",
     "csng",
+    "ccur",
+    "cdate",
     "cbool",
     "abs",
     "int",
@@ -230,27 +236,29 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
     };
 
     Ok(match name {
-        "msgbox" => {
-            match args.first().map(Value::to_display) {
-                None => Value::Empty,
-                Some(prompt) => {
-                    let buttons = args.get(1).map(Value::as_int).transpose()?.unwrap_or(0);
-                    let title = args
-                        .get(2)
-                        .map(Value::to_display)
-                        .unwrap_or_else(|| "脚本".into());
-                    let result = crate::interpreter::dialog::message_box(
-                        &prompt,
-                        &title,
-                        buttons,
-                        ctx.interrupt,
-                    )?;
-                    Value::Int(result)
-                }
+        "msgbox" => match args.first().map(Value::to_display) {
+            None => Value::Empty,
+            // 无人值守：不弹窗，按「点了确定」返回 `vbOK`。
+            Some(_) if !ctx.allow_ui => Value::Int(0),
+            Some(prompt) => {
+                let buttons = args.get(1).map(Value::as_int).transpose()?.unwrap_or(0);
+                let title = args
+                    .get(2)
+                    .map(Value::to_display)
+                    .unwrap_or_else(|| "脚本".into());
+                let result = crate::interpreter::dialog::message_box(
+                    &prompt,
+                    &title,
+                    buttons,
+                    ctx.interrupt,
+                )?;
+                Value::Int(result)
             }
-        }
+        },
         "inputbox" => match args.first().map(Value::to_display) {
             None => Value::Empty,
+            // 无人值守：不弹窗，直接返回空串（相当于用户点了取消）。
+            Some(_) if !ctx.allow_ui => Value::Str(String::new()),
             Some(prompt) => {
                 let title = args
                     .get(1)
@@ -317,10 +325,19 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
                 _ => (number(0)?.max(1) as usize, text(1)?, text(2)?),
             };
             let chars: Vec<char> = haystack.chars().collect();
+            let needle: Vec<char> = needle.chars().collect();
+            // VB：子串为空时返回起点；起点越过末尾时返回 0。
+            if needle.is_empty() {
+                return Ok(Value::Int(if start > chars.len() {
+                    0
+                } else {
+                    start as i64
+                }));
+            }
             let begin = (start - 1).min(chars.len());
             let found = chars[begin..]
-                .windows(needle.chars().count().max(1))
-                .position(|window| window.iter().copied().eq(needle.chars()));
+                .windows(needle.len())
+                .position(|window| window == needle.as_slice());
             Value::Int(found.map(|index| (begin + index + 1) as i64).unwrap_or(0))
         }
         "instrrev" => {
@@ -340,22 +357,75 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
         }
         "asc" => Value::Int(text(0)?.chars().next().map(|c| c as i64).unwrap_or(0)),
         "val" => Value::Float(leading_number(&text(0)?).unwrap_or(0.0)),
-        "str" => Value::Str(text(0)?),
+        "str" => match args.first() {
+            None => Value::Str(String::new()),
+            // `Str(Null)` 在 VB 里传播 `Null`。
+            Some(Value::Null) => Value::Null,
+            Some(value) => Value::Str(str_value(value)),
+        },
         "cstr" => Value::Str(text(0)?),
-        "cint" => Value::Int(round_half_even(text(0)?.parse::<f64>().unwrap_or_else(|_| {
-            args.first().and_then(|value| value.as_int().ok()).unwrap_or(0) as f64
-        })) as i64),
-        "clng" => Value::Int(args.first().map(|v| v.as_int()).transpose()?.unwrap_or(0)),
-        "cdbl" | "csng" => Value::Float(args.first().map(|v| v.as_float()).transpose()?.unwrap_or(0.0)),
-        "cbool" => Value::Bool(args.first().map(|v| v.to_bool()).transpose()?.unwrap_or(false)),
+        "cint" => Value::Int(convert_integer(args.first(), i16::MIN.into(), i16::MAX.into(), ctx)?),
+        "clng" => Value::Int(convert_integer(args.first(), i32::MIN.into(), i32::MAX.into(), ctx)?),
+        "cdbl" | "csng" => Value::Float(
+            args.first()
+                .map(|v| v.as_float())
+                .transpose()?
+                .unwrap_or(0.0),
+        ),
+        "ccur" => {
+            let value = args
+                .first()
+                .map(Value::as_currency)
+                .unwrap_or(Ok(0))
+                .map_err(|message| {
+                    if message == "溢出" {
+                        ctx.failure = Some(6);
+                    }
+                    message
+                })?;
+            Value::Currency(value)
+        }
+        "cdate" => {
+            let value = args.first().cloned().unwrap_or(Value::Empty);
+            value.coerce(crate::interpreter::value::VbType::Date)?
+        }
+        "cbool" => Value::Bool(
+            args.first()
+                .map(|v| v.to_bool())
+                .transpose()?
+                .unwrap_or(false),
+        ),
         "abs" => match args.first() {
             Some(Value::Float(value)) => Value::Float(value.abs()),
+            Some(Value::Currency(value)) => {
+                let Some(value) = value.checked_abs() else {
+                    ctx.failure = Some(6);
+                    return Err("溢出".into());
+                };
+                Value::Currency(value)
+            }
             _ => Value::Int(number(0)?.abs()),
         },
-        "int" => Value::Int(args.first().map(|v| v.as_float()).transpose()?.unwrap_or(0.0).floor() as i64),
-        "fix" => Value::Int(args.first().map(|v| v.as_float()).transpose()?.unwrap_or(0.0).trunc() as i64),
+        "int" => Value::Int(
+            args.first()
+                .map(|v| v.as_float())
+                .transpose()?
+                .unwrap_or(0.0)
+                .floor() as i64,
+        ),
+        "fix" => Value::Int(
+            args.first()
+                .map(|v| v.as_float())
+                .transpose()?
+                .unwrap_or(0.0)
+                .trunc() as i64,
+        ),
         "sgn" => {
-            let value = args.first().map(|v| v.as_float()).transpose()?.unwrap_or(0.0);
+            let value = args
+                .first()
+                .map(|v| v.as_float())
+                .transpose()?
+                .unwrap_or(0.0);
             Value::Int(if value > 0.0 {
                 1
             } else if value < 0.0 {
@@ -364,12 +434,39 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
                 0
             })
         }
-        "sqr" => Value::Float(args.first().map(|v| v.as_float()).transpose()?.unwrap_or(0.0).sqrt()),
-        "exp" => Value::Float(args.first().map(|v| v.as_float()).transpose()?.unwrap_or(0.0).exp()),
-        "log" => Value::Float(args.first().map(|v| v.as_float()).transpose()?.unwrap_or(0.0).ln()),
+        "sqr" => Value::Float(
+            args.first()
+                .map(|v| v.as_float())
+                .transpose()?
+                .unwrap_or(0.0)
+                .sqrt(),
+        ),
+        "exp" => Value::Float(
+            args.first()
+                .map(|v| v.as_float())
+                .transpose()?
+                .unwrap_or(0.0)
+                .exp(),
+        ),
+        "log" => Value::Float(
+            args.first()
+                .map(|v| v.as_float())
+                .transpose()?
+                .unwrap_or(0.0)
+                .ln(),
+        ),
         "round" => {
-            let value = args.first().map(|v| v.as_float()).transpose()?.unwrap_or(0.0);
-            let digits = args.get(1).map(Value::as_int).transpose()?.unwrap_or(0).max(0) as i32;
+            let value = args
+                .first()
+                .map(|v| v.as_float())
+                .transpose()?
+                .unwrap_or(0.0);
+            let digits = args
+                .get(1)
+                .map(Value::as_int)
+                .transpose()?
+                .unwrap_or(0)
+                .max(0) as i32;
             let factor = 10f64.powi(digits);
             Value::Float(round_half_even(value * factor) / factor)
         }
@@ -383,11 +480,11 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
         }
         "hex" => Value::Str(format!("{:X}", number(0)? as u32)),
         "oct" => Value::Str(format!("{:o}", number(0)? as u32)),
-        "space" => Value::Str(" ".repeat(number(0)?.max(0) as usize)),
+        "space" => Value::Str(limited_repeat(number(0)?, ' ', ctx)?),
         "string" => {
-            let count = number(0)?.max(0) as usize;
+            let count = number(0)?;
             let ch = text(1)?.chars().next().unwrap_or(' ');
-            Value::Str(std::iter::repeat_n(ch, count).collect())
+            Value::Str(limited_repeat(count, ch, ctx)?)
         }
         "timer" => {
             let _ = ctx.started;
@@ -410,7 +507,11 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
             Value::Str(error_text(number))
         }
         "iif" => {
-            let condition = args.first().map(|v| v.to_bool()).transpose()?.unwrap_or(false);
+            let condition = args
+                .first()
+                .map(|v| v.to_bool())
+                .transpose()?
+                .unwrap_or(false);
             if condition {
                 args.get(1).cloned().unwrap_or(Value::Empty)
             } else {
@@ -424,7 +525,10 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
         }
         "split" => {
             let source = text(0)?;
-            let delimiter = args.get(1).map(Value::to_display).unwrap_or_else(|| " ".into());
+            let delimiter = args
+                .get(1)
+                .map(Value::to_display)
+                .unwrap_or_else(|| " ".into());
             let limit = match args.get(2) {
                 Some(value) => value.as_int()?.max(0) as usize,
                 None => 0,
@@ -445,10 +549,11 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
                 if array.dims().len() > 1 {
                     return Err("`Join` 只支持一维数组".into());
                 }
+                // 直接遍历元素存储单元，省掉整份数组的深拷贝。
                 array
-                    .values()
+                    .cells()
                     .iter()
-                    .map(Value::to_display)
+                    .map(|cell| cell.borrow().to_display())
                     .collect::<Vec<_>>()
                     .join(&delimiter)
             };
@@ -457,11 +562,7 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
         "array" => Value::array(args),
         "isarray" => Value::Bool(args.first().is_some_and(Value::is_array)),
         "isnumeric" => Value::Bool(args.first().is_some_and(Value::is_numeric_like)),
-        "typename" => Value::Str(
-            args.first()
-                .map(Value::type_name)
-                .unwrap_or_default(),
-        ),
+        "typename" => Value::Str(args.first().map(Value::type_name).unwrap_or_default()),
         // `StrPtr(s)`：返回以 0 结尾的 UTF-16 缓冲区地址（`LongPtr`），供 `Declare` 的指针参数使用。
         "strptr" => {
             let mut buffer: Vec<u16> = text(0)?.encode_utf16().collect();
@@ -470,7 +571,8 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
             let pointer = ctx.strings.last().expect("刚压入").as_ptr() as i64;
             Value::Int(pointer)
         }
-        "lbound" | "ubound" => {            let array = args
+        "lbound" | "ubound" => {
+            let array = args
                 .first()
                 .ok_or_else(|| format!("`{name}` 缺少第 1 个参数"))?
                 .as_array()?;
@@ -492,13 +594,13 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
                 i64::from(lower) + count as i64 - 1
             })
         }
-        "now" => Value::Float(now_serial()),
-        "date" => Value::Float(now_serial().floor()),
-        "time" => Value::Float(now_serial().fract()),
-        "dateserial" => Value::Float(serial_from_ymd(number(0)?, number(1)?, number(2)?)?),
+        "now" => Value::Date(now_serial()),
+        "date" => Value::Date(now_serial().floor()),
+        "time" => Value::Date(now_serial().fract()),
+        "dateserial" => Value::Date(serial_from_ymd(number(0)?, number(1)?, number(2)?)?),
         "timeserial" => {
             let seconds = number(0)? * 3600 + number(1)? * 60 + number(2)?;
-            Value::Float(seconds as f64 / 86_400.0)
+            Value::Date(seconds as f64 / 86_400.0)
         }
         "dateadd" => {
             let interval = text(0)?.to_ascii_lowercase();
@@ -507,7 +609,7 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
                 Some(value) => value.as_float()?,
                 None => now_serial(),
             };
-            Value::Float(date_add(&interval, amount, serial)?)
+            Value::Date(date_add(&interval, amount, serial)?)
         }
         "datediff" => {
             let interval = text(0)?.to_ascii_lowercase();
@@ -516,7 +618,11 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
             Value::Int(date_diff(&interval, first, second)?)
         }
         "year" | "month" | "day" | "hour" | "minute" | "second" => {
-            let serial = args.first().map(Value::as_float).transpose()?.unwrap_or(0.0);
+            let serial = args
+                .first()
+                .map(Value::as_float)
+                .transpose()?
+                .unwrap_or(0.0);
             let (year, month, day, hour, minute, second) = parts_from_serial(serial);
             Value::Int(match name {
                 "year" => year,
@@ -615,13 +721,21 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
         ),
         // ---------- 日期补充 ----------
         "weekday" => {
-            let serial = args.first().map(Value::as_float).transpose()?.unwrap_or_else(now_serial);
+            let serial = args
+                .first()
+                .map(Value::as_float)
+                .transpose()?
+                .unwrap_or_else(now_serial);
             let first_day = args.get(1).map(Value::as_int).transpose()?.unwrap_or(1);
             Value::Int(weekday_of(serial, first_day))
         }
         "weekdayname" => {
             let weekday = number(0)?;
-            let abbreviate = args.get(1).map(Value::to_bool).transpose()?.unwrap_or(false);
+            let abbreviate = args
+                .get(1)
+                .map(Value::to_bool)
+                .transpose()?
+                .unwrap_or(false);
             let first_day = args.get(2).map(Value::as_int).transpose()?.unwrap_or(1);
             if !(1..=7).contains(&weekday) {
                 return Err(format!("`WeekdayName` 的星期 {weekday} 超出 1..7"));
@@ -629,32 +743,44 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
             let first = if first_day == 0 { 1 } else { first_day };
             let index = ((first - 1) + (weekday - 1)).rem_euclid(7) as usize;
             let name = WEEKDAY_NAMES[index];
-            Value::Str(if abbreviate { name[..3].to_string() } else { name.to_string() })
+            Value::Str(if abbreviate {
+                name[..3].to_string()
+            } else {
+                name.to_string()
+            })
         }
         "monthname" => {
             let month = number(0)?;
-            let abbreviate = args.get(1).map(Value::to_bool).transpose()?.unwrap_or(false);
+            let abbreviate = args
+                .get(1)
+                .map(Value::to_bool)
+                .transpose()?
+                .unwrap_or(false);
             if !(1..=12).contains(&month) {
                 return Err(format!("`MonthName` 的月份 {month} 超出 1..12"));
             }
             let name = MONTH_NAMES[(month - 1) as usize];
-            Value::Str(if abbreviate { name[..3].to_string() } else { name.to_string() })
+            Value::Str(if abbreviate {
+                name[..3].to_string()
+            } else {
+                name.to_string()
+            })
         }
         "datevalue" => {
             let raw = text(0)?;
             match parse_date_text(&raw) {
-                Some(serial) => Value::Float(serial),
+                Some(serial) => Value::Date(serial),
                 None => return Err(format!("`DateValue` 无法识别日期 \"{raw}\"")),
             }
         }
         "timevalue" => match args.first() {
-            Some(Value::Float(_) | Value::Int(_)) => {
-                Value::Float(args[0].as_float()?.fract())
+            Some(Value::Float(_) | Value::Int(_) | Value::Date(_)) => {
+                Value::Date(args[0].as_float()?.fract())
             }
             _ => {
                 let raw = text(0)?;
                 match parse_time_text(&raw) {
-                    Some(serial) => Value::Float(serial),
+                    Some(serial) => Value::Date(serial),
                     None => return Err(format!("`TimeValue` 无法识别时间 \"{raw}\"")),
                 }
             }
@@ -679,6 +805,62 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
         }
         _ => return Err(format!("未实现的内置函数 `{name}`")),
     })
+}
+
+/// 单个字符串允许的最大字符数：避免 `Space(2 ^ 40)` 这类参数一次申请掉几 GB 内存。
+const MAX_STRING_CHARS: i64 = 1 << 24;
+
+/// `Space(n)` / `String(n, ch)` 的重复填充，超长时报「字符串空间不足」（错误号 14）。
+fn limited_repeat(count: i64, fill: char, ctx: &mut Ctx) -> Result<String, String> {
+    let count = count.max(0);
+    if count > MAX_STRING_CHARS {
+        ctx.failure = Some(14);
+        return Err(format!("字符串长度 {count} 超过上限（{MAX_STRING_CHARS}）"));
+    }
+    Ok(std::iter::repeat_n(fill, count as usize).collect())
+}
+
+/// `Str(number)`：正数带一个前导空格（VB 的写法），布尔值照常给 `True` / `False`。
+fn str_value(value: &Value) -> String {
+    match value {
+        Value::Int(_) | Value::Float(_) | Value::Currency(_) => {
+            let text = value.to_display();
+            if text.starts_with('-') {
+                text
+            } else {
+                format!(" {text}")
+            }
+        }
+        // `Empty` 按数值 0 处理，与 VB 的 `Str(Empty)` 一致。
+        Value::Empty => " 0".to_string(),
+        other => other.to_display(),
+    }
+}
+
+/// `CInt` / `CLng`：银行家舍入后检查目标类型范围，越界报错误号 6。
+fn convert_integer(
+    value: Option<&Value>,
+    min: i64,
+    max: i64,
+    ctx: &mut Ctx,
+) -> Result<i64, String> {
+    let Some(value) = value else {
+        return Ok(0);
+    };
+    let number = value.as_float().map_err(|message| {
+        ctx.failure = Some(13);
+        format!("类型不匹配：{message}")
+    })?;
+    if !number.is_finite() {
+        ctx.failure = Some(6);
+        return Err("溢出".into());
+    }
+    let rounded = round_half_even(number);
+    if rounded < min as f64 || rounded > max as f64 {
+        ctx.failure = Some(6);
+        return Err(format!("溢出：{number} 超出目标类型范围"));
+    }
+    Ok(rounded as i64)
 }
 
 const WEEKDAY_NAMES: [&str; 7] = [
@@ -779,7 +961,12 @@ fn expand_paths(cwd: &std::path::Path, pattern: &str) -> Vec<String> {
     };
     let mut paths: Vec<String> = reader
         .flatten()
-        .filter(|entry| entry.file_type().map(|kind| !kind.is_dir()).unwrap_or(false))
+        .filter(|entry| {
+            entry
+                .file_type()
+                .map(|kind| !kind.is_dir())
+                .unwrap_or(false)
+        })
         .map(|entry| entry.file_name().to_string_lossy().to_string())
         .filter(|name| wildcard_match(&mask, name))
         .map(|name| parent.join(name).display().to_string())
@@ -819,10 +1006,7 @@ fn dir_value(args: &[Value], ctx: &mut Ctx) -> Result<Value, String> {
         }
     }
     entries.sort();
-    let mut state = DirState {
-        entries,
-        index: 0,
-    };
+    let mut state = DirState { entries, index: 0 };
     let first = state.next_entry();
     *ctx.dir = Some(state);
     Ok(Value::Str(first))
@@ -855,7 +1039,7 @@ fn file_datetime_value(args: &[Value], ctx: &mut Ctx) -> Result<Value, String> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs_f64())
         .unwrap_or(0.0);
-    Ok(Value::Float(serial_from_unix(seconds) + local_offset_days()))
+    Ok(Value::Date(serial_from_unix(seconds) + local_offset_days()))
 }
 
 /// Unix 秒 → VB 日期序列（UTC）。
@@ -925,10 +1109,7 @@ fn filter_value(args: &[Value], compare_text: bool) -> Result<Value, String> {
         .ok_or("`Filter` 缺少第 1 个参数")?
         .as_array()
         .map_err(|message| format!("`Filter` {message}"))?;
-    let needle = args
-        .get(1)
-        .ok_or("`Filter` 缺少第 2 个参数")?
-        .to_display();
+    let needle = args.get(1).ok_or("`Filter` 缺少第 2 个参数")?.to_display();
     let include = match args.get(2) {
         Some(value) => value.to_bool()?,
         None => true,
@@ -946,13 +1127,21 @@ fn filter_value(args: &[Value], compare_text: bool) -> Result<Value, String> {
         needle
     };
     let mut kept = Vec::new();
-    for value in array.borrow().values() {
+    let array = array.borrow();
+    for cell in array.cells() {
+        let value = cell.borrow();
         let text = value.to_display();
-        let haystack = if ignore_case { text.to_lowercase() } else { text };
+        let haystack = if ignore_case {
+            text.to_lowercase()
+        } else {
+            text
+        };
         if haystack.contains(&needle) == include {
-            kept.push(value);
+            // 只复制留下的元素，避免给整份数组做一次深拷贝。
+            kept.push((*value).clone());
         }
     }
+    drop(array);
     Ok(Value::array(kept))
 }
 
@@ -985,6 +1174,25 @@ pub fn parse_date_text(text: &str) -> Option<f64> {
     serial_from_ymd(year, month, day).ok()
 }
 
+pub fn parse_date_value(text: &str) -> Option<f64> {
+    let text = text.trim();
+    if let Some(serial) = parse_date_text(text) {
+        return Some(serial);
+    }
+    if let Some(serial) = parse_time_text(text) {
+        return Some(serial);
+    }
+    for (index, ch) in text.char_indices() {
+        if ch.is_whitespace() || ch == 'T' || ch == 't' {
+            let (date, time) = text.split_at(index);
+            let date = parse_date_text(date)?;
+            let time = parse_time_text(time.trim_start_matches([' ', 'T', 't']))?;
+            return Some(date + time);
+        }
+    }
+    parse_number(text)
+}
+
 /// 识别 `12:34`、`12:34:56.5` 这类时间文本。
 fn parse_time_text(text: &str) -> Option<f64> {
     let mut parts = text.trim().split(':');
@@ -996,23 +1204,46 @@ fn parse_time_text(text: &str) -> Option<f64> {
 
 fn is_date(value: &Value) -> bool {
     match value {
-        Value::Float(_) | Value::Int(_) | Value::Bool(_) => true,
-        Value::Str(text) => parse_date_text(text).is_some() || parse_time_text(text).is_some(),
+        Value::Date(_) | Value::Float(_) | Value::Int(_) | Value::Bool(_) => true,
+        Value::Str(text) => parse_date_value(text).is_some(),
         _ => false,
     }
 }
 
 /// 取字符串开头的数字部分（`Val` 的语义）。
+///
+/// 支持前导空白、正负号，以及 VB 的 `&H`（十六进制）、`&O` / `&`（八进制）前缀；
+/// 遇到第一个不能解释的字符就停下（`Val("12abc")` 是 12）。
 fn leading_number(text: &str) -> Option<f64> {
     let trimmed = text.trim_start();
+    let (negative, body) = match trimmed.as_bytes().first() {
+        Some(b'-') => (true, &trimmed[1..]),
+        Some(b'+') => (false, &trimmed[1..]),
+        _ => (false, trimmed),
+    };
+    if let Some(rest) = body.strip_prefix('&') {
+        let (radix, digits) = match rest.as_bytes().first() {
+            Some(b'h' | b'H') => (16u32, &rest[1..]),
+            Some(b'o' | b'O') => (8, &rest[1..]),
+            _ => (8, rest),
+        };
+        let mut value = 0f64;
+        for ch in digits.chars() {
+            let Some(digit) = ch.to_digit(radix) else {
+                break;
+            };
+            value = value * f64::from(radix) + f64::from(digit);
+        }
+        // `&H` 后面没有合法数字时 VB 也返回 0。
+        return Some(if negative { -value } else { value });
+    }
     let mut end = 0usize;
     let mut seen_digit = false;
     let mut seen_dot = false;
     let mut seen_exponent = false;
-    for (index, ch) in trimmed.char_indices() {
+    for (index, ch) in body.char_indices() {
         match ch {
             '0'..='9' => seen_digit = true,
-            '+' | '-' if index == 0 => {}
             '.' if !seen_dot && !seen_exponent => seen_dot = true,
             'e' | 'E' if seen_digit && !seen_exponent => seen_exponent = true,
             _ => break,
@@ -1020,9 +1251,11 @@ fn leading_number(text: &str) -> Option<f64> {
         end = index + ch.len_utf8();
     }
     if !seen_digit {
+        // `Val("-")`、`Val("abc")` 都是 0。
         return None;
     }
-    parse_number(&trimmed[..end])
+    let value = parse_number(&body[..end])?;
+    Some(if negative { -value } else { value })
 }
 
 // ---------------------------------------------------------------- 日期时间
@@ -1267,6 +1500,15 @@ fn format_date(serial: f64, spec: &str) -> String {
     output
 }
 
+pub fn format_date_display(serial: f64) -> String {
+    let (_, _, _, hour, minute, second) = parts_from_serial(serial);
+    if hour == 0 && minute == 0 && second == 0 {
+        format_date(serial, "yyyy-mm-dd")
+    } else {
+        format_date(serial, "yyyy-mm-dd hh:nn:ss")
+    }
+}
+
 /// `Split` 的分段规则：分隔符为空或 `limit` 为 1 时整串作为唯一元素。
 fn split_parts(source: &str, delimiter: &str, limit: usize) -> Vec<Value> {
     if delimiter.is_empty() || limit == 1 {
@@ -1344,10 +1586,7 @@ fn format_section(value: f64, section: &str) -> Result<String, String> {
     }
 
     let core: String = chars[first..=last].iter().collect();
-    if let Some(bad) = core
-        .chars()
-        .find(|ch| !matches!(ch, '0' | '#' | ',' | '.'))
-    {
+    if let Some(bad) = core.chars().find(|ch| !matches!(ch, '0' | '#' | ',' | '.')) {
         return Err(format!("`Format` 不支持格式字符 `{bad}`"));
     }
 

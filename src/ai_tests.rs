@@ -307,10 +307,12 @@ fn call(name: &str, arguments: serde_json::Value) -> ToolCall {
 fn run_tool(root: &Path, files: &HashMap<PathBuf, String>, call: &ToolCall) -> ToolPlan {
     let read = |path: &Path| files.get(path).cloned();
     let output = || String::from("脚本执行结束（用时 0.01s）");
+    let debug_state = || String::from("调试会话已暂停\n第 2 行");
     let ctx = PlanCtx {
         root,
         read: &read,
         output: &output,
+        debug_state: &debug_state,
     };
     tools::plan(&ctx, call)
 }
@@ -426,6 +428,93 @@ fn tool_read_output_returns_the_panel_tail() {
             assert!(summary.contains("输出面板"));
         }
         _ => panic!("read_output 应当只读"),
+    }
+}
+
+#[test]
+fn debug_tools_return_actions_and_gate_script_execution() {
+    use crate::ai::tools::AppAction;
+
+    let (root, files) = project();
+    for (name, expected) in [
+        ("run_script", AppAction::RunScript),
+        ("start_debug", AppAction::StartDebug),
+        ("debug_continue", AppAction::ContinueDebug),
+        ("debug_step", AppAction::StepDebug),
+        ("debug_pause", AppAction::PauseDebug),
+        ("stop_execution", AppAction::StopExecution),
+    ] {
+        let ToolPlan::Action { action, .. } = run_tool(&root, &files, &call(name, json!({})))
+        else {
+            panic!("{name} 应当返回主窗口操作");
+        };
+        assert_eq!(action, expected);
+        assert_eq!(
+            action.requires_confirmation(),
+            matches!(
+                name,
+                "run_script" | "start_debug" | "debug_continue" | "debug_step"
+            )
+        );
+    }
+}
+
+#[test]
+fn debug_state_and_watch_tools_expose_inspection_operations() {
+    use crate::ai::tools::AppAction;
+
+    let (root, files) = project();
+    match run_tool(&root, &files, &call("get_debug_state", json!({}))) {
+        ToolPlan::Read { content, .. } => assert!(content.contains("调试会话已暂停")),
+        _ => panic!("get_debug_state 应当只读"),
+    }
+    match run_tool(
+        &root,
+        &files,
+        &call("add_watch", json!({"expression": " total + 1 "})),
+    ) {
+        ToolPlan::Action {
+            action: AppAction::AddWatch { expression },
+            ..
+        } => assert_eq!(expression, "total + 1"),
+        _ => panic!("add_watch 应当返回监视操作"),
+    }
+}
+
+#[test]
+fn set_breakpoint_tool_validates_arguments_and_preserves_condition() {
+    use crate::ai::tools::AppAction;
+
+    let (root, files) = project();
+    match run_tool(
+        &root,
+        &files,
+        &call(
+            "set_breakpoint",
+            json!({"line": 3, "enabled": true, "condition": "x > 1"}),
+        ),
+    ) {
+        ToolPlan::Action {
+            action:
+                AppAction::SetBreakpoint {
+                    line,
+                    enabled,
+                    condition,
+                },
+            ..
+        } => {
+            assert_eq!(line, 3);
+            assert!(enabled);
+            assert_eq!(condition.as_deref(), Some("x > 1"));
+        }
+        _ => panic!("合法断点参数应当返回操作"),
+    }
+
+    for args in [json!({"line": 0, "enabled": true}), json!({"line": 1})] {
+        match run_tool(&root, &files, &call("set_breakpoint", args)) {
+            ToolPlan::Read { content, .. } => assert!(content.starts_with("错误：")),
+            _ => panic!("无效断点参数必须返回错误"),
+        }
     }
 }
 
@@ -567,6 +656,7 @@ fn ai_rules_select_common_plus_language_file() {
     let dir = temp_rules_dir("select");
     std::fs::write(dir.join("common.md"), "COMMON").unwrap();
     std::fs::write(dir.join("vb.md"), "VB").unwrap();
+    std::fs::write(dir.join("rust.md"), "RUST").unwrap();
     std::fs::write(dir.join("default.md"), "DEFAULT").unwrap();
 
     let vb = crate::ai::rules::rules_for_language_in(Some(&dir), Some("vb"));
@@ -574,8 +664,11 @@ fn ai_rules_select_common_plus_language_file() {
     assert!(!vb.contains("DEFAULT"), "{vb}");
 
     let rust = crate::ai::rules::rules_for_language_in(Some(&dir), Some("rust"));
-    assert!(rust.contains("COMMON") && rust.contains("DEFAULT"), "{rust}");
-    assert!(!rust.contains("VB"), "{rust}");
+    assert!(rust.contains("COMMON") && rust.contains("RUST"), "{rust}");
+    assert!(!rust.contains("DEFAULT") && !rust.contains("VB"), "{rust}");
+
+    let other = crate::ai::rules::rules_for_language_in(Some(&dir), Some("python"));
+    assert!(other.contains("COMMON") && other.contains("DEFAULT"), "{other}");
 
     let none = crate::ai::rules::rules_for_language_in(Some(&dir), None);
     assert!(none.contains("COMMON") && none.contains("DEFAULT"), "{none}");
@@ -602,7 +695,10 @@ fn ai_rules_defaults_do_not_overwrite_user_edits() {
     assert!(dir.join("README.md").exists());
     assert!(dir.join("common.md").exists());
     assert!(dir.join("vb.md").exists());
+    assert!(dir.join("rust.md").exists());
     assert!(dir.join("default.md").exists());
+    let rust = std::fs::read_to_string(dir.join("rust.md")).unwrap();
+    assert!(rust.contains("cargo test"), "{rust}");
 
     std::fs::write(dir.join("vb.md"), "MY VB RULES").unwrap();
     crate::ai::rules::ensure_defaults_in(&dir).expect("再次补齐默认规则");

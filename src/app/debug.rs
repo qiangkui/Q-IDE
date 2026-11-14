@@ -55,7 +55,8 @@ impl CodeWindow {
         };
 
         let (sender, receiver) = mpsc::channel::<ScriptEvent>();
-        std::thread::spawn(move || {
+        let event_interrupt = interrupt.clone();
+        let spawned = crate::interpreter::spawn_script_thread(move || {
             let line_sender = sender.clone();
             let result = crate::interpreter::run_with(
                 &source,
@@ -68,9 +69,14 @@ impl CodeWindow {
             let failure = result.map_err(|error| ScriptFailure::from_error(&error));
             let _ = sender.send(ScriptEvent::Finished(failure));
         });
+        if let Err(error) = spawned {
+            self.script_interrupt = None;
+            output.error(cx, format!("无法启动脚本线程：{error}"));
+            return;
+        }
 
         let jump_source = self.editor.read(cx).value().to_string();
-        self.spawn_script_events(receiver, jump_source, None, cx);
+        self.spawn_script_events(receiver, jump_source, None, event_interrupt, cx);
     }
 
     /// 把脚本线程的事件搬到界面上；调试会话还会轮询暂停状态并高亮当前行。
@@ -79,6 +85,7 @@ impl CodeWindow {
         receiver: mpsc::Receiver<ScriptEvent>,
         source: String,
         debug: Option<Arc<DebugControl>>,
+        interrupt: Arc<AtomicBool>,
         cx: &mut Context<Self>,
     ) {
         let log = self.output.clone();
@@ -140,11 +147,15 @@ impl CodeWindow {
                                     (Some(finished), Some(current)) => {
                                         Arc::ptr_eq(finished, &current.control)
                                     }
-                                    (None, current) => current.is_none(),
-                                    (Some(_), None) => true,
+                                    (None, None) => this
+                                        .script_interrupt
+                                        .as_ref()
+                                        .is_some_and(|current| Arc::ptr_eq(current, &interrupt)),
+                                    _ => false,
                                 };
                                 if is_current {
                                     this.debug = None;
+                                    this.script_interrupt = None;
                                     this.watch_states =
                                         vec![WatchState::Inactive; this.watches.len()];
                                     this.show_debug_line(None, cx);
@@ -337,13 +348,14 @@ impl CodeWindow {
 
         let (sender, receiver) = mpsc::channel::<ScriptEvent>();
         let thread_interrupt = interrupt;
+        let event_interrupt = thread_interrupt.clone();
         let thread_control = control.clone();
         let options = RunOptions {
             command_line: self.script_args.clone(),
             script_path: self.active_script_path(),
             ..RunOptions::default()
         };
-        std::thread::spawn(move || {
+        let spawned = crate::interpreter::spawn_script_thread(move || {
             let line_sender = sender.clone();
             let result = crate::interpreter::run_debug(
                 &source,
@@ -357,8 +369,20 @@ impl CodeWindow {
             let failure = result.map_err(|error| ScriptFailure::from_error(&error));
             let _ = sender.send(ScriptEvent::Finished(failure));
         });
+        if let Err(error) = spawned {
+            self.script_interrupt = None;
+            self.debug = None;
+            output.error(cx, format!("无法启动调试线程：{error}"));
+            return;
+        }
 
-        self.spawn_script_events(receiver, self.editor.read(cx).value().to_string(), Some(control), cx);
+        self.spawn_script_events(
+            receiver,
+            self.editor.read(cx).value().to_string(),
+            Some(control),
+            event_interrupt,
+            cx,
+        );
     }
 
     /// 在下一行暂停（菜单「运行 → 暂停」）。

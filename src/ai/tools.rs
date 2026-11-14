@@ -1,7 +1,7 @@
-//! AI 工具层：告诉模型能做哪些事，并把一次调用算成「只读结果」或「待写入的文件」。
+//! AI 工具层：描述工具，并把模型调用解析成只读结果、写入请求或主窗口操作。
 //!
 //! 这一层不碰界面、也不直接写盘：路径解析与内容计算是纯逻辑，真正落盘由界面层
-//! （`CodeWindow`）执行，这样打开着的标签、未保存内容、编码都能一起处理好。
+//! （`CodeWindow`）执行，这样打开着的标签、未保存内容、编码与调试状态都能正确同步。
 
 use std::path::{Component, Path, PathBuf};
 
@@ -112,6 +112,65 @@ pub fn specs() -> &'static [ToolSpec] {
             description: "读取输出面板最近的内容（运行脚本的输出与报错都在这里）。",
             parameters: r#"{"type": "object", "properties": {}}"#,
         },
+        ToolSpec {
+            name: "run_script",
+            description: "运行当前编辑器中的 VB 脚本。脚本可能产生文件、对话框等副作用；通常需要用户确认。",
+            parameters: r#"{"type": "object", "properties": {}}"#,
+        },
+        ToolSpec {
+            name: "start_debug",
+            description: "以调试模式启动当前 VB 脚本，会在断点处暂停；通常需要用户确认。",
+            parameters: r#"{"type": "object", "properties": {}}"#,
+        },
+        ToolSpec {
+            name: "debug_continue",
+            description: "继续当前暂停的调试会话直到下一个断点或结束；没有会话时按程序的 F11 行为启动调试。通常需要用户确认。",
+            parameters: r#"{"type": "object", "properties": {}}"#,
+        },
+        ToolSpec {
+            name: "debug_step",
+            description: "在当前调试会话中单步执行一条语句；没有会话时按程序的 F10 行为启动并暂停。通常需要用户确认。",
+            parameters: r#"{"type": "object", "properties": {}}"#,
+        },
+        ToolSpec {
+            name: "debug_pause",
+            description: "请求当前脚本在下一条语句处暂停。",
+            parameters: r#"{"type": "object", "properties": {}}"#,
+        },
+        ToolSpec {
+            name: "stop_execution",
+            description: "停止当前脚本或调试会话。",
+            parameters: r#"{"type": "object", "properties": {}}"#,
+        },
+        ToolSpec {
+            name: "get_debug_state",
+            description: "读取当前脚本运行状态、暂停行、调用栈、可见变量及值、断点和监视表达式。",
+            parameters: r#"{"type": "object", "properties": {}}"#,
+        },
+        ToolSpec {
+            name: "set_breakpoint",
+            description: "为当前编辑器中的 VB 脚本设置或移除断点。可选 condition 为条件表达式。",
+            parameters: r#"{
+                "type": "object",
+                "properties": {
+                    "line": {"type": "integer", "minimum": 1, "description": "1 基行号"},
+                    "enabled": {"type": "boolean", "description": "true 设置断点，false 移除断点"},
+                    "condition": {"type": "string", "description": "可选的断点条件表达式"}
+                },
+                "required": ["line", "enabled"]
+            }"#,
+        },
+        ToolSpec {
+            name: "add_watch",
+            description: "添加调试监视表达式；脚本暂停时会自动求值，结果可通过 get_debug_state 查看。",
+            parameters: r#"{
+                "type": "object",
+                "properties": {
+                    "expression": {"type": "string", "description": "变量名或 VB 表达式"}
+                },
+                "required": ["expression"]
+            }"#,
+        },
     ]
 }
 
@@ -123,6 +182,8 @@ pub struct PlanCtx<'a> {
     pub read: &'a dyn Fn(&Path) -> Option<String>,
     /// 输出面板最近的文本。
     pub output: &'a dyn Fn() -> String,
+    /// 当前脚本的调试状态。
+    pub debug_state: &'a dyn Fn() -> String,
 }
 
 /// 一次调用的执行计划。
@@ -137,6 +198,37 @@ pub enum ToolPlan {
         /// 写成功后回给模型的说明。
         done: String,
     },
+    /// 需要由主窗口执行的脚本/调试操作。
+    Action { action: AppAction, summary: String },
+}
+
+/// 需要在主窗口 UI 线程执行的 AI 操作。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AppAction {
+    RunScript,
+    StartDebug,
+    ContinueDebug,
+    StepDebug,
+    PauseDebug,
+    StopExecution,
+    SetBreakpoint {
+        line: usize,
+        enabled: bool,
+        condition: Option<String>,
+    },
+    AddWatch {
+        expression: String,
+    },
+}
+
+impl AppAction {
+    /// 这些操作会启动或推进脚本，遵循 AI 面板的确认设置。
+    pub fn requires_confirmation(&self) -> bool {
+        matches!(
+            self,
+            Self::RunScript | Self::StartDebug | Self::ContinueDebug | Self::StepDebug
+        )
+    }
 }
 
 fn read_failure(summary: String, content: String) -> ToolPlan {
@@ -179,11 +271,84 @@ pub fn plan(ctx: &PlanCtx<'_>, call: &crate::ai::client::ToolCall) -> ToolPlan {
         "write_file" => write_file(ctx, &args),
         "check_syntax" => check_syntax(ctx, &args),
         "read_output" => read_output(ctx),
+        "run_script" => action(AppAction::RunScript, "运行当前 VB 脚本"),
+        "start_debug" => action(AppAction::StartDebug, "调试运行当前 VB 脚本"),
+        "debug_continue" => action(AppAction::ContinueDebug, "继续调试"),
+        "debug_step" => action(AppAction::StepDebug, "调试单步执行"),
+        "debug_pause" => action(AppAction::PauseDebug, "暂停脚本"),
+        "stop_execution" => action(AppAction::StopExecution, "停止脚本"),
+        "get_debug_state" => ToolPlan::Read {
+            content: (ctx.debug_state)(),
+            summary: "读取脚本调试状态".to_string(),
+        },
+        "set_breakpoint" => set_breakpoint(&args),
+        "add_watch" => add_watch(&args),
         other => read_failure(
             format!("未知工具 {other}"),
             format!("错误：没有名为 `{other}` 的工具"),
         ),
     }
+}
+
+fn action(action: AppAction, summary: &str) -> ToolPlan {
+    ToolPlan::Action {
+        action,
+        summary: summary.to_string(),
+    }
+}
+
+fn set_breakpoint(args: &Value) -> ToolPlan {
+    let Some(line) = int_arg(args, "line").filter(|line| *line > 0) else {
+        return read_failure(
+            "参数错误".to_string(),
+            "错误：line 必须是大于 0 的行号".to_string(),
+        );
+    };
+    let Some(enabled) = args.get("enabled").and_then(Value::as_bool) else {
+        return read_failure(
+            "参数错误".to_string(),
+            "错误：enabled 必须是布尔值".to_string(),
+        );
+    };
+    let condition = text_arg(args, "condition").filter(|text| !text.trim().is_empty());
+    if enabled {
+        action(
+            AppAction::SetBreakpoint {
+                line,
+                enabled,
+                condition,
+            },
+            &format!("设置第 {line} 行断点"),
+        )
+    } else {
+        action(
+            AppAction::SetBreakpoint {
+                line,
+                enabled,
+                condition: None,
+            },
+            &format!("移除第 {line} 行断点"),
+        )
+    }
+}
+
+fn add_watch(args: &Value) -> ToolPlan {
+    let Some(expression) = text_arg(args, "expression") else {
+        return read_failure("参数错误".to_string(), "错误：缺少 expression".to_string());
+    };
+    let expression = expression.trim().to_string();
+    if expression.is_empty() {
+        return read_failure(
+            "参数错误".to_string(),
+            "错误：expression 不能为空".to_string(),
+        );
+    }
+    action(
+        AppAction::AddWatch {
+            expression: expression.clone(),
+        },
+        &format!("添加监视：{expression}"),
+    )
 }
 
 fn read_file(ctx: &PlanCtx<'_>, args: &Value) -> ToolPlan {

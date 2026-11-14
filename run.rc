@@ -1,0 +1,5 @@
+// Windows 资源脚本：命令行运行器 `qide-run.exe` 专用。
+//
+// 主程序用 app.rc（深蓝图标），运行器用本文件（浅绿图标），
+// 这样在“打开方式”列表里能一眼分辨。编译由 build.rs 调 embed-resource 完成。
+1 ICON "assets/run.ico"
