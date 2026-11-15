@@ -184,6 +184,11 @@ impl VbArray {
         }
     }
 
+    /// 元素声明类型（`VarType` 拼数组类型码用）。
+    pub fn element_type(&self) -> VbType {
+        self.ty
+    }
+
     pub fn is_dynamic(&self) -> bool {
         self.dynamic
     }
@@ -223,12 +228,9 @@ impl VbArray {
         Ok((self.items[offset].clone(), self.ty))
     }
 
-    pub fn element(&self, indices: &[i32]) -> Result<Rc<RefCell<Value>>, String> {
-        Ok(self.element_cell(indices)?.0)
-    }
-
     pub fn get(&self, indices: &[i32]) -> Result<Value, String> {
-        Ok(self.element(indices)?.borrow().clone())
+        let offset = self.offset(indices)?;
+        Ok(self.items[offset].borrow().clone())
     }
 
     pub fn set(&mut self, indices: &[i32], value: Value) -> Result<(), String> {
@@ -237,8 +239,13 @@ impl VbArray {
         {
             return Err(format!("该数组的元素必须是 `{type_name}` 记录"));
         }
+        let offset = self.offset(indices)?;
+        if fits_directly(self.ty, &value) {
+            *self.items[offset].borrow_mut() = value;
+            return Ok(());
+        }
         let coerced = value.coerce(self.ty)?;
-        *self.element(indices)?.borrow_mut() = coerced;
+        *self.items[offset].borrow_mut() = coerced;
         Ok(())
     }
 
@@ -569,7 +576,8 @@ impl VbDictionary {
         match self.index.get(&key.to_ascii_lowercase()).copied() {
             Some(index) => self.entries[index].1 = value,
             None => {
-                self.index.insert(key.to_ascii_lowercase(), self.entries.len());
+                self.index
+                    .insert(key.to_ascii_lowercase(), self.entries.len());
                 self.entries.push((key, value));
             }
         }
@@ -580,7 +588,8 @@ impl VbDictionary {
         if self.exists(&key) {
             return Err(format!("`Dictionary` 里已经有键 `{key}`"));
         }
-        self.index.insert(key.to_ascii_lowercase(), self.entries.len());
+        self.index
+            .insert(key.to_ascii_lowercase(), self.entries.len());
         self.entries.push((key, value));
         Ok(())
     }
@@ -936,9 +945,8 @@ impl Value {
             Self::Float(value) => Ok(*value),
             Self::Currency(value) => Ok(*value as f64 / 10_000.0),
             Self::Date(value) => Ok(*value),
-            Self::Str(text) => {
-                parse_number(text).ok_or_else(|| format!("类型不匹配：无法把字符串 \"{text}\" 转换为数值"))
-            }
+            Self::Str(text) => parse_number(text)
+                .ok_or_else(|| format!("类型不匹配：无法把字符串 \"{text}\" 转换为数值")),
             Self::Array(_) => Err("数组不能转换为数值".into()),
             Self::Record(_) => Err("记录不能转换为数值".into()),
             Self::Collection(_) => Err("集合不能转换为数值".into()),
@@ -1098,6 +1106,28 @@ impl Value {
             VbType::Boolean => Value::Bool(self.to_bool()?),
             VbType::Str => Value::Str(self.to_display()),
         })
+    }
+}
+
+/// 值与声明类型已经一致、不需要转换时直接入库。
+///
+/// VB 脚本里绝大多数赋值都是同类型直存（`Long = Long`、`String = String`），
+/// 这条快路径省掉 `coerce` 的类型分派；不满足就退回 `coerce`（含范围检查与报错）。
+pub fn fits_directly(ty: VbType, value: &Value) -> bool {
+    match (value, ty) {
+        // 数组与记录在 Variant 里按值语义深拷贝，交给 `coerce`。
+        (Value::Array(_) | Value::Record(_), _) => false,
+        (_, VbType::Variant | VbType::Object | VbType::Any) => true,
+        (Value::Int(number), VbType::Long) => i32::try_from(*number).is_ok(),
+        (Value::Int(number), VbType::Integer) => i16::try_from(*number).is_ok(),
+        (Value::Int(number), VbType::Byte) => u8::try_from(*number).is_ok(),
+        (Value::Int(_), VbType::LongLong | VbType::LongPtr) => true,
+        (Value::Float(_), VbType::Double) => true,
+        (Value::Bool(_), VbType::Boolean) => true,
+        (Value::Str(_), VbType::Str) => true,
+        (Value::Date(_), VbType::Date) => true,
+        (Value::Currency(_), VbType::Currency) => true,
+        _ => false,
     }
 }
 

@@ -1,11 +1,16 @@
 # 开发进度与后续计划
 
-> 更新时间：2026-11-06。下次接手先看这里，再照「验证约定」跑一遍命令。
+> 更新时间：2026-11-14。下次接手先看这里，再照「验证约定」跑一遍命令。
 
 ## 当前状态
 
-- `cargo build` 通过、`cargo test` **360 passed**（5 ignored）、`cargo clippy --all-targets` **0 警告**。
+- `cargo build` 通过、`cargo test` **725 passed**（6 ignored）、`cargo clippy --all-targets` 无警告。
 - 界面/交互效果由人工验证（不要用截图、也不要模拟鼠标键盘去点界面）。
+- **解释器语义以 VB6 官方行为为准**：`cargo test` 会跑 `src/vb6_golden_tests.rs`，
+  期望值来自本机 VB6 真编译（250 条表达式 + 28 条错误号 + 78 段整脚本）。
+  改动解释器语义后先跑这一组；换机器/装 VB6 后用 `python tools/vb6_golden.py` 重新生成。
+- 解释器性能（release，`qide-run`，2M 次循环）：数值循环约 0.43s、数组元素自增约 0.62s、
+  1500 元素冒泡约 0.90s；VB6 p-code 同脚本约 0.36s / 0.06s。热路径约定见 `docs/架构.md`「线程与性能约束」。
 
 ## 已完成的功能（按模块）
 
@@ -44,7 +49,7 @@
 
 ### 解释器
 
-- 语义检查 `sema.rs`：`Option Explicit` 下的未声明变量、`ReDim` 未声明数组、未定义的函数或过程（`With` 块内跳过，调用名是变量时跳过）。
+- 语义检查 `sema.rs`：`Option Explicit` 下的未声明变量、`ReDim` 未声明数组、未定义的函数或过程（`With` 块内跳过，调用名是变量时跳过）；另外做 `Implements` 的成员一致性检查（漏实现接口公开成员、写了接口没有的 `接口名_xxx`、`Property Let/Set` 形式不一致），这一项与 `Option Explicit` 无关，与 VB6 一样属于编译期错误。
 - 补全 `completion.rs`：文档里的符号优先于关键字/内置函数；**成员补全**（`p.` 后列 UDT 字段、类字段与方法、`Me.`、`New Collection` / `New Dictionary`）。
 - 编码 `encoding.rs`：BOM / UTF-8 / UTF-16LE/BE / GBK 探测，保存按原编码写回，状态栏显示。
 - 对话框 `dialog.rs`：`MsgBox` / `InputBox` 都自己建窗口 + 自己跑消息循环（理由见「坑位备忘」），支持按钮组语义，**开窗期间点「停止脚本」会立刻关闭**。
@@ -96,6 +101,44 @@
 2. 文件编码：状态栏点击切换编码并重新解码，另存时可指定编码与换行符（CRLF/LF）。
 3. 帮助菜单加「快捷键一览」对话框。
 4. 给 `gpui-base` 打本地补丁以支持语言级缩进规则（见「已知遗留」）。
+
+## 解释器：语义完善进度与待办
+
+**验证方式（改语义前必须先做）**：语义一律以本机 VB6 真编译为 oracle。用例写在
+`tools/vb6_golden_cases.txt`（表达式）/ `vb6_golden_errors.txt`（失败语句 → `Err.Number`）/
+`vb6_golden_scripts.txt`（整段脚本，`=== 名字` 分段，`@` 开头行写模块级选项），
+跑 `python tools/vb6_golden.py` 用 `Vb6.exe /make`（`CompilationType=-1` 即 p-code）生成
+`src/vb6_golden_data.rs`，再由 `cargo test`（`vb6_golden_tests.rs` 的 3 条数据驱动用例 + `builtins_tests.rs` 里若干条实测值用例）逐条比对。
+与 VB6 有意不同之处写进 `KNOWN_DIFFERENCES` / `SCRIPT_KNOWN_DIFFERENCES` 并在
+`docs/脚本语言.md` 写明理由。当前覆盖 **250 条表达式 + 28 条错误号 + 78 段整脚本**。
+
+### 已按此流程修掉的语义缺陷（累计）
+
+| 批次 | 缺陷 |
+| --- | --- |
+| 首次接入 | `^` 左结合写错（`2 ^ 3 ^ 2` 应为 64）、`CSng` 未窄化到 32 位 |
+| 脚本用例 | `Null` 传播（算术/比较/`&`）、除零错误文案、`For` 结束后计数器应停在第一个不满足条件的值 |
+| 文件 I/O | `Loc()` 语义（应为最后一个读写字节位置）、`Put #` 按转换函数定宽（1/2/4/8 字节） |
+| 类型与边界 | `For` 计数器声明成 Integer/Long/Byte 时自增溢出报**错误号 6**；`Partition` 全部规则（宽度 = 位数(终点+1)） |
+| 静态检查 | `Implements` 漏实现接口成员、写了接口没有的 `接口名_xxx`、`Property Let/Set` 与接口形式不一致 |
+| 字符串与格式化 | `InStr` 忽略比较方式；`InStrRev` 忽略起点与比较方式；`Replace` 忽略起点/次数/比较方式、空查找串、返回值应从 `start` 开始；`Split("")` 应返回空数组；`Format` 命名格式全错（把字母当占位符）、`Format` 应逢五进一、`Format` 不支持 `0.00E+00` |
+
+### 待办（按建议顺序）
+
+1. **`Byte` / `Single` 独立值类型**：现在 `VarType`/`TypeName` 把 Integer/Byte 统一当 Long、Single 当 Double，
+   连带 `Hex(-1)`/`Oct(-1)` 给 32 位（VB6 因为字面量是 Integer 给 16 位）、`CSng` 按 15 位有效数字打印。
+   落点：`value.rs`（`Value`/`VbType`）、`runtime.rs`（`coerce` / `store_in` / `fits_directly`）、
+   `builtins.rs`（`vartype_code` / `hex` / `oct`）。改完必须跑 bench 与黄金测试，热路径别把开销加回去。
+2. **模块级 `Public`/`Private` 隔离**（`#Include` 多文件场景）：目前只接受语法、不做可见性隔离。
+3. **`Implements` 签名一致性**：现在只查成员存在与 Let/Set 形式，还没查参数个数、`ByRef`、数组与类型；
+   落点 `sema.rs::check_implements`（诊断要保守，宁可少报也不要误报）。
+4. **编译错误文案对齐**：`E:\dsh工作区\反编译\data\errors\vb6-compile-errors-zh.tsv` 有 296 条现成中文文案，
+   可先做「错误号 → 文案」表，再逐条改 `parser.rs` / `error.rs` 的消息。
+5. **`Slot` 扁平化**（性能）：值内联、只在 `ByRef` 时造共享单元。这是跨 `runtime.rs`/`value.rs` 的结构性改造，
+   预期收益最大；动手前先读 `docs/架构.md`「线程与性能约束」里的实测数据与已否决清单。
+6. 探路项（**先用黄金用例确认 VB6 行为，再决定是否实现**）：`Property Set` 的接口分派、`For Each` 遍历 `Dictionary`、
+   `On Error GoTo -1`、`Static` 局部 UDT、`Format` 的日期命名格式（`General Date` / `Long Date` 等，牵涉区域设置，
+   要先定一个不随机器变化的固定写法，和 ISO 日期显示保持一致）。
 
 ## 常用命令
 

@@ -17,6 +17,7 @@ pub const USAGE: &str = "\
 选项：
     -h, --help       显示本说明后退出
     -V, --version    显示版本号后退出
+    --background     后台启动：窗口不抢焦点（由 qide-mcp 自动拉起时使用）
     --               其后的参数一律当作路径
 
 不带路径时按上次保存的布局启动。";
@@ -25,7 +26,11 @@ pub const USAGE: &str = "\
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// 正常开窗，并打开这些路径（可以为空，表示只恢复上次布局）。
-    Open(Vec<String>),
+    Open {
+        paths: Vec<String>,
+        /// `--background`：开窗但不抢焦点。
+        background: bool,
+    },
     Help,
     Version,
     /// 参数有误，字符串是具体原因。
@@ -49,6 +54,7 @@ where
     let mut paths = Vec::new();
     // `--` 之后不再识别选项：文件名本身可能以 `-` 开头。
     let mut literal = false;
+    let mut background = false;
     for arg in args {
         let arg = arg.as_ref();
         if literal {
@@ -59,6 +65,7 @@ where
             "--" => literal = true,
             "-h" | "--help" | "/?" => return Command::Help,
             "-V" | "--version" => return Command::Version,
+            "--background" => background = true,
             // 单个 `-` 不算选项，当作路径处理。
             _ if arg.len() > 1 && arg.starts_with('-') => {
                 return Command::Invalid(format!("未知选项 {arg}"));
@@ -66,7 +73,7 @@ where
             _ => paths.push(arg.to_string()),
         }
     }
-    Command::Open(paths)
+    Command::Open { paths, background }
 }
 
 /// 按磁盘现状分类：`is_file` / `is_dir` 都不成立时算作不存在。

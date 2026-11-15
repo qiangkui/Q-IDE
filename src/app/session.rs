@@ -1,11 +1,16 @@
 //! 会话恢复、标签关闭、外部修改检测与布局保存。
 
-use super::*;
 use super::dialogs::*;
+use super::*;
 
 impl CodeWindow {
     /// 恢复上次退出时开着的标签，并把焦点放回当时激活的那一个。
-    pub(super) fn restore_session(&mut self, layout: &Layout, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn restore_session(
+        &mut self,
+        layout: &Layout,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if layout.open.is_empty() {
             return;
         }
@@ -17,7 +22,11 @@ impl CodeWindow {
                 continue;
             }
             self.open_file(path, window, cx);
-            if let Some(index) = self.open_files.iter().position(|file| file.id == path.as_str()) {
+            if let Some(index) = self
+                .open_files
+                .iter()
+                .position(|file| file.id == path.as_str())
+            {
                 if path == &layout.active {
                     active_index = Some(index);
                 }
@@ -209,7 +218,10 @@ impl CodeWindow {
                 Ok(()) => saved_any = true,
                 Err(error) => {
                     let output = self.output();
-                    output.error(cx, format!("保存 {} 失败：{error}", self.open_files[index].name));
+                    output.error(
+                        cx,
+                        format!("保存 {} 失败：{error}", self.open_files[index].name),
+                    );
                 }
             }
         }
@@ -256,7 +268,12 @@ impl CodeWindow {
     }
 
     /// 直接关闭标签（不再检查未保存修改）；关掉当前标签后聚焦相邻文件。
-    pub(super) fn close_file_now(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn close_file_now(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if index >= self.open_files.len() {
             return;
         }
@@ -284,7 +301,8 @@ impl CodeWindow {
                     let next = index.min(self.open_files.len() - 1);
                     self.active_file = Some(next);
                     self.editor = self.editors[next].clone();
-                    self.editor.update(cx, |editor, cx| editor.focus(window, cx));
+                    self.editor
+                        .update(cx, |editor, cx| editor.focus(window, cx));
                 }
             }
         }
@@ -331,8 +349,7 @@ impl CodeWindow {
         });
         let discard_handle = handle;
         let on_discard: DialogCallback = Rc::new(move |window, cx| {
-            let _ =
-                discard_handle.update(cx, |this, cx| this.close_all_files_now(window, cx));
+            let _ = discard_handle.update(cx, |this, cx| this.close_all_files_now(window, cx));
         });
         show_unsaved_dialog(
             window,
@@ -431,7 +448,12 @@ impl CodeWindow {
     }
 
     /// 把磁盘上的新内容读回标签（丢掉未保存内容时也走这里）。
-    pub(super) fn reload_from_disk(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn reload_from_disk(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if index >= self.open_files.len() {
             return;
         }
@@ -454,7 +476,9 @@ impl CodeWindow {
             *slot = content.clone();
         }
         if let Some(editor) = self.editors.get(index).cloned() {
-            editor.update(cx, |editor, cx| editor.set_value(content.to_string(), window, cx));
+            editor.update(cx, |editor, cx| {
+                editor.set_value(content.to_string(), window, cx)
+            });
         }
         if self.active_file == Some(index) {
             self.reset_editor_caches();
@@ -468,7 +492,12 @@ impl CodeWindow {
     }
 
     /// 有未保存修改时问用户：保留我的内容，还是用磁盘上的版本覆盖。
-    pub(super) fn prompt_external_reload(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn prompt_external_reload(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let name = self.open_files[index].name.to_string();
         let handle = cx.entity().downgrade();
         let on_reload: DialogCallback = Rc::new(move |window, cx| {
@@ -509,10 +538,8 @@ impl CodeWindow {
                 .success(cx, format!("已替换 {files} 个文件、共 {total} 处"));
         }
         if outcome.skipped > 0 {
-            self.output().warning(
-                cx,
-                format!("{} 个文件无法读取，已跳过", outcome.skipped),
-            );
+            self.output()
+                .warning(cx, format!("{} 个文件无法读取，已跳过", outcome.skipped));
         }
         for failure in &outcome.failures {
             let message = format!("替换失败：{failure}");
@@ -529,7 +556,11 @@ impl CodeWindow {
     }
 
     /// 窗口关闭前的确认：有未保存修改时弹窗，返回 `false` 阻止本次关闭。
-    pub(super) fn request_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    pub(super) fn request_window_close(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         // 暂停中的调试线程会一直等指令，关窗口时先放它走。
         if let Some(session) = &self.debug {
             session.control.stop();
@@ -537,6 +568,7 @@ impl CodeWindow {
         self.save_active_content(cx);
         self.save_layout(cx);
         if !self.any_dirty() {
+            crate::agent::remove_endpoint();
             return true;
         }
 
@@ -550,10 +582,14 @@ impl CodeWindow {
                 })
                 .unwrap_or(false);
             if all_saved {
+                crate::agent::remove_endpoint();
                 cx.quit();
             }
         });
-        let on_discard: DialogCallback = Rc::new(move |_window, cx| cx.quit());
+        let on_discard: DialogCallback = Rc::new(move |_window, cx| {
+            crate::agent::remove_endpoint();
+            cx.quit();
+        });
         show_unsaved_dialog(
             window,
             cx,

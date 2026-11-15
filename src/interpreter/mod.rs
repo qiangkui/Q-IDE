@@ -164,6 +164,10 @@ pub struct RunOptions {
     /// headless 宿主（命令行、外部 agent）设 `false`：`MsgBox` 直接返回 0（`vbOK`），
     /// `InputBox` 返回空串，脚本不会因为等不到人点按钮而卡死。
     pub allow_ui: bool,
+    /// 是否累计执行频次统计（`qide-run --stats`）；默认关闭，避免给热路径加无谓工作。
+    pub count_stats: bool,
+    /// 是否逐条输出执行轨迹（`qide-run --trace`）：每执行一条语句就写一行 `» 第 N 行`。
+    pub trace: bool,
 }
 
 impl Default for RunOptions {
@@ -175,9 +179,14 @@ impl Default for RunOptions {
             script_path: None,
             include_dir: None,
             allow_ui: true,
+            count_stats: false,
+            trace: false,
         }
     }
 }
+
+/// 执行轨迹行（`--trace`）的前缀：宿主靠它把轨迹与脚本输出区分开。
+pub const TRACE_PREFIX: &str = "»";
 
 /// 在后台线程跑脚本。
 ///
@@ -205,21 +214,60 @@ where
 /// 带运行限制的 [`run`]。
 pub fn run_with<F>(
     source: &str,
-    mut out: F,
+    out: F,
     interrupt: &AtomicBool,
     options: RunOptions,
 ) -> Result<(), Error>
 where
     F: FnMut(&str),
 {
-    let (program, map) = parse_with_include_dir(
+    run_with_stats(source, out, interrupt, options).0
+}
+
+/// 同 [`run_with`]，另外返回执行频次统计（`qide-run --stats`）。
+pub fn run_with_stats<F>(
+    source: &str,
+    mut out: F,
+    interrupt: &AtomicBool,
+    options: RunOptions,
+) -> (Result<(), Error>, runtime::RunStats)
+where
+    F: FnMut(&str),
+{
+    let parsed = parse_with_include_dir(
         source,
         options.script_path.as_deref(),
         options.include_dir.as_deref(),
-    )?;
-    runtime::run_program(&program, &mut out, interrupt, &options, None)
-        .map_err(|error| Error::Runtime(remap_runtime(error, &map)))?;
-    Ok(())
+    );
+    let (program, map) = match parsed {
+        Ok(parsed) => parsed,
+        Err(error) => return (Err(error), runtime::RunStats::default()),
+    };
+    let (outcome, stats) = run_program_guarded_stats(|| {
+        runtime::run_program_with_stats(&program, &mut out, interrupt, &options, None)
+    });
+    let outcome = outcome.map_err(|error| Error::Runtime(remap_runtime(error, &map)));
+    (outcome, stats)
+}
+
+/// 同 [`run_program_guarded`]，但把执行统计一起带回来。
+fn run_program_guarded_stats<F>(work: F) -> (Result<(), error::RuntimeError>, runtime::RunStats)
+where
+    F: FnOnce() -> (Result<(), error::RuntimeError>, runtime::RunStats),
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+        Ok(outcome) => outcome,
+        Err(payload) => (
+            Err(error::RuntimeError::new(
+                format!(
+                    "解释器内部错误（这是 Q-IDE 的缺陷，不是脚本问题）：{}",
+                    panic_text(payload.as_ref())
+                ),
+                0,
+            )),
+            runtime::RunStats::default(),
+        ),
+    }
 }
 
 /// 带调试器的 [`run`]：命中断点或界面请求暂停时，解释器会停下来并把
@@ -239,12 +287,43 @@ where
         options.script_path.as_deref(),
         options.include_dir.as_deref(),
     )?;
-    let outcome =
+    let outcome = run_program_guarded(|| {
         runtime::run_program(&program, &mut out, interrupt, &options, Some(debug.clone()))
-            .map_err(|error| Error::Runtime(remap_runtime(error, &map)));
+    })
+    .map_err(|error| Error::Runtime(remap_runtime(error, &map)));
     debug.finish();
     outcome?;
     Ok(())
+}
+
+/// 跑一遍程序；解释器内部 panic（借用冲突、下标越界等）转成普通运行时错误。
+///
+/// 少了这一层，panic 会让脚本线程静默结束：界面永远等不到「结束」事件、一直显示运行中，
+/// 用户也看不到任何原因。捕获范围只到 `run_program`，`Runtime` 的清理照常执行。
+fn run_program_guarded<F>(work: F) -> Result<(), error::RuntimeError>
+where
+    F: FnOnce() -> Result<(), error::RuntimeError>,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+        Ok(outcome) => outcome,
+        Err(payload) => Err(error::RuntimeError::new(
+            format!(
+                "解释器内部错误（这是 Q-IDE 的缺陷，不是脚本问题）：{}",
+                panic_text(payload.as_ref())
+            ),
+            0,
+        )),
+    }
+}
+
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "原因不明".to_string()
+    }
 }
 
 /// 只做语法检查，不执行；不展开 `#Include`（没有脚本路径，无法解析相对路径）。
@@ -288,7 +367,7 @@ fn remap_parse(error: ParseError, map: &include::SourceMap) -> Error {
 fn remap_runtime(mut error: error::RuntimeError, map: &include::SourceMap) -> error::RuntimeError {
     let (line, message) = map.remap(error.line, &error.message);
     error.line = line;
-    error.message = message;
+    error.message = std::sync::Arc::from(message.as_str());
     error
 }
 
@@ -308,11 +387,63 @@ mod tests {
         run_lines(source).expect("脚本应当执行成功")
     }
 
+    /// 解释器内部 panic 必须变成一条普通运行时错误，而不是让脚本线程静默消失。
+    #[test]
+    fn internal_panic_becomes_runtime_error() {
+        let outcome = run_program_guarded(|| panic!("借用冲突"));
+        let error = outcome.expect_err("panic 应当转成运行时错误");
+        assert!(
+            error.message.contains("解释器内部错误"),
+            "{}",
+            error.message
+        );
+        assert!(error.message.contains("借用冲突"), "{}", error.message);
+    }
+
+    /// `--trace` 在每条语句前写一行 `» 第 N 行`，脚本输出保持原样。
+    #[test]
+    fn trace_reports_each_executed_statement() {
+        let mut lines = Vec::new();
+        let flag = AtomicBool::new(false);
+        run_with(
+            "Dim i As Long\nFor i = 1 To 2\nDebug.Print i\nNext i\n",
+            |line| lines.push(line.to_string()),
+            &flag,
+            RunOptions {
+                trace: true,
+                ..RunOptions::default()
+            },
+        )
+        .expect("脚本应当执行成功");
+        let markers = lines
+            .iter()
+            .filter(|line| line.starts_with(TRACE_PREFIX))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            markers,
+            [
+                format!("{TRACE_PREFIX} 第 1 行"),
+                format!("{TRACE_PREFIX} 第 2 行"),
+                format!("{TRACE_PREFIX} 第 3 行"),
+                format!("{TRACE_PREFIX} 第 3 行"),
+            ]
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| !line.starts_with(TRACE_PREFIX))
+                .count(),
+            2
+        );
+    }
+
     #[test]
     fn arithmetic_precedence() {
         assert_eq!(output("Debug.Print 1 + 2 * 3"), ["7"]);
         assert_eq!(output("Debug.Print (1 + 2) * 3"), ["9"]);
-        assert_eq!(output("Debug.Print 2 ^ 3 ^ 2"), ["512"]);
+        // VB6 的 `^` 是左结合：`2 ^ 3 ^ 2` = `(2 ^ 3) ^ 2` = 64（本机 VB6 实测）。
+        assert_eq!(output("Debug.Print 2 ^ 3 ^ 2"), ["64"]);
         assert_eq!(output("Debug.Print -2 ^ 2"), ["-4"]);
         assert_eq!(output("Debug.Print 7 \\ 2"), ["3"]);
         assert_eq!(output("Debug.Print 7 Mod 2"), ["1"]);
@@ -1022,7 +1153,7 @@ Err.Clear
 Debug.Print Err.Number
 Debug.Print x
 "#;
-        assert_eq!(output(source), ["True", "除数为 0", "0", "0"]);
+        assert_eq!(output(source), ["True", "除数为零", "0", "0"]);
     }
 
     #[test]
@@ -1042,7 +1173,7 @@ Handler:
     Resume Next
 End Sub
 "#;
-        assert_eq!(output(source), ["handled: 除数为 0", "after"]);
+        assert_eq!(output(source), ["handled: 除数为零", "after"]);
     }
 
     #[test]
@@ -1051,7 +1182,7 @@ End Sub
             "Sub Main()\n    On Error Resume Next\n    On Error GoTo 0\n    Dim x As Long\n    x = 1 / 0\nEnd Sub\n",
         )
         .unwrap_err();
-        assert!(error.message().contains("除数为 0"), "{error}");
+        assert!(error.message().contains("除数为零"), "{error}");
         assert_eq!(error.line(), 5);
     }
 
@@ -1272,13 +1403,14 @@ On Error Resume Next
 Open "Z:\nope\nothing.txt" For Input As #1
 Debug.Print Err.Number
 "#;
-        assert_eq!(output(source), ["11", "9", "53"]);
+        // 父目录不存在时 VB 报 76（路径未找到），目录存在但文件不在才是 53。
+        assert_eq!(output(source), ["11", "9", "76"]);
     }
 
     #[test]
     fn unhandled_err_raise_stops_with_its_description() {
         let error = run_lines("Err.Raise 53\n").unwrap_err();
-        assert!(error.message().contains("找不到文件"), "{error}");
+        assert!(error.message().contains("文件未找到"), "{error}");
         assert_eq!(error.line(), 1);
     }
 
@@ -1676,7 +1808,7 @@ Debug.Print ldexp(1.5, 3)
     #[test]
     fn runtime_error_reports_line() {
         let error = run_lines("Dim x As Long\nx = 1 / 0").unwrap_err();
-        assert!(error.message().contains("除数为 0"), "{error}");
+        assert!(error.message().contains("除数为零"), "{error}");
         assert_eq!(error.line(), 2);
     }
 

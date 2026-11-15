@@ -95,9 +95,13 @@ impl RenderOnce for Tree {
                         let id = entry.item().id.clone();
                         let context_menu_builder = context_menu_builder.clone();
                         let context_menu_state = state.clone();
-                        let item = render_item(ix, entry, entry_state.is_selected(), window, cx)
+                        let item = render_item(ix, entry, entry_state.is_selected(), window, cx);
+                        // 树自身的单选状态可能与调用方的多选同时存在：
+                        // 调用方在 ListItem 上设置的 selected 也要保留。
+                        let selected = entry_state.is_selected() || item.is_selected();
+                        let item = item
                             .disabled(entry.is_disabled())
-                            .selected(entry_state.is_selected())
+                            .selected(selected)
                             .secondary_selected(entry_state.is_right_clicked());
 
                         div()

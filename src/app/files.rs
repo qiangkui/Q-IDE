@@ -1,7 +1,7 @@
 //! 文件、标签与资源管理器操作。
 
-use super::*;
 use super::dialogs::*;
+use super::*;
 use crate::startup;
 
 impl CodeWindow {
@@ -22,7 +22,8 @@ impl CodeWindow {
         self.save_active_content(cx);
         self.active_file = Some(index);
         self.editor = editor;
-        self.editor.update(cx, |editor, cx| editor.focus(window, cx));
+        self.editor
+            .update(cx, |editor, cx| editor.focus(window, cx));
 
         // 这些缓存属于「当前标签」，切换后要按新标签重新计算。
         self.reset_editor_caches();
@@ -91,7 +92,8 @@ impl CodeWindow {
         // 每个标签持有自己的编辑器实体，切换回来时光标、滚动和撤销历史都还在。
         let editor = self.add_editor(content.into(), language.into(), window, cx);
         self.editor = editor;
-        self.editor.update(cx, |editor, cx| editor.focus(window, cx));
+        self.editor
+            .update(cx, |editor, cx| editor.focus(window, cx));
 
         self.reset_editor_caches();
 
@@ -160,7 +162,12 @@ impl CodeWindow {
     }
 
     /// 在 `dir` 下新建一个空的 `新建文件*.vb`，刷新树并打开它。
-    pub(crate) fn create_file_in(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn create_file_in(
+        &mut self,
+        dir: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let path = free_vb_path(&dir);
         if let Err(error) = std::fs::write(&path, "") {
             let output = self.output();
@@ -176,8 +183,7 @@ impl CodeWindow {
     /// 在目标目录下新建一个空文件夹（名字自动避开重名）。
     pub(crate) fn new_folder(&mut self, cx: &mut Context<Self>) {
         let Some(dir) = self.target_dir() else {
-            self.output()
-                .warning(cx, "先在资源管理器里添加一个文件夹");
+            self.output().warning(cx, "先在资源管理器里添加一个文件夹");
             return;
         };
         self.create_folder_in(dir, cx);
@@ -210,8 +216,7 @@ impl CodeWindow {
                 self.output().success(cx, format!("已新建文件夹 {name}"));
             }
             Err(error) => {
-                self.output()
-                    .error(cx, format!("无法新建文件夹：{error}"));
+                self.output().error(cx, format!("无法新建文件夹：{error}"));
             }
         }
     }
@@ -399,36 +404,130 @@ impl CodeWindow {
         show_confirm_dialog(window, cx, "删除", description, "删除", on_confirm);
     }
 
-    pub(super) fn delete_path(&mut self, path: &str, is_dir: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn delete_path(
+        &mut self,
+        path: &str,
+        is_dir: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.delete_path_checked(path, is_dir, window, cx) {
+            Ok(()) => self.output().success(cx, format!("已删除 {path}")),
+            Err(error) => self.output().error(cx, format!("删除失败：{error}")),
+        }
+    }
+
+    /// 删除一个文件或文件夹；返回结果供 agent 之类的调用方使用。
+    pub(super) fn delete_path_checked(
+        &mut self,
+        path: &str,
+        is_dir: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
         let result = if is_dir {
             std::fs::remove_dir_all(path)
         } else {
             std::fs::remove_file(path)
         };
-        if let Err(error) = result {
-            self.output().error(cx, format!("删除失败：{error}"));
+        result.map_err(|error| error.to_string())?;
+        self.forget_paths(&[path.to_string()], window, cx);
+        Ok(())
+    }
+
+    /// 打开「删除」确认框：一次删除多个选中项（文件夹连同内容一起删）。
+    pub(crate) fn delete_paths_dialog(
+        &mut self,
+        paths: Vec<(String, bool)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() {
             return;
         }
-        self.forget_paths(&[path.to_string()], window, cx);
-        self.output().success(cx, format!("已删除 {path}"));
+        let description = if paths.len() == 1 {
+            let (path, is_dir) = &paths[0];
+            let name = Path::new(path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone());
+            if *is_dir {
+                format!("确定要删除文件夹 {name} 及其中的全部内容吗？删除后无法撤销。")
+            } else {
+                format!("确定要删除 {name} 吗？删除后无法撤销。")
+            }
+        } else {
+            format!(
+                "确定要删除选中的 {} 个项目吗？删除后无法撤销。",
+                paths.len()
+            )
+        };
+        let handle = cx.entity().downgrade();
+        let on_confirm: DialogCallback = Rc::new(move |window, cx| {
+            let paths = paths.clone();
+            let _ = handle.update(cx, |this, cx| this.delete_paths(&paths, window, cx));
+        });
+        show_confirm_dialog(window, cx, "删除", description, "删除", on_confirm);
+    }
+
+    /// 删除一批条目，父目录已被选中时跳过它下面的子项。
+    pub(super) fn delete_paths(
+        &mut self,
+        paths: &[(String, bool)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut removed = Vec::new();
+        for (path, is_dir) in paths {
+            let nested = paths.iter().any(|(other, other_is_dir)| {
+                *other_is_dir && other != path && Path::new(path).starts_with(other)
+            });
+            if nested {
+                continue;
+            }
+            let result = if *is_dir {
+                std::fs::remove_dir_all(path)
+            } else {
+                std::fs::remove_file(path)
+            };
+            match result {
+                Ok(()) => removed.push(path.clone()),
+                Err(error) => self.output().error(cx, format!("删除失败：{error}")),
+            }
+        }
+        if removed.is_empty() {
+            return;
+        }
+        self.forget_paths(&removed, window, cx);
+        self.output()
+            .success(cx, format!("已删除 {} 个项目", removed.len()));
     }
 
     /// 把资源管理器里拖动的条目移动到目标目录。
     pub(crate) fn move_path(&mut self, source: &str, target_dir: &str, cx: &mut Context<Self>) {
+        match self.move_path_checked(source, target_dir, cx) {
+            Ok(message) => self.output().success(cx, message),
+            Err(error) => self.output().error(cx, error),
+        }
+    }
+
+    /// 移动文件/文件夹；返回成功说明或错误说明。
+    pub(super) fn move_path_checked(
+        &mut self,
+        source: &str,
+        target_dir: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<String, String> {
         let source_path = Path::new(source);
         let Some(name) = source_path.file_name() else {
-            return;
+            return Err("源路径没有文件名".to_string());
         };
         let target = Path::new(target_dir).join(name);
         if target == source_path {
-            return;
+            return Err("源和目标相同".to_string());
         }
         if target.exists() {
-            self.output().error(
-                cx,
-                format!("目标里已经有 {} 了", name.to_string_lossy()),
-            );
-            return;
+            return Err(format!("目标里已经有 {} 了", name.to_string_lossy()));
         }
         if let Some(index) = self
             .open_files
@@ -447,23 +546,23 @@ impl CodeWindow {
                 self.refresh_editor_language(cx);
                 self.sync_editor_panel(cx);
                 self.save_layout(cx);
-                self.output().success(
-                    cx,
-                    format!(
-                        "已移动 {} 到 {}",
-                        name.to_string_lossy(),
-                        target_dir
-                    ),
-                );
+                Ok(format!(
+                    "已移动 {} 到 {}",
+                    name.to_string_lossy(),
+                    target_dir
+                ))
             }
-            Err(error) => {
-                self.output().error(cx, format!("移动失败：{error}"));
-            }
+            Err(error) => Err(format!("移动失败：{error}")),
         }
     }
 
     /// 这些路径被删除后：关掉相关标签，清掉断点与最近打开记录。
-    pub(super) fn forget_paths(&mut self, paths: &[String], window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn forget_paths(
+        &mut self,
+        paths: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let affected = |file: &str| {
             paths
                 .iter()
@@ -480,8 +579,7 @@ impl CodeWindow {
             self.close_file_now(index, window, cx);
         }
         self.breakpoints.retain(|file, _| !affected(file));
-        self.breakpoint_conditions
-            .retain(|file, _| !affected(file));
+        self.breakpoint_conditions.retain(|file, _| !affected(file));
         self.recent_files.retain(|item| !affected(item));
         self.rebuild_tree(cx);
         self.save_layout(cx);
@@ -531,11 +629,7 @@ impl CodeWindow {
 
     /// 把某个标签对应文件的完整路径复制到剪贴板。
     pub(crate) fn copy_file_path(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(path) = self
-            .open_files
-            .get(index)
-            .map(|file| file.id.to_string())
-        else {
+        let Some(path) = self.open_files.get(index).map(|file| file.id.to_string()) else {
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
@@ -593,7 +687,8 @@ impl CodeWindow {
         }
         if saved > 0 {
             self.sync_editor_panel(cx);
-            self.output().success(cx, format!("已自动保存 {saved} 个文件"));
+            self.output()
+                .success(cx, format!("已自动保存 {saved} 个文件"));
         }
         for failure in failures {
             self.output().error(cx, format!("自动保存失败：{failure}"));
@@ -605,9 +700,7 @@ impl CodeWindow {
     pub(super) fn spawn_auto_save_timer(&self, window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |this, cx| {
             loop {
-                cx.background_executor()
-                    .timer(Duration::from_secs(1))
-                    .await;
+                cx.background_executor().timer(Duration::from_secs(1)).await;
                 if this
                     .update_in(cx, |this, window, cx| this.auto_save_tick(window, cx))
                     .is_err()
@@ -759,7 +852,12 @@ impl CodeWindow {
     }
 
     /// 把选中的文件夹逐个加入资源管理器（已在树里的会跳过）。
-    pub(super) fn add_folders(&mut self, paths: Vec<PathBuf>, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn add_folders(
+        &mut self,
+        paths: Vec<PathBuf>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let mut changed = false;
         for path in paths {
             changed |= self.explorer.add_folder(path);
@@ -788,8 +886,12 @@ impl CodeWindow {
                 startup::Target::Dir => folders.push(path),
                 startup::Target::File => {
                     if let Some(dir) = path.parent() {
-                        let roots: Vec<PathBuf> =
-                            self.explorer.roots().iter().map(|root| root.path().to_path_buf()).collect();
+                        let roots: Vec<PathBuf> = self
+                            .explorer
+                            .roots()
+                            .iter()
+                            .map(|root| root.path().to_path_buf())
+                            .collect();
                         if !startup::covered_by_roots(&roots, dir) {
                             folders.push(dir.to_path_buf());
                         }
@@ -845,5 +947,4 @@ impl CodeWindow {
         }
         self.save_all_dirty(cx);
     }
-
 }

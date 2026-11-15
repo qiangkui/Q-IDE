@@ -1,0 +1,727 @@
+# VB6 黄金脚本用例：用 `=== 用例名` 分隔，每段是一段完整的 VB 语句序列（可以用 Debug.Print）。
+# 生成器会把 `Debug.Print` 换成写文件，并把每段包进独立的过程，因此各段之间的变量互不影响。
+# 每段不能用 `End`（会终止程序）、不能声明与过程名冲突的东西。
+
+=== for_counter_overflow
+Dim i As Integer, n As Long, j As Long
+On Error Resume Next
+Err.Clear
+For i = 32767 To 32767
+    n = n + 1
+Next i
+Debug.Print n, Err.Number
+Err.Clear
+n = 0
+For i = 32766 To 32767 Step 1
+    n = n + 1
+Next i
+Debug.Print n, Err.Number
+Err.Clear
+n = 0
+For i = -32768 To -32768
+    n = n + 1
+Next i
+Debug.Print n, Err.Number
+Err.Clear
+n = 0
+For j = 2147483647 To 2147483647
+    n = n + 1
+Next j
+Debug.Print n, Err.Number
+
+=== for_counter_after
+Dim i As Long
+For i = 1 To 4
+Next i
+Debug.Print i
+For i = 1 To 10 Step 3
+Next i
+Debug.Print i
+For i = 5 To 1 Step -2
+Next i
+Debug.Print i
+For i = 5 To 1
+Next i
+Debug.Print i
+For i = 1 To 10
+    If i = 4 Then Exit For
+Next i
+Debug.Print i
+
+=== for_step
+Dim i As Long
+For i = 1 To 10 Step 3
+    Debug.Print i
+Next i
+
+=== for_negative_step
+Dim i As Long
+For i = 5 To 1 Step -2
+    Debug.Print i
+Next i
+
+=== for_zero_iterations
+Dim i As Long
+For i = 5 To 1
+    Debug.Print "never"
+Next i
+Debug.Print "done"
+
+=== for_empty_body
+Dim i As Long, n As Long
+For i = 1 To 4
+    n = n + i
+Next i
+Debug.Print n
+
+=== nested_for
+Dim i As Long, j As Long, s As Long
+For i = 1 To 3
+    For j = 1 To 2
+        s = s + i * j
+    Next j
+Next i
+Debug.Print s
+
+=== exit_for
+Dim i As Long
+For i = 1 To 10
+    If i = 4 Then Exit For
+    Debug.Print i
+Next i
+Debug.Print "after " & i
+
+=== do_while
+Dim n As Long
+n = 3
+Do While n > 0
+    Debug.Print n
+    n = n - 1
+Loop
+
+=== do_until
+Dim n As Long
+Do
+    n = n + 1
+Loop Until n >= 3
+Debug.Print n
+
+=== while_wend
+Dim n As Long
+While n < 3
+    n = n + 1
+Wend
+Debug.Print n
+
+=== do_exit
+Dim n As Long
+Do
+    n = n + 1
+    If n = 3 Then Exit Do
+Loop
+Debug.Print n
+
+=== select_int
+Dim grade As Long
+grade = 85
+Select Case grade
+    Case Is >= 90
+        Debug.Print "优"
+    Case 60 To 89
+        Debug.Print "及格"
+    Case Else
+        Debug.Print "其它"
+End Select
+
+=== select_string
+Dim s As String
+s = "b"
+Select Case s
+    Case "a"
+        Debug.Print 1
+    Case "b", "c"
+        Debug.Print 2
+    Case Else
+        Debug.Print 3
+End Select
+
+=== select_no_match
+Dim n As Long
+n = 99
+Select Case n
+    Case 1
+        Debug.Print "one"
+End Select
+Debug.Print "after"
+
+=== goto_label
+Dim n As Long
+Start:
+n = n + 1
+If n < 3 Then GoTo Start
+Debug.Print n
+
+=== gosub_return
+Dim n As Long
+GoSub Helper
+Debug.Print "back:" & n
+Exit Sub
+Helper:
+n = 42
+Return
+
+=== if_elseif_else
+Dim n As Long
+n = 2
+If n = 1 Then
+    Debug.Print "one"
+ElseIf n = 2 Then
+    Debug.Print "two"
+Else
+    Debug.Print "many"
+End If
+
+=== on_error_resume_next
+Dim x As Long
+On Error Resume Next
+x = 1 / 0
+Debug.Print Err.Number
+x = 5
+Debug.Print x
+On Error GoTo 0
+Debug.Print "ok"
+
+=== on_error_goto_handler
+Dim x As Long
+On Error GoTo Handler
+x = 1 / 0
+Debug.Print "not reached"
+Exit Sub
+Handler:
+Debug.Print "handled " & Err.Number
+
+=== array_basics
+Dim a(3) As Long
+Dim i As Long
+For i = 0 To 3
+    a(i) = i * i
+Next i
+Debug.Print a(0), a(3)
+Debug.Print LBound(a), UBound(a)
+
+=== array_dynamic_redim
+Dim a() As Long
+ReDim a(1 To 3)
+Dim i As Long
+For i = 1 To 3
+    a(i) = i
+Next i
+ReDim Preserve a(1 To 5)
+Debug.Print a(3), a(5), UBound(a)
+
+=== array_2d
+Dim m(1, 2) As Long
+m(0, 0) = 1
+m(1, 2) = 6
+Debug.Print m(0, 0) + m(1, 2)
+Debug.Print UBound(m, 1), UBound(m, 2)
+
+=== array_string_join
+Dim a(2) As String
+a(0) = "x"
+a(1) = "y"
+a(2) = "z"
+Debug.Print Join(a, "-")
+
+=== udt_basic
+Dim p As Pt
+p.X = 3
+p.Y = 4
+Debug.Print p.X * p.Y
+
+=== with_block
+Dim p As Pt
+With p
+    .X = 5
+    .Y = 6
+End With
+Debug.Print p.X + p.Y
+
+=== string_concat_loop
+Dim i As Long, s As String
+For i = 1 To 3
+    s = s & i
+Next i
+Debug.Print s
+
+=== string_function_mix
+Dim s As String
+s = "Hello, World"
+Debug.Print UCase(Left(s, 5))
+Debug.Print InStr(s, ",")
+Debug.Print Mid(s, 8)
+Debug.Print Replace(s, "l", "L")
+
+=== numeric_accumulate
+Dim i As Long, total As Double
+For i = 1 To 100
+    total = total + i
+Next i
+Debug.Print total
+
+=== nested_function_call
+Dim n As Long
+n = Double2(Triple(2))
+Debug.Print n
+
+=== recursive
+Dim n As Long
+n = Fact(5)
+Debug.Print n
+
+=== byref_parameter
+Dim n As Long
+n = 1
+Bump n
+Debug.Print n
+
+=== optional_parameter
+Debug.Print Greet("A")
+Debug.Print Greet("B", "!")
+
+=== static_local
+Debug.Print Counter()
+Debug.Print Counter()
+Debug.Print Counter()
+
+=== boolean_ops
+Dim a As Boolean, b As Boolean
+a = True
+b = False
+Debug.Print (a And b), (a Or b), (a Xor b), (Not a)
+Debug.Print (a And b) = False
+
+=== print_numeric_format
+Dim n As Long, d As Double
+n = 5
+d = 0.5
+Debug.Print n
+Debug.Print -n
+Debug.Print d
+Debug.Print -d
+Debug.Print 1, 2
+Debug.Print True, False
+
+=== print_empty_and_null
+Dim v
+Debug.Print "[" & Empty & "]"
+Debug.Print "[" & Null & "]"
+Debug.Print v
+
+=== null_propagation
+Dim v
+Debug.Print "[" & Null & "]"
+Debug.Print TypeName(Null & "x")
+v = Null + 1
+Debug.Print TypeName(v)
+v = Null + "x"
+Debug.Print TypeName(v)
+v = Null * 2
+Debug.Print TypeName(v)
+Debug.Print TypeName(Null = Null)
+
+=== for_each_array
+Dim a(3) As Long
+Dim i As Long, total As Long, item
+For i = 0 To 3
+    a(i) = i + 1
+Next i
+For Each item In a
+    total = total + item
+Next item
+Debug.Print total
+
+=== collection_basics
+Dim c As Collection
+Set c = New Collection
+c.Add "a"
+c.Add "b"
+Debug.Print c.Count
+Debug.Print c.Item(2)
+Debug.Print c.Item(1)
+
+=== mid_statement
+Dim s As String
+s = "abcdef"
+Mid(s, 2, 3) = "XY"
+Debug.Print s
+
+=== string_build_and_parse
+Dim i As Long, s As String, parts
+For i = 1 To 3
+    s = s & i & ","
+Next i
+Debug.Print s
+parts = Split(s, ",")
+Debug.Print UBound(parts)
+Debug.Print parts(0)
+
+=== exit_function_early
+Debug.Print Pick(0)
+Debug.Print Pick(5)
+
+=== udt_array
+Dim pts(2) As Pt
+Dim i As Long, total As Long
+For i = 0 To 2
+    pts(i).X = i
+    pts(i).Y = i * 2
+Next i
+For i = 0 To 2
+    total = total + pts(i).X + pts(i).Y
+Next i
+Debug.Print total
+
+=== nested_with
+Dim a As Pt, b As Pt
+With a
+    .X = 1
+    With b
+        .Y = 2
+    End With
+    .Y = 3
+End With
+Debug.Print a.X + a.Y + b.Y
+
+=== error_in_loop
+Dim i As Long, errors As Long
+On Error Resume Next
+For i = 1 To 4
+    If i Mod 2 = 0 Then
+        errors = errors + 1 + (1 / 0)
+    End If
+Next i
+Debug.Print errors
+Debug.Print i
+On Error GoTo 0
+
+=== file_roundtrip
+Dim fn As Integer, line1 As String
+fn = FreeFile
+Open "golden_io.txt" For Output As #fn
+Print #fn, "hello"
+Print #fn, 42
+Close #fn
+fn = FreeFile
+Open "golden_io.txt" For Input As #fn
+Line Input #fn, line1
+Debug.Print line1
+Input #fn, line1
+Debug.Print "[" & line1 & "]"
+Close #fn
+Kill "golden_io.txt"
+
+=== static_in_recursion
+Debug.Print SumTo(4)
+
+=== select_nested
+Dim a As Long, b As Long
+a = 1
+b = 2
+Select Case a
+    Case 1
+        Select Case b
+            Case 2
+                Debug.Print "inner"
+            Case Else
+                Debug.Print "inner-else"
+        End Select
+    Case Else
+        Debug.Print "outer-else"
+End Select
+
+=== string_compare_option
+Dim r As Long
+r = StrComp("abc", "ABC", 1)
+Debug.Print r
+Debug.Print "abc" Like "a*"
+Debug.Print "abc" Like "b*"
+
+=== numeric_edge
+Dim d As Double
+d = 1 / 3
+Debug.Print d * 3
+Debug.Print CInt(d * 3)
+Debug.Print -Int(2.5)
+
+=== concat_numbers
+Debug.Print 1 & 2
+Debug.Print "5" + 3
+Debug.Print 5 & ""
+Debug.Print 1 & 2 & 3
+
+=== arithmetic_negatives
+Debug.Print -7 \ 2
+Debug.Print -7 Mod 2
+Debug.Print 7 Mod -2
+Debug.Print -7 Mod -2
+Debug.Print Int(-7 / 2)
+Debug.Print Fix(-7 / 2)
+Debug.Print 7 \ -2
+
+=== format_specs
+Debug.Print Format(1234.5, "0.00")
+Debug.Print Format(1234, "#,##0")
+Debug.Print Format(5, "000")
+Debug.Print Format(-1234.5, "#,##0.00")
+Debug.Print Format(0.25, "0%")
+Debug.Print Format(0, "0.0")
+
+=== string_number_compare
+Debug.Print ("5" = 5)
+Debug.Print ("5" > 4)
+Debug.Print ("a" < "b")
+Debug.Print (5 = "5")
+Debug.Print ("abc" = "ABC")
+
+=== iif_evaluates_both_arguments
+On Error Resume Next
+Debug.Print IIf(True, 1, 1 / 0)
+Debug.Print Err.Number
+
+=== set_nothing
+Dim c As Collection
+Set c = New Collection
+Debug.Print (c Is Nothing)
+Set c = Nothing
+Debug.Print (c Is Nothing)
+
+=== redim_preserve_2d
+Dim a() As Long
+ReDim a(0 To 1, 0 To 2)
+Dim i As Long, j As Long
+For i = 0 To 1
+    For j = 0 To 2
+        a(i, j) = i * 10 + j
+    Next j
+Next i
+ReDim Preserve a(0 To 1, 0 To 3)
+Debug.Print a(0, 0), a(1, 2), a(1, 3)
+Debug.Print UBound(a, 2)
+
+=== string_builtin_edges
+Debug.Print "[" & Left("abc", 0) & "]"
+Debug.Print "[" & Mid("abc", 2, 0) & "]"
+Debug.Print "[" & Mid("abc", 2, 99) & "]"
+Debug.Print Len(Space(0))
+Debug.Print Len(String(0, "a"))
+
+=== nested_byref_out_parameter
+Dim n As Long, m As Long
+n = 3
+Twice n, m
+Debug.Print n
+Debug.Print m
+
+=== option_base_1
+@Option Base 1
+Dim a(3) As Long
+Dim i As Long, total As Long
+Debug.Print LBound(a)
+Debug.Print UBound(a)
+For i = 1 To 3
+    total = total + i
+Next i
+a(1) = total
+Debug.Print a(1)
+Debug.Print a(3)
+
+=== option_compare_text
+@Option Compare Text
+Debug.Print ("abc" = "ABC")
+Debug.Print ("abc" < "ABD")
+Debug.Print ("ABC" Like "a*")
+Debug.Print StrComp("abc", "ABC")
+
+=== option_base_1_2d
+@Option Base 1
+Dim m(2, 3) As Long
+m(1, 1) = 5
+m(2, 3) = 7
+Debug.Print m(1, 1) + m(2, 3)
+Debug.Print LBound(m, 1), LBound(m, 2)
+Debug.Print UBound(m, 1), UBound(m, 2)
+
+=== write_hash_roundtrip
+Dim fn As Integer, s As String, n As Long, d As Double
+fn = FreeFile
+Open "golden_w.txt" For Output As #fn
+Write #fn, "hello", 42, 1.5
+Close #fn
+fn = FreeFile
+Open "golden_w.txt" For Input As #fn
+Input #fn, s, n, d
+Debug.Print s
+Debug.Print n
+Debug.Print d
+Close #fn
+Kill "golden_w.txt"
+
+=== random_udt_roundtrip
+Dim fn As Integer, p As Pt, q As Pt
+fn = FreeFile
+Open "golden_r.dat" For Random As #fn Len = Len(p)
+p.X = 11
+p.Y = 22
+Put #fn, 1, p
+p.X = 33
+Put #fn, 2, p
+Get #fn, 1, q
+Debug.Print q.X, q.Y
+Get #fn, 2, q
+Debug.Print q.X, q.Y
+Debug.Print LOF(fn)
+Close #fn
+Kill "golden_r.dat"
+
+=== binary_seek_roundtrip
+Dim fn As Integer, a As Byte, b As Byte
+fn = FreeFile
+Open "golden_b.dat" For Binary As #fn
+a = 65
+Put #fn, 1, a
+a = 66
+Put #fn, 2, a
+a = 67
+Put #fn, 3, a
+Seek #fn, 2
+Get #fn, , b
+Debug.Print b
+Debug.Print LOF(fn)
+Debug.Print Loc(fn)
+Close #fn
+Kill "golden_b.dat"
+
+=== put_conversion_widths
+Dim fn As Integer
+Dim b As Byte, i As Integer, l As Long
+fn = FreeFile
+Open "golden_pw.dat" For Binary As #fn
+Put #fn, 1, CByte(65)
+Put #fn, 2, CInt(1000)
+Put #fn, 4, CLng(70000)
+Debug.Print LOF(fn)
+Seek #fn, 1
+Get #fn, , b
+Get #fn, , i
+Get #fn, , l
+Debug.Print b
+Debug.Print i
+Debug.Print l
+Close #fn
+Kill "golden_pw.dat"
+
+=== err_object_state
+Dim x As Long
+On Error Resume Next
+Err.Clear
+x = 1 / 0
+Debug.Print Err.Number
+Debug.Print Err.Description
+Err.Clear
+Debug.Print Err.Number
+
+=== nested_error_handler
+Dim x As Long
+On Error Resume Next
+x = 1 / 0
+Debug.Print "after " & x
+x = 6
+Debug.Print x
+
+=== udt_byref_mutation
+Dim p As Pt
+p.X = 1
+MovePt p, 5
+Debug.Print p.X
+Debug.Print p.Y
+
+=== paramarray_sum
+Debug.Print SumAll(1, 2, 3)
+Debug.Print SumAll()
+Debug.Print SumAll(10)
+Debug.Print SumAll(1, 2)
+
+=== static_array
+Debug.Print StaticArr(0)
+Debug.Print StaticArr(0)
+Debug.Print StaticArr(2)
+Debug.Print StaticArr(0)
+
+=== collection_mutation
+Dim c As New Collection
+Dim v
+c.Add 1
+c.Add 2
+c.Add 3, "third"
+Debug.Print c.Count
+Debug.Print c.Item("third")
+c.Remove 1
+Debug.Print c.Count
+For Each v In c
+    Debug.Print v
+Next
+c.Add 9, "fourth"
+Debug.Print c.Count
+
+=== array_assignment_copy
+Dim a, b
+a = Array(7, 8)
+b = a
+b(0) = 9
+Debug.Print a(0)
+Debug.Print b(0)
+Debug.Print UBound(b)
+
+=== select_case_forms
+Dim n As Long
+For n = 0 To 6
+    Select Case n
+        Case 1, 2
+            Debug.Print "low"
+        Case Is > 4
+            Debug.Print "high"
+        Case Else
+            Debug.Print "mid"
+    End Select
+Next
+
+=== exit_do_inner
+Dim i As Long, j As Long, hits As Long
+For i = 1 To 3
+    j = 0
+    Do
+        j = j + 1
+        If j = 2 Then Exit Do
+    Loop While j < 10
+    hits = hits + j
+Next
+Debug.Print hits
+
+=== for_each_collection
+Dim c As New Collection
+Dim v
+Dim total As Long
+c.Add 4
+c.Add 5
+For Each v In c
+    total = total + v
+Next
+Debug.Print total
+
+=== split_join_roundtrip
+Dim parts
+parts = Split("a,b,c", ",")
+Debug.Print UBound(parts)
+Debug.Print Join(parts, "|")
+Debug.Print parts(1)

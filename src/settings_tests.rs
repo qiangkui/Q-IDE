@@ -27,10 +27,7 @@ fn default_layout_shows_explorer_on_the_left() {
 fn opening_uses_the_preferred_side_when_both_are_empty() {
     let mut appearance = both_empty();
     appearance.open_panel(PanelKind::Outline);
-    assert_eq!(
-        appearance.slot_of(PanelKind::Outline),
-        Some(SideSlot::Left)
-    );
+    assert_eq!(appearance.slot_of(PanelKind::Outline), Some(SideSlot::Left));
 
     let mut appearance = both_empty();
     appearance.open_panel(PanelKind::Ai);
@@ -49,10 +46,7 @@ fn opening_a_panel_uses_the_free_side() {
         appearance.slot_of(PanelKind::Explorer),
         Some(SideSlot::Right)
     );
-    assert_eq!(
-        appearance.slot_of(PanelKind::Outline),
-        Some(SideSlot::Left)
-    );
+    assert_eq!(appearance.slot_of(PanelKind::Outline), Some(SideSlot::Left));
 
     // 代码大纲在右边、左边空着：打开 AI 放到左边。
     let mut appearance = both_empty();
@@ -160,9 +154,15 @@ fn auto_save_waits_for_the_interval_and_dirty_files() {
         ..EditorSettings::default()
     };
 
-    assert!(!settings.auto_save_due(Duration::from_secs(29), 1), "还没到间隔");
+    assert!(
+        !settings.auto_save_due(Duration::from_secs(29), 1),
+        "还没到间隔"
+    );
     assert!(settings.auto_save_due(Duration::from_secs(30), 1));
-    assert!(!settings.auto_save_due(Duration::from_secs(60), 0), "没有改动不保存");
+    assert!(
+        !settings.auto_save_due(Duration::from_secs(60), 0),
+        "没有改动不保存"
+    );
 }
 
 #[test]
@@ -188,6 +188,11 @@ fn ai_settings_fall_back_to_deepseek_defaults() {
     assert_eq!(ai.approval, AiApproval::Ask);
     assert_eq!(ai.round_limit, AiRoundLimit::Six);
     assert_eq!(ai.font_size, DEFAULT_AI_FONT_SIZE);
+    assert!(ai.agent_enabled, "默认启动外部 agent 接口");
+    assert!(!ai.agent_allow_write, "默认不允许外部 agent 写入");
+    assert!(!ai.agent_auto_confirm, "默认危险操作要确认");
+    assert!(!ai.agent_allow_run, "默认运行/调试要确认");
+    assert!(ai.agent_audit, "默认记录外部 agent 调用");
 
     // 设置窗口里清空输入不应该让请求打到空地址或空模型。
     let blank = AiSettings {

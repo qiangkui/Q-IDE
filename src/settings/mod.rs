@@ -417,10 +417,8 @@ pub enum AiApproval {
 
 impl AiApproval {
     /// 所有可选项：`(值, 界面文字)`。
-    pub const OPTIONS: &'static [(&'static str, &'static str)] = &[
-        ("ask", "执行前确认"),
-        ("auto", "自动允许所有操作"),
-    ];
+    pub const OPTIONS: &'static [(&'static str, &'static str)] =
+        &[("ask", "执行前确认"), ("auto", "自动允许所有操作")];
 
     /// 写进布局文件的键。
     pub fn as_str(self) -> &'static str {
@@ -460,11 +458,8 @@ pub enum AiRoundLimit {
 
 impl AiRoundLimit {
     /// 所有可选项：`(值, 界面文字)`。
-    pub const OPTIONS: &'static [(&'static str, &'static str)] = &[
-        ("6", "6 轮"),
-        ("12", "12 轮"),
-        ("unlimited", "一直执行"),
-    ];
+    pub const OPTIONS: &'static [(&'static str, &'static str)] =
+        &[("6", "6 轮"), ("12", "12 轮"), ("unlimited", "一直执行")];
 
     /// 写进布局文件的键。
     pub fn as_str(self) -> &'static str {
@@ -523,6 +518,16 @@ pub struct AiSettings {
     pub round_limit: AiRoundLimit,
     /// 对话区（消息、代码块、提示）的字号，单位像素。
     pub font_size: u32,
+    /// 是否启用外部 agent（qide-mcp）接口。
+    pub agent_enabled: bool,
+    /// 是否允许外部 agent 写入/删除/移动文件。
+    pub agent_allow_write: bool,
+    /// 外部 agent 的文件写入/删除/移动是否跳过确认框。
+    pub agent_auto_confirm: bool,
+    /// 是否允许外部 agent 直接运行脚本和调试（跳过确认）。
+    pub agent_allow_run: bool,
+    /// 是否把外部 agent 的每次调用写进输出面板。
+    pub agent_audit: bool,
 }
 
 impl Default for AiSettings {
@@ -533,6 +538,11 @@ impl Default for AiSettings {
             approval: AiApproval::default(),
             round_limit: AiRoundLimit::default(),
             font_size: DEFAULT_AI_FONT_SIZE,
+            agent_enabled: true,
+            agent_allow_write: false,
+            agent_auto_confirm: false,
+            agent_allow_run: false,
+            agent_audit: true,
         }
     }
 }

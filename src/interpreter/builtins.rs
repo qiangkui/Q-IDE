@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::interpreter::ffi;
-use crate::interpreter::value::{Value, parse_number, round_half_even};
+use crate::interpreter::value::{Value, VbType, parse_number, round_half_even};
 
 /// 内置函数执行环境。
 pub struct Ctx<'a> {
@@ -84,6 +84,9 @@ const BUILTINS: &[&str] = &[
     "cstr",
     "cint",
     "clng",
+    "cbyte",
+    "cvar",
+    "vartype",
     "cdbl",
     "csng",
     "ccur",
@@ -106,6 +109,11 @@ const BUILTINS: &[&str] = &[
     "sleep",
     "tickcount",
     "iif",
+    "choose",
+    "switch",
+    "strconv",
+    "partition",
+    "ismissing",
     "format",
     "split",
     "join",
@@ -180,38 +188,47 @@ pub fn error_text(number: i64) -> String {
         3 => "无 GoSub 返回",
         5 => "无效的过程调用或参数",
         6 => "溢出",
-        7 => "内存不足",
+        7 => "内存溢出",
         9 => "下标越界",
-        10 => "该数组为固定大小或临时锁定",
+        10 => "该数组被固定或暂时锁定",
         11 => "除数为零",
         13 => "类型不匹配",
-        14 => "字符串空间不足",
-        17 => "无法执行所请求的操作",
-        20 => "恢复时没有错误",
-        28 => "堆栈空间不足",
-        35 => "未定义的子过程或函数",
-        48 => "加载 DLL 时出错",
-        49 => "错误的 DLL 调用约定",
+        14 => "字符串空间溢出",
+        16 => "表达式太复杂",
+        17 => "不能执行所需的操作",
+        18 => "出现用户中断",
+        20 => "无错误恢复",
+        28 => "堆栈空间溢出",
+        35 => "子程序或函数未定义",
+        47 => "DLL 应用程序客户太多",
+        48 => "加载 DLL 错误",
+        49 => "DLL 调用约定错误",
         51 => "内部错误",
-        52 => "错误的文件名或文件号",
-        53 => "找不到文件",
-        54 => "错误的文件模式",
+        52 => "错误的文件名或号码",
+        53 => "文件未找到",
+        54 => "文件模式错误",
         55 => "文件已打开",
         57 => "设备 I/O 错误",
         58 => "文件已存在",
-        59 => "错误的记录长度",
+        59 => "记录长度错误",
         61 => "磁盘已满",
         62 => "输入超出文件尾",
-        63 => "错误的记录号",
-        67 => "文件过多",
+        63 => "记录号错误",
+        67 => "文件太多",
         68 => "设备不可用",
-        70 => "权限被拒绝",
+        70 => "拒绝的权限",
         71 => "磁盘未准备好",
-        74 => "无法重命名文件",
+        74 => "不能以不同的驱动器改名",
         75 => "路径/文件访问错误",
-        76 => "找不到路径",
+        76 => "路径未找到",
         91 => "对象变量或 With 块变量未设置",
+        92 => "For 循环未初始化",
+        93 => "无效的模式串",
         94 => "无效使用 Null",
+        95 => "应用程序定义或对象定义错误",
+        96 => "由于对象已经激活了事件接受器支持的最多个事件，因此不能激活对象的事件",
+        97 => "不能调用对象的友元函数，该对象不是所定义类的一个实例。",
+        98 => "一个属性或方法调用不能包含对一个私有对象的引用，无论是作为参数还是返回值",
         424 => "需要对象",
         429 => "ActiveX 部件无法创建对象",
         438 => "对象不支持该属性或方法",
@@ -221,6 +238,124 @@ pub fn error_text(number: i64) -> String {
         _ => "应用程序定义或对象定义的错误",
     };
     text.to_string()
+}
+
+/// `VarType` 的返回值（VB 的 `vb*` 常量）。数组是 `vbArray + 元素类型码`。
+///
+/// 注意：QIDE 的整数统一用 `i64` 承载、整数字面量按 `Long` 处理，所以 `VarType(1)` 是 3（Long），
+/// 而 VB6 的整数字面量是 Integer、会返回 2。声明为 `As Integer` 的变量同样只能报 3。
+fn vartype_code(value: Option<&Value>) -> i64 {
+    let Some(value) = value else {
+        return 0;
+    };
+    match value {
+        Value::Empty => 0,
+        Value::Null => 1,
+        Value::Int(_) => 3,
+        Value::Float(_) => 5,
+        Value::Currency(_) => 6,
+        Value::Date(_) => 7,
+        Value::Str(_) => 8,
+        Value::Bool(_) => 11,
+        Value::Array(array) => 8192 + element_vartype(array.borrow().element_type()),
+        Value::FuncPtr(_) => 3,
+        Value::Record(_)
+        | Value::Class(_)
+        | Value::ComObject(_)
+        | Value::Collection(_)
+        | Value::Dictionary(_) => 9,
+    }
+}
+
+fn element_vartype(ty: VbType) -> i64 {
+    match ty {
+        VbType::Byte => 17,
+        VbType::Integer => 2,
+        VbType::Long | VbType::LongPtr => 3,
+        VbType::LongLong => 20,
+        VbType::Single => 4,
+        VbType::Double => 5,
+        VbType::Currency => 6,
+        VbType::Date => 7,
+        VbType::Boolean => 11,
+        VbType::Str => 8,
+        VbType::Object => 9,
+        VbType::Variant | VbType::Any => 12,
+    }
+}
+
+/// `StrConv`：实现大小写、全角与「宽/窄」恒等变换。
+///
+/// `vbUnicode`(64) / `vbFromUnicode`(128) 对 Rust 的 Unicode 字符串是恒等变换；
+/// VB6 的字节级转换语义在 QIDE 里没有对应物，这里按原样返回。
+fn strconv(source: &str, conversion: i64) -> Result<String, String> {
+    // 1/2 是大小写位，3 由这两位组合出「首字母大写」，不必单列。
+    const SUPPORTED: i64 = 1 | 2 | 4 | 8 | 64 | 128;
+    if conversion < 0 || conversion & !SUPPORTED != 0 {
+        return Err(format!("无效的 `StrConv` 转换方式 {conversion}"));
+    }
+    let mut text = match conversion & 3 {
+        1 => source.to_uppercase(),
+        2 => source.to_lowercase(),
+        3 => proper_case(source),
+        _ => source.to_string(),
+    };
+    if conversion & 4 != 0 {
+        text = text.chars().map(to_fullwidth).collect();
+    }
+    Ok(text)
+}
+
+fn proper_case(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut at_word_start = true;
+    for ch in source.chars() {
+        if ch.is_alphanumeric() {
+            if at_word_start {
+                out.extend(ch.to_uppercase());
+            } else {
+                out.extend(ch.to_lowercase());
+            }
+            at_word_start = false;
+        } else {
+            out.push(ch);
+            at_word_start = true;
+        }
+    }
+    out
+}
+
+fn to_fullwidth(ch: char) -> char {
+    match ch {
+        ' ' => '\u{3000}',
+        '\u{21}'..='\u{7e}' => char::from_u32(ch as u32 + 0xFEE0).unwrap_or(ch),
+        _ => ch,
+    }
+}
+
+/// `Partition`：返回 `number` 落在哪个区间，格式与 VB6 一致（本机实测）。
+///
+/// 区间是 `[start + k*interval, start + k*interval + interval - 1]`，上界超过 `stop` 时截到 `stop`；
+/// 两段都按 `停止值 + 1` 的位数右对齐补空格。`number` 小于 `start` 时前半段留空、
+/// 后半段是 `start - 1`；大于 `stop` 时前半段是 `stop + 1`、后半段留空。
+fn partition(number: i64, start: i64, stop: i64, interval: i64) -> Result<String, String> {
+    const INVALID: &str = "`Partition` 的区间参数无效";
+    if start < 0 || stop <= start || interval < 1 {
+        return Err(INVALID.to_string());
+    }
+    let width = (stop.saturating_add(1)).to_string().len();
+    let field = |value: i64| format!("{value:>width$}");
+    let blank = " ".repeat(width);
+    if number < start {
+        return Ok(format!("{blank}:{}", field(start - 1)));
+    }
+    if number > stop {
+        return Ok(format!("{}:{blank}", field(stop.saturating_add(1))));
+    }
+    let offset = (number - start) / interval;
+    let lower = start.saturating_add(offset.saturating_mul(interval));
+    let upper = lower.saturating_add(interval - 1).min(stop);
+    Ok(format!("{}:{}", field(lower), field(upper)))
 }
 
 pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String> {
@@ -319,10 +454,18 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
         "ltrim" => Value::Str(text(0)?.trim_start().to_string()),
         "rtrim" => Value::Str(text(0)?.trim_end().to_string()),
         "instr" => {
-            let (start, haystack, needle) = match args.len() {
+            // `InStr([start], string1, string2, [compare])`：VB 的 compare 是 0=二进制、1=文本、
+            // 2=数据库（按二进制处理）。省略时按二进制比较。
+            let (start, haystack, needle, ignore_case) = match args.len() {
                 0 | 1 => return Err("`instr` 需要至少两个参数".into()),
-                2 => (1usize, text(0)?, text(1)?),
-                _ => (number(0)?.max(1) as usize, text(1)?, text(2)?),
+                2 => (1usize, text(0)?, text(1)?, false),
+                3 => (number(0)?.max(1) as usize, text(1)?, text(2)?, false),
+                _ => (
+                    number(0)?.max(1) as usize,
+                    text(1)?,
+                    text(2)?,
+                    compare_is_text(args.get(3))?,
+                ),
             };
             let chars: Vec<char> = haystack.chars().collect();
             let needle: Vec<char> = needle.chars().collect();
@@ -335,22 +478,60 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
                 }));
             }
             let begin = (start - 1).min(chars.len());
-            let found = chars[begin..]
-                .windows(needle.len())
-                .position(|window| window == needle.as_slice());
-            Value::Int(found.map(|index| (begin + index + 1) as i64).unwrap_or(0))
-        }
-        "instrrev" => {
-            let haystack = text(0)?;
-            let needle = text(1)?;
             Value::Int(
-                haystack
-                    .rfind(&needle)
-                    .map(|byte_index| haystack[..byte_index].chars().count() as i64 + 1)
+                find_substring(&chars, &needle, begin, ignore_case)
+                    .map(|index| index as i64 + 1)
                     .unwrap_or(0),
             )
         }
-        "replace" => Value::Str(text(0)?.replace(&text(1)?, &text(2)?)),
+        "instrrev" => {
+            // `InStrRev(string1, string2, [start], [compare])`：从 `start`（默认 -1 = 末尾）
+            // 往左找，返回**起始位置**在 `start` 之前的最后一个匹配。
+            let haystack = text(0)?;
+            let needle = text(1)?;
+            let chars: Vec<char> = haystack.chars().collect();
+            let needle: Vec<char> = needle.chars().collect();
+            let start = match args.get(2) {
+                Some(value) => value.as_int()?,
+                None => -1,
+            };
+            let ignore_case = compare_is_text(args.get(3))?;
+            let start = if start < 0 {
+                chars.len()
+            } else {
+                (start as usize).min(chars.len())
+            };
+            if needle.is_empty() {
+                return Ok(Value::Int(start as i64 + 1));
+            }
+            let found = (0..start)
+                .rev()
+                .find(|index| chars_match_at(&chars, &needle, *index, ignore_case));
+            Value::Int(found.map(|index| index as i64 + 1).unwrap_or(0))
+        }
+        "replace" => {
+            // `Replace(expression, find, replace, [start], [count], [compare])`。
+            let source = text(0)?;
+            let find = text(1)?;
+            let replacement = text(2)?;
+            let start = match args.get(3) {
+                Some(value) => value.as_int()?.max(1),
+                None => 1,
+            };
+            let count = match args.get(4) {
+                Some(value) => value.as_int()?,
+                None => -1,
+            };
+            let ignore_case = compare_is_text(args.get(5))?;
+            Value::Str(replace_substring(
+                &source,
+                &find,
+                &replacement,
+                start as usize,
+                count,
+                ignore_case,
+            ))
+        }
         "chr" => {
             let code = number(0)? as u32;
             Value::Str(char::from_u32(code).unwrap_or('\u{fffd}').to_string())
@@ -364,14 +545,38 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
             Some(value) => Value::Str(str_value(value)),
         },
         "cstr" => Value::Str(text(0)?),
-        "cint" => Value::Int(convert_integer(args.first(), i16::MIN.into(), i16::MAX.into(), ctx)?),
-        "clng" => Value::Int(convert_integer(args.first(), i32::MIN.into(), i32::MAX.into(), ctx)?),
-        "cdbl" | "csng" => Value::Float(
+        "cint" => Value::Int(convert_integer(
+            args.first(),
+            i16::MIN.into(),
+            i16::MAX.into(),
+            ctx,
+        )?),
+        "clng" => Value::Int(convert_integer(
+            args.first(),
+            i32::MIN.into(),
+            i32::MAX.into(),
+            ctx,
+        )?),
+        "cdbl" => Value::Float(
             args.first()
                 .map(|v| v.as_float())
                 .transpose()?
                 .unwrap_or(0.0),
         ),
+        "csng" => {
+            let value = args
+                .first()
+                .map(|v| v.as_float())
+                .transpose()?
+                .unwrap_or(0.0);
+            // `Single` 是 32 位浮点：先窄化再存回 `f64`，后续运算才与 VB6 一致。
+            let narrowed = value as f32;
+            if narrowed.is_infinite() && value.is_finite() {
+                ctx.failure = Some(6);
+                return Err("溢出".into());
+            }
+            Value::Float(f64::from(narrowed))
+        }
         "ccur" => {
             let value = args
                 .first()
@@ -395,6 +600,58 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
                 .transpose()?
                 .unwrap_or(false),
         ),
+        "cbyte" => {
+            // VB6 把 `True` 直接存成字节 255（等同于 -1 按位截断），不走溢出检查。
+            let number = match args.first() {
+                Some(Value::Bool(flag)) => {
+                    if *flag {
+                        255
+                    } else {
+                        0
+                    }
+                }
+                other => convert_integer(other, 0, 255, ctx)?,
+            };
+            Value::Int(number)
+        }
+        "cvar" => args.first().cloned().unwrap_or(Value::Empty),
+        "vartype" => Value::Int(vartype_code(args.first())),
+        "choose" => {
+            let index = number(0)?;
+            if index < 1 {
+                Value::Null
+            } else {
+                match args.get(index as usize) {
+                    Some(value) => value.clone(),
+                    None => Value::Null,
+                }
+            }
+        }
+        "switch" => {
+            // 成对的「条件, 值」；参数个数为奇数或没有条件成立都按 VB 返回 Null。
+            if !args.len().is_multiple_of(2) {
+                return Err("参数个数错误".into());
+            }
+            let mut chosen = Value::Null;
+            for pair in args.chunks(2) {
+                if pair[0].to_bool()? {
+                    chosen = pair[1].clone();
+                    break;
+                }
+            }
+            chosen
+        }
+        "strconv" => {
+            let source = text(0)?;
+            let conversion = number(1)?;
+            Value::Str(strconv(&source, conversion)?)
+        }
+        "partition" => {
+            ctx.failure = Some(5);
+            let result = partition(number(0)?, number(1)?, number(2)?, number(3)?);
+            ctx.failure = if result.is_ok() { None } else { Some(5) };
+            Value::Str(result?)
+        }
         "abs" => match args.first() {
             Some(Value::Float(value)) => Value::Float(value.abs()),
             Some(Value::Currency(value)) => {
@@ -700,6 +957,8 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
         }
         // ---------- 类型判断 ----------
         "isempty" => Value::Bool(matches!(args.first(), None | Some(Value::Empty))),
+        // 真正的判定在 `call_with_by_value_args` 里按槽位做（需要"参数是否省略"的信息）。
+        "ismissing" => Value::Bool(false),
         "isnull" => Value::Bool(matches!(args.first(), Some(Value::Null))),
         "isobject" => Value::Bool(args.first().is_some_and(Value::is_object)),
         "isdate" => Value::Bool(args.first().is_some_and(is_date)),
@@ -825,6 +1084,12 @@ fn str_value(value: &Value) -> String {
     match value {
         Value::Int(_) | Value::Float(_) | Value::Currency(_) => {
             let text = value.to_display();
+            // VB 的 `Str` 和 `CStr` 有一处差别：|x| < 1 时不写整数部分的 0（`Str(0.5)` 是 `" .5"`）。
+            let text = if matches!(value, Value::Float(_) | Value::Currency(_)) {
+                strip_leading_zero(&text)
+            } else {
+                text
+            };
             if text.starts_with('-') {
                 text
             } else {
@@ -834,6 +1099,17 @@ fn str_value(value: &Value) -> String {
         // `Empty` 按数值 0 处理，与 VB 的 `Str(Empty)` 一致。
         Value::Empty => " 0".to_string(),
         other => other.to_display(),
+    }
+}
+
+/// 去掉 `0.5` / `-0.5` 里的前导 `0`：`".5"` / `"-.5"`。
+fn strip_leading_zero(text: &str) -> String {
+    if let Some(rest) = text.strip_prefix("0.") {
+        format!(".{rest}")
+    } else if let Some(rest) = text.strip_prefix("-0.") {
+        format!("-.{rest}")
+    } else {
+        text.to_string()
     }
 }
 
@@ -1509,8 +1785,12 @@ pub fn format_date_display(serial: f64) -> String {
     }
 }
 
-/// `Split` 的分段规则：分隔符为空或 `limit` 为 1 时整串作为唯一元素。
+/// `Split` 的分段规则：源串为空时返回空数组（VB6 里 `UBound(Split(""))` 是 -1），
+/// 分隔符为空或 `limit` 为 1 时整串作为唯一元素。
 fn split_parts(source: &str, delimiter: &str, limit: usize) -> Vec<Value> {
+    if source.is_empty() {
+        return Vec::new();
+    }
     if delimiter.is_empty() || limit == 1 {
         return vec![Value::Str(source.to_string())];
     }
@@ -1525,10 +1805,13 @@ fn split_parts(source: &str, delimiter: &str, limit: usize) -> Vec<Value> {
         .collect()
 }
 
-/// `Format`：支持数值格式（`0`/`#`/`.`/`,`/`%`、`;` 分段）与大小写格式（`>`/`<`）。
+/// `Format`：支持数值格式（`0`/`#`/`.`/`,`/`%`、`E+00`、`;` 分段）与大小写格式（`>`/`<`）。
 fn format_value(value: &Value, spec: &str) -> Result<String, String> {
     if spec.is_empty() {
         return Ok(value.to_display());
+    }
+    if let Some(text) = named_format(value, spec)? {
+        return Ok(text);
     }
     if !spec.contains('0') && !spec.contains('#') {
         if is_date_format(spec) {
@@ -1547,6 +1830,11 @@ fn format_value(value: &Value, spec: &str) -> Result<String, String> {
     let number = value
         .as_float()
         .map_err(|_| format!("`Format` 需要数值，但得到 \"{}\"", value.to_display()))?;
+    format_number(number, spec)
+}
+
+/// 按数值格式（可含 `;` 分段）格式化一个数。
+fn format_number(number: f64, spec: &str) -> Result<String, String> {
     let sections: Vec<&str> = spec.split(';').collect();
     let (section, negative_sign) = if number < 0.0 {
         match sections.get(1) {
@@ -1564,6 +1852,115 @@ fn format_value(value: &Value, spec: &str) -> Result<String, String> {
         text.insert(0, '-');
     }
     Ok(text)
+}
+
+/// `Format` 的命名格式（大小写不敏感），返回 `None` 表示不是命名格式。
+///
+/// 命名格式不读系统区域设置：`Currency` 固定用 `$`，千位分隔符固定用 `,`。
+fn named_format(value: &Value, spec: &str) -> Result<Option<String>, String> {
+    let key = spec.trim().to_ascii_lowercase();
+    let number = |spec: &str| -> Result<Option<String>, String> {
+        let number = value
+            .as_float()
+            .map_err(|_| format!("`Format` 需要数值，但得到 \"{}\"", value.to_display()))?;
+        Ok(Some(format_number(number, spec)?))
+    };
+    match key.as_str() {
+        "general number" => Ok(Some(value.to_display())),
+        "fixed" => number("0.00"),
+        "standard" => number("#,##0.00"),
+        "percent" => number("0.00%"),
+        "scientific" => number("0.00E+00"),
+        "currency" => number("$#,##0.00"),
+        "yes/no" => Ok(Some(choice_text(value, "No", "Yes")?)),
+        "true/false" => Ok(Some(choice_text(value, "False", "True")?)),
+        "on/off" => Ok(Some(choice_text(value, "Off", "On")?)),
+        _ => Ok(None),
+    }
+}
+
+/// `Format` 的 `Yes/No`、`True/False`、`On/Off`：0 取第一个词，非 0 取第二个。
+fn choice_text(value: &Value, zero: &str, nonzero: &str) -> Result<String, String> {
+    Ok(if value.as_float()? == 0.0 {
+        zero.to_string()
+    } else {
+        nonzero.to_string()
+    })
+}
+
+/// VB 的比较方式参数：0 = 二进制、1 = 文本（不区分大小写）、2 = 数据库。
+///
+/// 解释器没有区域/排序规则，`2` 按二进制处理。
+fn compare_is_text(value: Option<&Value>) -> Result<bool, String> {
+    match value {
+        None | Some(Value::Empty) => Ok(false),
+        Some(value) => Ok(value.as_int()? != 0),
+    }
+}
+
+fn chars_match_at(
+    haystack: &[char],
+    needle: &[char],
+    index: usize,
+    ignore_case: bool,
+) -> bool {
+    if index + needle.len() > haystack.len() {
+        return false;
+    }
+    needle.iter().enumerate().all(|(offset, expected)| {
+        let actual = haystack[index + offset];
+        if ignore_case {
+            actual == *expected || actual.to_lowercase().eq(expected.to_lowercase())
+        } else {
+            actual == *expected
+        }
+    })
+}
+
+/// 从 `begin`（0 基字符下标）开始找子串，返回匹配的 0 基下标。
+fn find_substring(
+    haystack: &[char],
+    needle: &[char],
+    begin: usize,
+    ignore_case: bool,
+) -> Option<usize> {
+    if needle.is_empty() || begin >= haystack.len() {
+        return None;
+    }
+    (begin..=haystack.len().saturating_sub(needle.len()))
+        .find(|index| chars_match_at(haystack, needle, *index, ignore_case))
+}
+
+/// `Replace`：从 `start`（1 基字符位置）起替换，`count` 为负表示全部替换。
+///
+/// VB6 的返回值从 `start` 开始，`start` 之前的部分不会保留；空 `find` 不做任何替换。
+fn replace_substring(
+    source: &str,
+    find: &str,
+    replacement: &str,
+    start: usize,
+    count: i64,
+    ignore_case: bool,
+) -> String {
+    let find: Vec<char> = find.chars().collect();
+    if find.is_empty() {
+        return source.to_string();
+    }
+    let chars: Vec<char> = source.chars().collect();
+    let mut output = String::with_capacity(source.len());
+    let mut index = (start - 1).min(chars.len());
+    let mut replaced = 0i64;
+    while index < chars.len() {
+        if (count < 0 || replaced < count) && chars_match_at(&chars, &find, index, ignore_case) {
+            output.push_str(replacement);
+            index += find.len();
+            replaced += 1;
+            continue;
+        }
+        output.push(chars[index]);
+        index += 1;
+    }
+    output
 }
 
 /// 按单个数字格式段（`#,##0.00`）格式化一个非负数。
@@ -1586,9 +1983,20 @@ fn format_section(value: f64, section: &str) -> Result<String, String> {
     }
 
     let core: String = chars[first..=last].iter().collect();
-    if let Some(bad) = core.chars().find(|ch| !matches!(ch, '0' | '#' | ',' | '.')) {
+    let (mantissa, exponent) = match core.find(['E', 'e']) {
+        Some(index) => (core[..index].to_string(), Some(core[index..].to_string())),
+        None => (core.clone(), None),
+    };
+    if let Some(bad) = mantissa
+        .chars()
+        .find(|ch| !matches!(ch, '0' | '#' | ',' | '.'))
+    {
         return Err(format!("`Format` 不支持格式字符 `{bad}`"));
     }
+    let exponent = match exponent {
+        Some(text) => Some(exponent_spec(&text)?),
+        None => None,
+    };
 
     let value = if prefix.contains('%') || suffix.contains('%') {
         value * 100.0
@@ -1596,10 +2004,32 @@ fn format_section(value: f64, section: &str) -> Result<String, String> {
         value
     };
 
-    let (int_format, frac_format) = match core.split_once('.') {
+    let (int_format, frac_format) = match mantissa.split_once('.') {
         Some((int, frac)) => (int, frac),
-        None => (core.as_str(), ""),
+        None => (mantissa.as_str(), ""),
     };
+    let (integer, fraction, exponent_text) = match exponent {
+        Some(spec) => render_scientific(value, int_format, frac_format, &spec),
+        None => {
+            let (integer, fraction) = render_fixed(value, int_format, frac_format);
+            (integer, fraction, String::new())
+        }
+    };
+
+    let mut output = String::with_capacity(section.len() + 4);
+    output.push_str(&prefix);
+    output.push_str(&integer);
+    if !frac_format.is_empty() {
+        output.push('.');
+        output.push_str(&fraction);
+    }
+    output.push_str(&exponent_text);
+    output.push_str(&suffix);
+    Ok(output)
+}
+
+/// 把非负数按 `0`/`#` 的位数渲染成 (整数部分, 小数部分)。
+fn render_fixed(value: f64, int_format: &str, frac_format: &str) -> (String, String) {
     let decimals = frac_format
         .chars()
         .filter(|ch| matches!(ch, '0' | '#'))
@@ -1609,7 +2039,8 @@ fn format_section(value: f64, section: &str) -> Result<String, String> {
     let grouped = int_format.contains(',');
 
     let factor = 10f64.powi(decimals as i32);
-    let rounded = round_half_even(value * factor) / factor;
+    // 与 VB6 一致：`Format` 逢五进位，而 `Round` 是银行家舍入。
+    let rounded = (value * factor).round() / factor;
     let text = format!("{rounded:.decimals$}");
     let (int_text, frac_text) = match text.split_once('.') {
         Some((int, frac)) => (int.to_string(), frac.to_string()),
@@ -1628,16 +2059,68 @@ fn format_section(value: f64, section: &str) -> Result<String, String> {
     while fraction.chars().count() > min_decimals && fraction.ends_with('0') {
         fraction.pop();
     }
+    (integer, fraction)
+}
 
-    let mut output = String::with_capacity(section.len() + 4);
-    output.push_str(&prefix);
-    output.push_str(&integer);
-    if !frac_format.is_empty() {
-        output.push('.');
-        output.push_str(&fraction);
+/// 科学计数法格式里 `E`/`e` 后面的写法：`E+00` 表示总带符号、至少两位指数。
+struct ExponentSpec {
+    marker: char,
+    always_sign: bool,
+    width: usize,
+}
+
+fn exponent_spec(text: &str) -> Result<ExponentSpec, String> {
+    let marker = text.chars().next().unwrap_or('E');
+    let rest: String = text.chars().skip(1).collect();
+    let (always_sign, digits) = match rest.strip_prefix('+') {
+        Some(digits) => (true, digits),
+        None => (false, rest.strip_prefix('-').unwrap_or(&rest)),
+    };
+    if digits.is_empty() || digits.chars().any(|ch| ch != '0') {
+        return Err(format!("`Format` 不支持指数写法 \"{text}\""));
     }
-    output.push_str(&suffix);
-    Ok(output)
+    Ok(ExponentSpec {
+        marker,
+        always_sign,
+        width: digits.chars().count(),
+    })
+}
+
+/// 科学计数法：返回 (尾数整数部分, 尾数小数部分, 指数文本)。
+fn render_scientific(
+    value: f64,
+    int_format: &str,
+    frac_format: &str,
+    spec: &ExponentSpec,
+) -> (String, String, String) {
+    let mut exponent = if value == 0.0 {
+        0
+    } else {
+        value.log10().floor() as i32
+    };
+    let mut scaled = if value == 0.0 {
+        0.0
+    } else {
+        value / 10f64.powi(exponent)
+    };
+    let (mut integer, mut fraction) = render_fixed(scaled, int_format, frac_format);
+    // 四舍五入后尾数可能进位到 10，需要把指数提高一位再算。
+    if integer.trim_start_matches('0').chars().count() > 1 {
+        exponent += 1;
+        scaled /= 10.0;
+        let rendered = render_fixed(scaled, int_format, frac_format);
+        integer = rendered.0;
+        fraction = rendered.1;
+    }
+    let sign = if exponent < 0 {
+        "-"
+    } else if spec.always_sign {
+        "+"
+    } else {
+        ""
+    };
+    let digits = format!("{:0width$}", exponent.abs(), width = spec.width);
+    (integer, fraction, format!("{}{sign}{digits}", spec.marker))
 }
 
 /// 从右往左每三位插入千位分隔符。

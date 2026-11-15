@@ -26,7 +26,7 @@ use crate::interpreter::filelock;
 use crate::interpreter::trampoline::Trampoline;
 use crate::interpreter::value::{
     ClassRef, RecordField, Value, VbArray, VbDictionary, VbInstance, VbRecord, VbType,
-    default_value, pad_fixed,
+    default_value, fits_directly, pad_fixed,
 };
 
 /// 单个数组允许的最大元素数，避免脚本一次分配过多内存。
@@ -86,6 +86,8 @@ pub struct Slot {
     readonly: bool,
     /// 声明时就是数组（`Dim a(2)`、`Dim a()`），不能整体赋成标量。
     array_binding: bool,
+    /// 省略掉的可选参数（`IsMissing` 用它判定）；一旦写入就清掉。
+    missing: std::cell::Cell<bool>,
     /// 由哪一行 `Dim` 声明出来的；0 表示参数、全局或 `Const` 这类非 `Dim` 来源。
     ///
     /// 循环体里的 `Dim` 每轮都会执行到，靠它区分「同一条声明又跑了一遍」和
@@ -110,6 +112,7 @@ impl Slot {
             ty,
             readonly: false,
             array_binding: false,
+            missing: std::cell::Cell::new(false),
             declared_at: 0,
         }
     }
@@ -121,8 +124,19 @@ impl Slot {
             ty,
             readonly,
             array_binding,
+            missing: std::cell::Cell::new(false),
             declared_at: 0,
         }
+    }
+
+    /// 标记为「调用时省略的可选参数」，供 `IsMissing` 判定。
+    fn omitted_optional(self) -> Self {
+        self.missing.set(true);
+        self
+    }
+
+    pub fn is_missing(&self) -> bool {
+        self.missing.get()
     }
 
     /// 记下这条声明来自哪一行。
@@ -151,6 +165,11 @@ impl Slot {
         if self.readonly {
             return Err("不能给常量赋值".into());
         }
+        self.missing.set(false);
+        if fits_directly(self.ty, &value) {
+            *self.cell.borrow_mut() = value;
+            return Ok(());
+        }
         let coerced = value.coerce(self.ty)?;
         *self.cell.borrow_mut() = coerced;
         Ok(())
@@ -172,6 +191,29 @@ struct Frame {
     resume_index: Option<usize>,
     /// 已进入的语句块层数，0 表示过程/模块的根块。
     depth: usize,
+}
+
+/// `eval_indices` 的栈上缓冲上限；超过这么多维才退回堆分配（VB 最多允许 60 维）。
+const INLINE_DIMS: usize = 8;
+
+/// 数组下标求值结果：常见 1–2 维不碰堆。
+struct IndexBuf {
+    inline: [i32; INLINE_DIMS],
+    len: usize,
+    /// 只有维数超过 `INLINE_DIMS` 时才非空。
+    heap: Vec<i32>,
+}
+
+impl std::ops::Deref for IndexBuf {
+    type Target = [i32];
+
+    fn deref(&self) -> &[i32] {
+        if self.heap.is_empty() {
+            &self.inline[..self.len]
+        } else {
+            &self.heap
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -286,12 +328,13 @@ impl BinaryFile {
         }
     }
 
-    /// `Loc(n)`：最近一次读写过的记录号；随机文件以外等同于 `Seek(n)`。
+    /// `Loc(n)`：最近一次读写过的记录号；随机文件以外是「最后一个读写过的字节的 1 基位置」。
+    /// （`pos` 保存的是下一次读写的位置（0 基），所以刚读过的那一字节正好是 `pos`。）
     fn location(&self) -> i64 {
         if self.random {
             self.record_number()
         } else {
-            self.position()
+            self.pos as i64
         }
     }
 
@@ -382,6 +425,11 @@ pub struct Runtime<'p, 'o> {
     events: HashMap<usize, Vec<Weak<RefCell<VbInstance>>>>,
     /// 调试控制器；普通运行时为 `None`。
     debug: Option<Arc<DebugControl>>,
+    /// 是否累计执行频次统计（`--stats`）。
+    count_stats: bool,
+    /// 是否逐条输出执行轨迹（`--trace`）。
+    trace: bool,
+    stats: RunStats,
     /// 正在求值监视表达式：期间的语句不再次触发暂停检查。
     evaluating: bool,
     /// `Command()` 返回的命令行参数。
@@ -432,6 +480,16 @@ pub(crate) fn terminate_instance(instance: &mut VbInstance) {
     runtime.terminate_instance(instance);
 }
 
+/// 执行频次统计：`qide-run --stats` 用它回答"钱花在哪"，也用来决定优化的先后。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RunStats {
+    pub statements: u64,
+    pub expressions: u64,
+    pub calls: u64,
+    pub array_accesses: u64,
+    pub variable_reads: u64,
+}
+
 /// 执行一个已解析的程序；`debug` 为 `Some` 时在每条语句前检查断点与暂停请求。
 pub fn run_program(
     program: &Program,
@@ -440,6 +498,17 @@ pub fn run_program(
     options: &RunOptions,
     debug: Option<Arc<DebugControl>>,
 ) -> Result<(), RuntimeError> {
+    run_program_with_stats(program, out, interrupt, options, debug).0
+}
+
+/// 同 [`run_program`]，另外返回执行频次统计。
+pub fn run_program_with_stats(
+    program: &Program,
+    out: &mut dyn FnMut(&str),
+    interrupt: &AtomicBool,
+    options: &RunOptions,
+    debug: Option<Arc<DebugControl>>,
+) -> (Result<(), RuntimeError>, RunStats) {
     let com_initialization = com::initialize();
     let com_error = com_initialization.as_ref().err().cloned();
     let _com_apartment: Option<ApartmentGuard> = com_initialization.ok();
@@ -471,10 +540,13 @@ pub fn run_program(
     for def in &program.enums {
         for (name, value) in &def.members {
             if globals.contains_key(name) {
-                return Err(RuntimeError::new(
-                    format!("枚举 `{}` 的成员 `{name}` 与前面的定义重名", def.display),
-                    def.line,
-                ));
+                return (
+                    Err(RuntimeError::new(
+                        format!("枚举 `{}` 的成员 `{name}` 与前面的定义重名", def.display),
+                        def.line,
+                    )),
+                    RunStats::default(),
+                );
             }
             globals.insert(
                 name.clone(),
@@ -520,6 +592,9 @@ pub fn run_program(
         max_depth: options.max_depth.max(1),
         rng: 0x9E37_79B9_7F4A_7C15,
         started: Instant::now(),
+        count_stats: options.count_stats,
+        trace: options.trace,
+        stats: RunStats::default(),
         dir: None,
         strings: Vec::new(),
         persistent_callbacks: Vec::new(),
@@ -565,7 +640,7 @@ pub fn run_program(
     );
     drop(leftovers);
     ACTIVE_RUNTIME.with(|slot| slot.set(previous));
-    outcome
+    (outcome, runtime.stats)
 }
 
 impl<'p, 'o> Runtime<'p, 'o> {
@@ -712,19 +787,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
 
     fn set_var(&mut self, name: &str, value: Value, line: usize) -> Result<(), RuntimeError> {
         match self.find_slot(name) {
-            Some(slot) => {
-                if slot.is_readonly() {
-                    return Err(RuntimeError::new(format!("不能给常量 `{name}` 赋值"), line));
-                }
-                if slot.is_array_binding() && !value.is_array() {
-                    return Err(RuntimeError::new(
-                        format!("`{name}` 是数组，不能整体赋值为普通值"),
-                        line,
-                    ));
-                }
-                slot.set(value)
-                    .map_err(|message| RuntimeError::from_coerce(message, line))
-            }
+            Some(slot) => self.store_in(&slot, name, value, line),
             None => {
                 if self.option_explicit {
                     return Err(RuntimeError::new(
@@ -739,6 +802,27 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 Ok(())
             }
         }
+    }
+
+    /// 写入已有的单元（`set_var` 与循环计数器共用）。
+    fn store_in(
+        &self,
+        slot: &Slot,
+        name: &str,
+        value: Value,
+        line: usize,
+    ) -> Result<(), RuntimeError> {
+        if slot.is_readonly() {
+            return Err(RuntimeError::new(format!("不能给常量 `{name}` 赋值"), line));
+        }
+        if slot.is_array_binding() && !value.is_array() {
+            return Err(RuntimeError::new(
+                format!("`{name}` 是数组，不能整体赋值为普通值"),
+                line,
+            ));
+        }
+        slot.set(value)
+            .map_err(|message| RuntimeError::from_coerce(message, line))
     }
 
     // ---------- 步数 / 中断 ----------
@@ -763,7 +847,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
     fn debug_check(&mut self, line: usize) -> Result<(), RuntimeError> {
         // 监视表达式执行期间不再停下来：解释器线程本来就卡在 `before_line` 里，
         // 再次进入会等一个永远不会到来的「继续」。
-        if self.evaluating {
+        if self.evaluating || self.debug.is_none() {
             return Ok(());
         }
         let Some(control) = self.debug.clone() else {
@@ -806,7 +890,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         self.evaluating = true;
         let outcome = self.eval(&expr, line);
         self.evaluating = false;
-        outcome.map_err(|error| error.message)
+        outcome.map_err(|error| error.message.to_string())
     }
 
     fn debug_snapshot(&self, line: usize) -> DebugSnapshot {
@@ -962,6 +1046,15 @@ impl<'p, 'o> Runtime<'p, 'o> {
 
     fn exec(&mut self, stmt: &Stmt) -> Result<Flow, RuntimeError> {
         let line = stmt_line(stmt);
+        if self.count_stats {
+            self.stats.statements += 1;
+        }
+        if self.trace {
+            (self.out)(&format!(
+                "{} 第 {line} 行",
+                crate::interpreter::TRACE_PREFIX
+            ));
+        }
         self.tick(line)?;
         self.debug_check(line)?;
 
@@ -1087,13 +1180,17 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 suffix,
                 line,
             } => {
-                if self.find_slot(target).is_none()
+                // `Property Let` 很少见：没有任何 Let 过程时跳过这次变量查找。
+                if !self.lets.is_empty()
+                    && self.find_slot(target).is_none()
                     && let Some(procedure) = self.lets.get(target).copied()
                 {
                     return self.call_property_let(procedure, &[], value, *line);
                 }
                 let value = self.eval(value, *line)?;
+                // 只有带类型后缀（`x$ = ...`）才可能在这里隐式声明。
                 if !self.option_explicit
+                    && suffix.is_some()
                     && self.find_slot(target).is_none()
                     && let Some(ty) = suffix.and_then(VbType::from_suffix)
                 {
@@ -1108,7 +1205,8 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 value,
                 line,
             } => {
-                if self.find_slot(name).is_none()
+                if !self.lets.is_empty()
+                    && self.find_slot(name).is_none()
                     && let Some(procedure) = self.lets.get(name).copied()
                 {
                     return self.call_property_let(procedure, indices, value, *line);
@@ -1141,6 +1239,9 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     return Ok(Flow::Normal);
                 }
                 let indices = self.eval_indices(indices, *line)?;
+                if self.count_stats {
+                    self.stats.array_accesses += 1;
+                }
                 let array = current
                     .as_array()
                     .map_err(|message| RuntimeError::new(format!("`{name}` {message}"), *line))?;
@@ -1268,13 +1369,16 @@ impl<'p, 'o> Runtime<'p, 'o> {
                         .set(&path[0], &value)
                         .map_err(|message| RuntimeError::new(message, *line).with_number(438))?,
                     Value::ComObject(_) => {
-                        return Err(RuntimeError::new(
-                            "COM 属性暂不支持链式成员赋值",
-                            *line,
-                        ));
+                        return Err(RuntimeError::new("COM 属性暂不支持链式成员赋值", *line));
                     }
                     Value::Class(instance) => {
-                        self.assign_instance_member(&instance.0, path, &Expr::Literal(value), true, *line)?;
+                        self.assign_instance_member(
+                            &instance.0,
+                            path,
+                            &Expr::Literal(value),
+                            true,
+                            *line,
+                        )?;
                     }
                     _ => self.assign_member(root, path, value, *line)?,
                 }
@@ -1316,10 +1420,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
             } => {
                 let value = self.eval(subject, *line)?;
                 if !value.is_record() && !value.is_object() {
-                    return Err(RuntimeError::new(
-                        "`With` 需要记录或对象值",
-                        *line,
-                    ));
+                    return Err(RuntimeError::new("`With` 需要记录或对象值", *line));
                 }
                 self.with_stack.push(value);
                 let outcome = self.exec_block(body);
@@ -1612,14 +1713,14 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     FileMode::Input => {
                         let file = File::open(&resolved).map_err(|error| {
                             RuntimeError::new(format!("无法打开 `{path}`：{error}"), *line)
-                                .with_number(io_error_number(&error))
+                                .with_number(open_error_number(&error, &resolved))
                         })?;
                         FileHandle::Reader(BufReader::new(file))
                     }
                     FileMode::Output => {
                         let file = File::create(&resolved).map_err(|error| {
                             RuntimeError::new(format!("无法创建 `{path}`：{error}"), *line)
-                                .with_number(io_error_number(&error))
+                                .with_number(open_error_number(&error, &resolved))
                         })?;
                         FileHandle::Writer(FileWriter::new(file))
                     }
@@ -1630,7 +1731,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                             .open(&resolved)
                             .map_err(|error| {
                                 RuntimeError::new(format!("无法追加 `{path}`：{error}"), *line)
-                                    .with_number(io_error_number(&error))
+                                    .with_number(open_error_number(&error, &resolved))
                             })?;
                         FileHandle::Writer(FileWriter::new(file))
                     }
@@ -1643,7 +1744,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                             .open(&resolved)
                             .map_err(|error| {
                                 RuntimeError::new(format!("无法打开 `{path}`：{error}"), *line)
-                                    .with_number(io_error_number(&error))
+                                    .with_number(open_error_number(&error, &resolved))
                             })?;
                         FileHandle::Binary(BinaryFile::new(file, record_len))
                     }
@@ -1685,10 +1786,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 };
                 let text = self.render_print(values, seps, start_column, *line)?;
                 let Some(FileHandle::Writer(writer)) = self.files.get_mut(&number) else {
-                    return Err(RuntimeError::new(
-                        format!("文件号 #{number} 不是以 Output/Append 打开"),
-                        *line,
-                    ));
+                    return Err(writer_error(&self.files, number, *line));
                 };
                 writer
                     .write_line(&text, *suppress_newline)
@@ -1708,10 +1806,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     RuntimeError::new(format!("`Width` 的宽度必须是整数：{message}"), *line)
                 })?;
                 let Some(FileHandle::Writer(writer)) = self.files.get_mut(&number) else {
-                    return Err(RuntimeError::new(
-                        format!("文件号 #{number} 不是以 Output/Append 打开"),
-                        *line,
-                    ));
+                    return Err(writer_error(&self.files, number, *line));
                 };
                 writer.width = width.max(0) as usize;
                 Ok(Flow::Normal)
@@ -1731,10 +1826,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 }
                 let text = format!("{}\r\n", fields.join(","));
                 let Some(FileHandle::Writer(writer)) = self.files.get_mut(&number) else {
-                    return Err(RuntimeError::new(
-                        format!("文件号 #{number} 不是以 Output/Append 打开"),
-                        *line,
-                    ));
+                    return Err(writer_error(&self.files, number, *line));
                 };
                 writer.write_raw(&text).map_err(|error| {
                     RuntimeError::new(format!("写入 #{number} 失败：{error}"), *line)
@@ -1968,14 +2060,8 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 let position = self.eval(position, *line)?.as_int().map_err(|message| {
                     RuntimeError::new(format!("文件位置必须是整数：{message}"), *line)
                 })?;
-                let Some(FileHandle::Binary(file)) = self.files.get_mut(&number) else {
-                    return Err(RuntimeError::new(
-                        format!("文件号 #{number} 不是以 Binary 或 Random 打开"),
-                        *line,
-                    )
-                    .with_number(54));
-                };
-                file.move_to(position, *line)?;
+                self.binary_file_mut(number, *line)?
+                    .move_to(position, *line)?;
                 Ok(Flow::Normal)
             }
             Stmt::ErrRaise {
@@ -1988,7 +2074,9 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     RuntimeError::new(format!("错误号必须是整数：{message}"), *line)
                 })?;
                 let source = match source {
-                    Some(expr) => Some(self.eval(expr, *line)?.to_display()),
+                    Some(expr) => Some(std::sync::Arc::from(
+                        self.eval(expr, *line)?.to_display().as_str(),
+                    )),
                     None => None,
                 };
                 let description = match description {
@@ -2033,8 +2121,16 @@ impl<'p, 'o> Runtime<'p, 'o> {
             exact_int(&end_value),
             step_expression.as_ref().map_or(Some(1), exact_int),
         ) {
+            // 计数器单元只在进入循环时解析一次（VB 的 `For` 计数也是按帧偏移直取）。
+            let mut counter_slot = self.find_slot(var);
+            let counter_type = counter_slot
+                .as_ref()
+                .map_or(VbType::Variant, |slot| slot.ty());
             loop {
                 self.tick(line)?;
+                if self.count_stats {
+                    self.stats.statements += 1;
+                }
                 let in_range = if step > 0 {
                     current <= limit
                 } else {
@@ -2043,17 +2139,34 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 if !in_range {
                     break;
                 }
-                self.set_var(var, Value::Int(current), line)?;
+                match &counter_slot {
+                    Some(slot) => self.store_in(slot, var, Value::Int(current), line)?,
+                    None => {
+                        self.set_var(var, Value::Int(current), line)?;
+                        counter_slot = self.find_slot(var);
+                    }
+                }
                 match self.exec_block(body)? {
                     Flow::Normal | Flow::ExitDo => {}
                     Flow::ExitFor => return Ok(Flow::Normal),
                     other => return Ok(other),
                 }
-                // 计数器溢出时结束循环，避免整数回绕成死循环。
+                // 计数器是 `Variant` / `LongLong` 时，i64 溢出就结束循环，避免回绕成死循环；
+                // 声明成 `Integer` / `Long` / `Byte` 时按该类型的范围检查并报错误号 6（见下）。
                 let Some(next) = current.checked_add(step) else {
                     break;
                 };
+                // 声明成整数类型时按该类型的范围检查：VB6 在 `Next` 里溢出报错误号 6。
+                if let Some((min, max)) = integer_bounds(counter_type)
+                    && (next < min || next > max)
+                {
+                    return Err(RuntimeError::new("溢出", line).with_number(6));
+                }
                 current = next;
+            }
+            // VB 的 `For` 走完时计数器停在「第一个不满足条件的值」（`For i = 1 To 4` 之后 `i` 是 5）。
+            if let Some(slot) = &counter_slot {
+                self.store_in(slot, var, Value::Int(current), line)?;
             }
             return Ok(Flow::Normal);
         }
@@ -2066,9 +2179,13 @@ impl<'p, 'o> Runtime<'p, 'o> {
             .map_err(|message| RuntimeError::new(message, line))?;
         // 累积误差与步长同阶：按步长的相对量给容差，而不是固定 1e-9。
         let tolerance = step_value.abs() * 1e-9;
+        let mut counter_slot = self.find_slot(var);
 
         loop {
             self.tick(line)?;
+            if self.count_stats {
+                self.stats.statements += 1;
+            }
             let in_range = if step_value > 0.0 {
                 current <= limit + tolerance
             } else {
@@ -2077,13 +2194,23 @@ impl<'p, 'o> Runtime<'p, 'o> {
             if !in_range {
                 break;
             }
-            self.set_var(var, number_value(current), line)?;
+            match &counter_slot {
+                Some(slot) => self.store_in(slot, var, number_value(current), line)?,
+                None => {
+                    self.set_var(var, number_value(current), line)?;
+                    counter_slot = self.find_slot(var);
+                }
+            }
             match self.exec_block(body)? {
                 Flow::Normal | Flow::ExitDo => {}
                 Flow::ExitFor => break,
                 other => return Ok(other),
             }
             current += step_value;
+        }
+        // 与整数循环一致：正常结束后计数器停在越界后的那个值。
+        if let Some(slot) = &counter_slot {
+            self.store_in(slot, var, number_value(current), line)?;
         }
         Ok(Flow::Normal)
     }
@@ -2197,6 +2324,9 @@ impl<'p, 'o> Runtime<'p, 'o> {
         }
         let declared = match expr {
             Expr::Var(name) => self.find_slot(name).map(|slot| slot.ty()),
+            // `Put #1, , CByte(65)`：转换函数的结果宽度由函数决定，不能按动态类型猜
+            // （`CByte` 的值在解释器里是 `Int`，猜成 Integer 会写 2 字节）。
+            Expr::Call { name, .. } => conversion_type(name),
             _ => None,
         };
         let ty = match declared {
@@ -2457,17 +2587,38 @@ impl<'p, 'o> Runtime<'p, 'o> {
     }
 
     /// 求一组下标表达式，统一转成 `i32`。
-    fn eval_indices(&mut self, exprs: &[Expr], line: usize) -> Result<Vec<i32>, RuntimeError> {
-        let mut indices = Vec::with_capacity(exprs.len());
-        for expr in exprs {
-            let value = self.eval(expr, line)?.as_int().map_err(|message| {
-                RuntimeError::new(format!("数组下标必须是整数：{message}"), line).with_number(9)
-            })?;
-            indices.push(i32::try_from(value).map_err(|_| {
-                RuntimeError::new(format!("数组下标 {value} 超出范围"), line).with_number(9)
-            })?);
+    /// 求值一组下标。常见 1–2 维走栈上缓冲，不再每次访问数组都分配 `Vec`。
+    fn eval_indices(&mut self, exprs: &[Expr], line: usize) -> Result<IndexBuf, RuntimeError> {
+        if exprs.len() <= INLINE_DIMS {
+            let mut indices = IndexBuf {
+                inline: [0; INLINE_DIMS],
+                len: exprs.len(),
+                heap: Vec::new(),
+            };
+            for (position, expr) in exprs.iter().enumerate() {
+                indices.inline[position] = self.eval_index(expr, line)?;
+            }
+            Ok(indices)
+        } else {
+            let mut heap = Vec::with_capacity(exprs.len());
+            for expr in exprs {
+                heap.push(self.eval_index(expr, line)?);
+            }
+            Ok(IndexBuf {
+                inline: [0; INLINE_DIMS],
+                len: exprs.len(),
+                heap,
+            })
         }
-        Ok(indices)
+    }
+
+    fn eval_index(&mut self, expr: &Expr, line: usize) -> Result<i32, RuntimeError> {
+        let value = self.eval(expr, line)?.as_int().map_err(|message| {
+            RuntimeError::new(format!("数组下标必须是整数：{message}"), line).with_number(9)
+        })?;
+        i32::try_from(value).map_err(|_| {
+            RuntimeError::new(format!("数组下标 {value} 超出范围"), line).with_number(9)
+        })
     }
 
     // ---------- 类（`Class ... End Class`）----------
@@ -2981,14 +3132,15 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 "description" => Value::Str(
                     self.last_error
                         .as_ref()
-                        .map(|error| error.message.clone())
+                        .map(|error| error.message.to_string())
                         .unwrap_or_default(),
                 ),
                 "source" => Value::Str(
                     self.last_error
                         .as_ref()
-                        .and_then(|error| error.source.clone())
-                        .unwrap_or_else(|| "vb".into()),
+                        .and_then(|error| error.source.as_deref())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "vb".to_string()),
                 ),
                 _ => return Err(RuntimeError::new(format!("`Err` 没有属性 `{name}`"), line)),
             });
@@ -3251,6 +3403,9 @@ impl<'p, 'o> Runtime<'p, 'o> {
     // ---------- 表达异 ----------
 
     fn eval(&mut self, expr: &Expr, line: usize) -> Result<Value, RuntimeError> {
+        if self.count_stats {
+            self.stats.expressions += 1;
+        }
         self.tick(line)?;
         match expr {
             Expr::Literal(value) => Ok(value.clone()),
@@ -3266,6 +3421,9 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 line,
             )),
             Expr::Var(name) => {
+                if self.count_stats {
+                    self.stats.variable_reads += 1;
+                }
                 if let Some(slot) = self.find_slot(name) {
                     return Ok(slot.value());
                 }
@@ -3465,6 +3623,17 @@ impl<'p, 'o> Runtime<'p, 'o> {
         by_value_args: &[bool],
         line: usize,
     ) -> Result<Value, RuntimeError> {
+        if self.count_stats {
+            self.stats.calls += 1;
+        }
+        // `IsMissing` 判定的是"实参有没有省略"，只能从参数槽读，所以在分派前单独处理。
+        if name == "ismissing" {
+            let missing = match args.first() {
+                Some(Expr::Var(var)) => self.find_slot(var).is_some_and(|slot| slot.is_missing()),
+                _ => false,
+            };
+            return Ok(Value::Bool(missing));
+        }
         if matches!(name, "createobject" | "getobject") {
             if let Some(message) = &self.com_error {
                 return Err(RuntimeError::new(message.clone(), line).with_number(429));
@@ -3620,7 +3789,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
             let outcome = builtins::call(name, values, &mut ctx);
             let failure = ctx.failure;
             return outcome.map_err(|message| {
-                let error = RuntimeError::new(message, line);
+                let error = RuntimeError::from_coerce(message, line);
                 match failure {
                     Some(number) => error.with_number(number),
                     None => error,
@@ -3641,6 +3810,9 @@ impl<'p, 'o> Runtime<'p, 'o> {
         args: &[Expr],
         line: usize,
     ) -> Result<Value, RuntimeError> {
+        if self.count_stats {
+            self.stats.array_accesses += 1;
+        }
         let indices = self.eval_indices(args, line)?;
         let array = array
             .as_array()
@@ -3729,9 +3901,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         // `max_depth` 是逻辑上的层数；真正先到顶的往往是物理栈（debug 构建每层几十 KB）。
         // 与其让进程被栈溢出直接终止，不如在这里报 VB 的错误号 28。
         if stack_headroom() < MIN_CALL_STACK {
-            return Err(
-                RuntimeError::new("调用层次过深（栈空间不足）", line).with_number(28)
-            );
+            return Err(RuntimeError::new("调用层次过深（栈空间不足）", line).with_number(28));
         }
         if args.len() > procedure.params.len()
             && !procedure.params.iter().any(|param| param.param_array)
@@ -3746,6 +3916,8 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 line,
             ));
         }
+        // 参数与返回值都要塞进局部表：先按数量预留，省掉逐次扩容的哈希搬迁。
+        locals.reserve(procedure.params.len() + 1);
         for (index, param) in procedure.params.iter().enumerate() {
             if param.param_array {
                 // `ParamArray xs()`：把剩下的实参打包成 0 基 Variant 数组。
@@ -3766,7 +3938,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     by_value_args.get(index).copied().unwrap_or(false),
                     line,
                 )?,
-                None if param.optional => self.bind_default(param, line)?,
+                None if param.optional => self.bind_default(param, line)?.omitted_optional(),
                 None => {
                     return Err(RuntimeError::new(
                         format!("过程 `{}` 缺少参数 `{}`", procedure.name, param.name),
@@ -4268,9 +4440,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
             ));
         }
         if stack_headroom() < MIN_CALL_STACK {
-            return Err(
-                RuntimeError::new("调用层次过深（栈空间不足）", line).with_number(28)
-            );
+            return Err(RuntimeError::new("调用层次过深（栈空间不足）", line).with_number(28));
         }
         for (index, param) in procedure.params.iter().enumerate() {
             let value = match values.get(index) {
@@ -4805,6 +4975,32 @@ fn flush_file(handle: FileHandle) {
     }
 }
 
+/// 转换函数（`CByte` / `CInt` …）的结果声明类型：`Put #` 用它决定写几个字节。
+fn conversion_type(name: &str) -> Option<VbType> {
+    Some(match name {
+        "cbyte" => VbType::Byte,
+        "cint" => VbType::Integer,
+        "clng" => VbType::Long,
+        "csng" => VbType::Single,
+        "cdbl" => VbType::Double,
+        "ccur" => VbType::Currency,
+        "cdate" => VbType::Date,
+        "cbool" => VbType::Boolean,
+        "cstr" => VbType::Str,
+        _ => return None,
+    })
+}
+
+/// 整数类型的取值范围（`Variant` 等没有固定范围，返回 `None`）。
+fn integer_bounds(ty: VbType) -> Option<(i64, i64)> {
+    match ty {
+        VbType::Byte => Some((0, 255)),
+        VbType::Integer => Some((i16::MIN as i64, i16::MAX as i64)),
+        VbType::Long => Some((i32::MIN as i64, i32::MAX as i64)),
+        _ => None,
+    }
+}
+
 /// 把 IO 错误映射成 VB 错误号。
 fn io_error_number(error: &std::io::Error) -> i64 {
     match error.kind() {
@@ -4813,6 +5009,29 @@ fn io_error_number(error: &std::io::Error) -> i64 {
         std::io::ErrorKind::AlreadyExists => 58,
         std::io::ErrorKind::UnexpectedEof => 62,
         _ => 57,
+    }
+}
+
+/// 打开文件时的错误号：父目录不存在是 VB 的 76（路径未找到），目录在但文件不在才是 53。
+fn open_error_number(error: &std::io::Error, path: &Path) -> i64 {
+    if error.kind() == std::io::ErrorKind::NotFound
+        && let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        return 76;
+    }
+    io_error_number(error)
+}
+
+/// 目标文件号不能用时的错误：没打开是 VB 的 52（错误的文件名或号码），
+/// 打开了但模式不对是 54（文件模式错误）。
+fn writer_error(files: &HashMap<i32, FileHandle>, number: i32, line: usize) -> RuntimeError {
+    if files.contains_key(&number) {
+        RuntimeError::new(format!("文件号 #{number} 不是以 Output/Append 打开"), line)
+            .with_number(54)
+    } else {
+        RuntimeError::new(format!("文件号 #{number} 没有打开"), line).with_number(52)
     }
 }
 
@@ -4908,14 +5127,21 @@ fn exact_int(value: &Value) -> Option<i64> {
 
 /// 字符串拼接：两侧都是字符串时直接拷贝，省掉 `to_display` 的临时副本。
 fn concat_text(left: &Value, right: &Value) -> String {
+    // VB 的 `&` 把 `Null` 当成空串（`"a" & Null` 是 `"a"`，与 `+` 传播 Null 不同）。
+    let display = |value: &Value| match value {
+        Value::Null => String::new(),
+        other => other.to_display(),
+    };
     let (left, right) = match (left, right) {
-        (Value::Str(left), Value::Str(right)) => return {
-            let mut text = String::with_capacity(left.len() + right.len());
-            text.push_str(left);
-            text.push_str(right);
-            text
-        },
-        _ => (left.to_display(), right.to_display()),
+        (Value::Str(left), Value::Str(right)) => {
+            return {
+                let mut text = String::with_capacity(left.len() + right.len());
+                text.push_str(left);
+                text.push_str(right);
+                text
+            };
+        }
+        _ => (display(left), display(right)),
     };
     let mut text = String::with_capacity(left.len() + right.len());
     text.push_str(&left);
@@ -4965,7 +5191,7 @@ fn currency_scaled(value: &Value) -> Result<i64, String> {
 
 fn currency_ratio(numerator: i128, denominator: i128) -> Result<i64, String> {
     if denominator == 0 {
-        return Err("除数为 0".into());
+        return Err("除数为零".into());
     }
     let negative = (numerator < 0) ^ (denominator < 0);
     let numerator = numerator.unsigned_abs();
@@ -5109,21 +5335,32 @@ fn like_match(value: &str, pattern: &str, compare_text: bool) -> bool {
         } else {
             match &tokens[token_index] {
                 LikeToken::AnySequence => {
-                    matches(tokens, chars, token_index + 1, char_index, compare_text, memo)
-                        || (char_index < chars.len()
-                            && matches(
-                                tokens,
-                                chars,
-                                token_index,
-                                char_index + 1,
-                                compare_text,
-                                memo,
-                            ))
+                    matches(
+                        tokens,
+                        chars,
+                        token_index + 1,
+                        char_index,
+                        compare_text,
+                        memo,
+                    ) || (char_index < chars.len()
+                        && matches(
+                            tokens,
+                            chars,
+                            token_index,
+                            char_index + 1,
+                            compare_text,
+                            memo,
+                        ))
                 }
                 _ if char_index >= chars.len() => false,
-                LikeToken::AnyCharacter => {
-                    matches(tokens, chars, token_index + 1, char_index + 1, compare_text, memo)
-                }
+                LikeToken::AnyCharacter => matches(
+                    tokens,
+                    chars,
+                    token_index + 1,
+                    char_index + 1,
+                    compare_text,
+                    memo,
+                ),
                 LikeToken::Digit => {
                     chars[char_index].is_ascii_digit()
                         && matches(
@@ -5193,7 +5430,55 @@ fn apply_binary(
     line: usize,
     compare_text: bool,
 ) -> Result<Value, RuntimeError> {
-    let fail = |message: String| RuntimeError::new(message, line);
+    let fail = |message: String| RuntimeError::from_coerce(message, line);
+
+    // `Null` 参与算术或比较时结果仍是 `Null`（VB 的传播规则，`&` 例外：当成空串）。
+    if matches!(
+        op,
+        BinOp::Add
+            | BinOp::Subtract
+            | BinOp::Multiply
+            | BinOp::Divide
+            | BinOp::IntDivide
+            | BinOp::Modulo
+            | BinOp::Power
+            | BinOp::Eq
+            | BinOp::NotEq
+            | BinOp::Lt
+            | BinOp::Gt
+            | BinOp::LtEq
+            | BinOp::GtEq
+            | BinOp::Like
+    ) && (matches!(left, Value::Null) || matches!(right, Value::Null))
+    {
+        return Ok(Value::Null);
+    }
+
+    // 最常见的 `Long op Long`：先走整数快路径，省掉下面逐层 `matches!` 与 `as_int` 的 Result 开销。
+    // 语义与后面的通用分支完全一致（溢出仍是错误号 6，除零仍是 11）。
+    if let (Value::Int(left), Value::Int(right)) = (&left, &right)
+        && matches!(
+            op,
+            BinOp::Add | BinOp::Subtract | BinOp::Multiply | BinOp::IntDivide | BinOp::Modulo
+        )
+    {
+        let computed = match op {
+            BinOp::Add => left.checked_add(*right),
+            BinOp::Subtract => left.checked_sub(*right),
+            BinOp::Multiply => left.checked_mul(*right),
+            BinOp::IntDivide if *right == 0 => {
+                return Err(fail("除数为零".into()).with_number(11));
+            }
+            BinOp::Modulo if *right == 0 => {
+                return Err(fail("除数为零".into()).with_number(11));
+            }
+            BinOp::IntDivide => left.checked_div(*right),
+            _ => left.checked_rem(*right),
+        };
+        return Ok(Value::Int(
+            computed.ok_or_else(|| fail("数值溢出".into()).with_number(6))?,
+        ));
+    }
 
     Ok(match op {
         BinOp::Concat => Value::Str(concat_text(&left, &right)),
@@ -5217,15 +5502,15 @@ fn apply_binary(
                     compare_text,
                 ))
             } else {
-            let ordering = compare_values(&left, &right, compare_text).map_err(fail)?;
-            Value::Bool(match op {
-                BinOp::Eq => ordering == Ordering::Equal,
-                BinOp::NotEq => ordering != Ordering::Equal,
-                BinOp::Lt => ordering == Ordering::Less,
-                BinOp::Gt => ordering == Ordering::Greater,
-                BinOp::LtEq => ordering != Ordering::Greater,
-                _ => ordering != Ordering::Less,
-            })
+                let ordering = compare_values(&left, &right, compare_text).map_err(fail)?;
+                Value::Bool(match op {
+                    BinOp::Eq => ordering == Ordering::Equal,
+                    BinOp::NotEq => ordering != Ordering::Equal,
+                    BinOp::Lt => ordering == Ordering::Less,
+                    BinOp::Gt => ordering == Ordering::Greater,
+                    BinOp::LtEq => ordering != Ordering::Greater,
+                    _ => ordering != Ordering::Less,
+                })
             }
         }
         BinOp::And | BinOp::Or | BinOp::Xor | BinOp::Eqv | BinOp::Imp => {
@@ -5254,14 +5539,14 @@ fn apply_binary(
         BinOp::Divide => {
             let divisor = right.as_float().map_err(fail)?;
             if divisor == 0.0 {
-                return Err(fail("除数为 0".into()).with_number(11));
+                return Err(fail("除数为零".into()).with_number(11));
             }
             Value::Float(left.as_float().map_err(fail)? / divisor)
         }
         BinOp::IntDivide => {
             let divisor = right.as_int().map_err(fail)?;
             if divisor == 0 {
-                return Err(fail("除数为 0".into()).with_number(11));
+                return Err(fail("除数为零".into()).with_number(11));
             }
             // `LongLong` 最小值除以 -1 会溢出，VB 报错误号 6 而不是崩溃。
             let quotient = left
@@ -5274,7 +5559,7 @@ fn apply_binary(
         BinOp::Modulo => {
             let divisor = right.as_int().map_err(fail)?;
             if divisor == 0 {
-                return Err(fail("除数为 0".into()).with_number(11));
+                return Err(fail("除数为零".into()).with_number(11));
             }
             let remainder = left
                 .as_int()

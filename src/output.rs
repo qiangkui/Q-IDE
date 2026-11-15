@@ -21,11 +21,8 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use gpui_kit::component::button::*;
-use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::*;
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::theme::{self as ui_theme, Palette};
@@ -298,7 +295,9 @@ impl OutputLog {
 
     /// 第 `index` 行可见内容；`index` 超出可见范围时为 `None`。
     pub fn visible_line(&self, index: usize) -> Option<&OutputLine> {
-        self.visible.get(index).and_then(|line| self.lines.get(*line))
+        self.visible
+            .get(index)
+            .and_then(|line| self.lines.get(*line))
     }
 
     /// 设置过滤条件；条件没变时什么都不做。
@@ -515,10 +514,7 @@ impl OutputLog {
     pub fn position_at(&self, position: Point<Pixels>) -> Option<TextPosition> {
         let visible = self.visible.len();
         let geometry = self.geometry.borrow();
-        if visible == 0
-            || geometry.layouts.len() != visible
-            || geometry.rows.len() != visible
-        {
+        if visible == 0 || geometry.layouts.len() != visible || geometry.rows.len() != visible {
             return None;
         }
 
@@ -785,36 +781,19 @@ impl OutputHandle {
     }
 }
 
-/// 过滤条上「只看错误」按钮的回调。
-pub type FilterToggle = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
-
 /// 输出面板的渲染参数。
 pub struct OutputPanelProps<'a> {
     pub log: &'a OutputLog,
     /// 面板自身的实体：鼠标与键盘回调通过它更新选区。
     pub entity: Entity<OutputLog>,
     pub palette: Palette,
-    /// Dock 内由容器决定高度时为 `None`。
-    pub height: Option<f32>,
     pub font_size: f32,
-    /// 过滤输入框；`None` 表示不显示过滤条。
-    pub filter_input: Option<Entity<InputState>>,
-    /// 「只看错误」是否选中。
-    pub only_errors: bool,
-    /// 点「只看错误」时调用（切换开关）。
-    pub on_toggle_only_errors: Option<FilterToggle>,
 }
 
-/// 渲染输出面板：标题栏（复制 / 清空 / 关闭）+ 可滚动的日志区。
+/// 渲染输出面板的日志区（标题栏与标签栏由 `OutputPanel` 负责）。
 ///
 /// 日志区里可以拖动鼠标选择文字、双击选整行、Ctrl+A 全选，Ctrl+C 复制选区。
-pub fn render(
-    props: OutputPanelProps<'_>,
-    on_copy: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    on_clear: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    show_header: bool,
-) -> AnyElement {
+pub fn render_body(props: OutputPanelProps<'_>) -> AnyElement {
     let palette = props.palette;
     let log = props.log;
 
@@ -825,7 +804,7 @@ pub fn render(
         geometry.rows.clear();
     }
 
-    let body: AnyElement = if log.is_empty() {
+    if log.is_empty() {
         div()
             .flex_1()
             .w_full()
@@ -860,115 +839,7 @@ pub fn render(
             .into_any_element()
     } else {
         log_body(log, props.entity, palette, props.font_size)
-    };
-
-    let mut panel = v_flex()
-        .bg(rgb(palette.sidebar_bg))
-        .rounded(px(ui_theme::PANE_RADIUS))
-        .border_1()
-        .border_color(rgba(palette.border))
-        .overflow_hidden();
-    panel = match props.height {
-        Some(height) => panel.h(px(height)).w_full().flex_shrink_0(),
-        None => panel.w_full().h_full().min_h_0(),
-    };
-
-    panel
-        .when(show_header, |this| {
-            this.child(
-                h_flex()
-                    .h(px(ui_theme::PANEL_HEADER_HEIGHT))
-                    .flex_shrink_0()
-                    .items_center()
-                    .justify_between()
-                    .px(px(12.0))
-                    .border_b_1()
-                    .border_color(rgba(palette.border))
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(palette.sidebar_text))
-                                    .child("输出"),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(palette.file))
-                                    .child(log.channel().clone()),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                Button::new("output-copy")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::Copy)
-                                    .label(if log.has_selection() {
-                                        "复制选区"
-                                    } else {
-                                        "复制"
-                                    })
-                                    .disabled(log.is_empty())
-                                    .on_click(on_copy),
-                            )
-                            .child(
-                                Button::new("output-clear")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::Delete)
-                                    .label("清空")
-                                    .on_click(on_clear),
-                            )
-                            .when_some(props.on_toggle_only_errors.clone(), |this, toggle| {
-                                this.child(
-                                    Button::new("output-only-errors")
-                                        .ghost()
-                                        .xsmall()
-                                        .label("只看错误")
-                                        .selected(props.only_errors)
-                                        .on_click(move |event, window, cx| toggle(event, window, cx)),
-                                )
-                            })
-                            .when_some(props.filter_input.clone(), |this, field| {
-                                this.child(
-                                    div().w(px(150.0)).child(
-                                        Input::new(&field)
-                                            .xsmall()
-                                            .focus_ring(false)
-                                            .appearance(false),
-                                    ),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .id("output-close")
-                                    .flex_shrink_0()
-                                    .size(px(18.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(4.0))
-                                    .cursor(CursorStyle::PointingHand)
-                                    .hover(move |this| this.bg(rgba(palette.hover)))
-                                    .child(
-                                        Icon::new(IconName::ChevronDown)
-                                            .xsmall()
-                                            .text_color(rgb(palette.sidebar_text)),
-                                    )
-                                    .on_click(on_close),
-                            ),
-                    ),
-            )
-        })
-        .child(body)
-        .into_any_element()
+    }
 }
 
 /// 日志区：可滚动的行列表，支持鼠标拖选、双击选行、Ctrl+A 全选与 Ctrl+C 复制。

@@ -30,7 +30,7 @@
 
 ### 工作区
 
-- 资源管理器：多根目录、新建文件/文件夹、重命名、删除、复制路径、刷新；条目可拖到文件夹里移动，也可拖到标签栏直接打开。
+- 资源管理器：多根目录、新建文件/文件夹、重命名、删除、复制路径、刷新；条目可拖到文件夹里移动，也可拖到标签栏直接打开。根目录之外的条目左侧有灰色小圆点，点圆点进入选择模式（圆点变成更大的圆圈，选中项在圆圈中心显示实心点）：点条目只切换选中、不再打开文件，可批量删除选中项或拖动移动；根目录不参与选择，全部取消选中后自动退出选择模式。右键条目只会高亮该条目、不会打开文件，菜单里的「删除…」作用于右键指向的条目；批量删除用选择模式标题栏的删除按钮。
 - 项目内搜索（`Ctrl+Shift+F`）：大小写敏感、全词匹配、限定目录，后台线程扫描并实时显示进度；结果按文件分组、命中片段高亮，点击跳转。
 - 跨文件替换：只作用于本次搜索结果里的文件，沿用本次搜索的匹配选项。
 - 代码大纲：符号按模块/过程/类分组、可折叠、带过滤框；另有「断点」「监视」两节，调试暂停时显示变量值与类型。
@@ -38,18 +38,50 @@
 - 命令面板（`Ctrl+Shift+P`）：38 条命令，模糊匹配、回车执行，结果写进输出面板。
 - Dock 布局：编辑器居中、输出固定底部；左右两侧各最多放一个面板（资源管理器/代码大纲/搜索/AI 编程）。打开面板时，它偏好的那一侧空着就放那里，否则借用另一侧的空位，两侧都占满时替换偏好侧的面板；拖到已占用的一侧会关闭原面板。完整布局写入布局文件。
 - 主题：设置窗口「主题」页选择内置深色 / 浅色（只读）、已保存的自定义主题或「新建主题」；自定义主题可改名、改颜色（取色器或手填十六进制），改动直接替换同名主题并写入 `themes.txt`。设置窗口按分类分页（布局 / 主题 / 排版 / 保存 / 语法分析器 / 输出 / AI），点左侧导航直接切换。
-- AI 设置：设置窗口「AI」页里先是 **DeepSeek** 分组（以后接入其它模型时按模型分组），组内填 API 密钥、接口地址（默认 `https://api.deepseek.com`）与模型（默认 `deepseek-chat`）。密钥一行是「标签在前、输入框在后」，内容始终遮罩，只存进 Windows 凭据管理器，不写进 `layout.txt`；清空输入或点「清除」即删除。
+- AI 设置：设置窗口「AI」页里先是 **DeepSeek** 分组（以后接入其它模型时按模型分组），组内填 API 密钥、接口地址（默认 `https://api.deepseek.com`）与模型（默认 `deepseek-chat`）。密钥一行是「标签在前、输入框在后」，内容始终遮罩，只存进 Windows 凭据管理器，不写进 `layout.txt`；清空输入或点「清除」即删除。「外部 agent（MCP）」分组可开关接口、允许写入/删除/移动、危险操作跳过确认、允许运行脚本和调试与调用日志。
 - AI 对话：右侧 AI 编程面板里输入需求，回车或点「发送」发给 DeepSeek（OpenAI 兼容的 `/chat/completions`，`stream: true`）。发送时会**自动带上当前打开文件的路径与内容**（文件超过 4 万字符时在整行末尾截断并注明总长度与后续读取方式）。**请求长度有上限**：对话越积越多时先丢最早的那几轮（带「已省略」标记），仍然过长就把最长的工具输出截断（带「已截断」标记），面板里保存的对话始终是完整原文。回答**边生成边显示**：用户消息靠右、AI 消息靠左，各是一个圆角气泡；回复按 Markdown 渲染，代码块单独成块（更深底色 + 圆角边框，右上角浮着「复制」「写入」「展开/收起」，默认只露前 5 行）；消息文字可拖选，`Ctrl+C` 复制。标题栏右侧的「＋」开始新对话（清空内容与输入框、滚动回顶部、焦点回输入框并取消进行中的请求），「清空」只清掉对话内容、输入框里的草稿保留。
 - AI 固定规则：程序目录下的 `ai-rules/`（启动时自动补齐默认文件，不覆盖用户修改）。`common.md` 总是加载；VB 脚本加载 `vb.md`，Rust 源码加载内置的 `rust.md`，其它语言加载 `<语言>.md`（也可自行添加 `json.md`），没有就 `default.md`。每次请求重新读取，改完下一条消息生效；`QIDE_AI_RULES_DIR` 可改用其它目录。
-- AI 工具调用：模型可以自己调工具把活干完——`read_file` / `list_files` 看代码，`replace_in_file`（精确替换唯一片段）或 `write_file` 改文件，`check_syntax` 自查语法，`read_output` 看运行输出；用户明确要求运行或调试时，还可调用 `run_script` / `start_debug` / `debug_continue` / `debug_step` 执行脚本，使用 `set_breakpoint` 设置普通或条件断点，使用 `get_debug_state` 查看暂停行、调用栈和变量值，并用 `add_watch` 添加监视表达式。**交互方式、工具轮数与模型都在 AI 面板底栏（聊天输入框下方）切换**：左边按钮选「执行前确认」（默认，写文件或启动/推进脚本前弹确认卡片）或「全部允许」；旁边按钮选「6 轮」（默认）/「12 轮」/「一直执行」；右边按钮选当前用的 AI 模型（`deepseek-chat` / `deepseek-reasoner`，也可显示设置里的自定义模型）。生成过程中「发送」旁边会出现「停止」，可中断网络请求、工具循环或待确认的操作；停止后未完成的工具调用会补一条「已停止」结果，保证下一轮对话仍符合接口协议。推理模型 `deepseek-reasoner` 不支持函数调用，选中它时只聊天、不调用工具。路径限制在项目根目录内。
+- AI 工具调用：模型可以自己调工具把活干完——`read_file` / `list_files` 看代码，`replace_in_file`（精确替换唯一片段）或 `write_file` 改文件，`delete_path` / `move_path` 删除或移动文件（执行前会先确认），`check_syntax` 自查语法，`read_output` 看运行输出；用户明确要求运行或调试时，还可调用 `run_script` / `start_debug` / `debug_continue` / `debug_step` 执行脚本，使用 `set_breakpoint` 设置普通或条件断点，使用 `get_debug_state` 查看暂停行、调用栈和变量值，并用 `add_watch` 添加监视表达式。**交互方式、工具轮数与模型都在 AI 面板底栏（聊天输入框下方）切换**：左边按钮选「执行前确认」（默认，写文件或启动/推进脚本前弹确认卡片）或「全部允许」；旁边按钮选「6 轮」（默认）/「12 轮」/「一直执行」；右边按钮选当前用的 AI 模型（`deepseek-chat` / `deepseek-reasoner`，也可显示设置里的自定义模型）。生成过程中「发送」旁边会出现「停止」，可中断网络请求、工具循环或待确认的操作；停止后未完成的工具调用会补一条「已停止」结果，保证下一轮对话仍符合接口协议。推理模型 `deepseek-reasoner` 不支持函数调用，选中它时只聊天、不调用工具。路径限制在项目根目录内。
 - AI 写入文件：代码块右上角的「写入」会弹出路径输入框（默认是当前打开的文件，相对路径按项目根目录解析），确认后**用这段代码覆盖目标文件的全部内容**：文件已打开就直接替换编辑器内容并按原编码保存，没打开就写到磁盘再打开，同时刷新资源管理器与输出日志。
+
+### 外部 agent（MCP）
+
+Q-IDE 启动后会在本机回环地址（`127.0.0.1`）开一个带随机 token 的 agent 端口，并把端口/token 写到 `%APPDATA%\gpui-first\agent-endpoint.json`；`qide-mcp.exe` 负责把 MCP stdio 的请求转发进去。外部 agent 的 MCP 配置示例：
+
+```json
+{
+  "mcpServers": {
+    "qide": {
+      "command": "E:\\rust\\QIDE\\target\\debug\\qide-mcp.exe"
+    }
+  }
+}
+```
+
+**不需要先手动打开 Q-IDE**：`qide-mcp.exe` 连不上端点时，会在第一次工具调用里用 `--background` 后台拉起与它同目录的主程序（窗口出现但不抢焦点），每 250ms 重试一次，最多等 30 秒再把这次调用转发过去。`QIDE_APP` 可以指定主程序路径，`QIDE_AUTO_LAUNCH=0` 关闭自动拉起（此时调用会直接报「Q-IDE 未运行」）。Q-IDE 关闭时会删掉端点文件，下次调用同样会自动拉起。自动拉起的实例沿用 `layout.txt` 里的设置：如果「启用外部 agent 接口」是关闭的，它不会开端口，这次调用会等到超时并报错。
+
+当前工具：
+
+- `qide_get_app_state`：项目根、打开标签、活动文件、面板可见性、调试状态与最近输出
+- `qide_list_commands`：命令面板的命令 id / 名称 / 快捷键
+- `qide_list_files` / `qide_read_file`：列出/读取项目内文件（路径限制在项目根目录）
+- `qide_read_output`：输出面板最近 80 行
+- `qide_get_debug_state`：脚本运行状态、断点、监视
+- `qide_open_file`：在编辑器打开项目内文件（可带行号）
+- `qide_run_command`：执行白名单内的命令（保存、编辑动作、面板/主题切换）
+- `qide_write_file` / `qide_replace_in_file` / `qide_delete_path` / `qide_move_path`：写入、精确替换、删除、移动；默认只读，需要在设置里允许写入
+- `qide_check_syntax`：检查当前脚本语法，结果写进输出面板
+- `qide_run_script` / `qide_start_debug` / `qide_debug_continue` / `qide_debug_step` / `qide_debug_pause` / `qide_stop_execution`：运行与调试
+- `qide_set_breakpoint` / `qide_add_watch`：断点与监视表达式
+
+文件写入/删除/移动默认在执行前弹确认框；`qide_run_script` / `qide_start_debug` / `qide_debug_continue` / `qide_debug_step` 默认也先弹确认框，在设置窗口「AI → 外部 agent（MCP）」里打开「允许运行脚本和调试」后改为直接执行。设置窗口同一分组里还可以开关接口、允许写入、选择是否跳过文件操作确认，以及是否把调用写进输出面板。项目根目录不能被删除或移动。
 
 ### 运行与调试
 
 - `F5` 运行当前 VB 脚本，「检查语法」只解析不执行，「运行参数…」的内容由 `Command()` 读取。
 - 断点（`F9`）、条件断点、清除所有断点（`Ctrl+Shift+F9`）；调试运行（`Ctrl+F5`）、继续（`F11`）、单步（`F10`）、运行到光标处（`Ctrl+F10`）、停止脚本（`Shift+F5`）。
 - 暂停时可查看变量快照（值 + 类型）、调用栈、监视表达式求值结果；「添加监视…」的表达式会持久化。
-- 输出面板：单击「第 N 行…」跳转到对应代码、相邻重复错误合并计数、关键字过滤与「只看错误」、时间戳、最大保留行数。
+- 输出面板：单击「第 N 行…」跳转到对应代码、相邻重复错误合并计数、关键字过滤与「只看错误」、时间戳、最大保留行数；同一面板用固定标签页切换「输出」与「终端」。终端默认在项目根目录启动，提示符直接显示在输出区内（可上下键翻阅历史命令），用 `cmd /C` 执行命令（`cd` / `cls` 由终端自己维护），命令在后台线程运行，输出按 UTF-8 / UTF-16 / GBK 自动解码；每条命令在独立进程里执行，不共享上一条命令设置的环境变量。
 
 ### 脚本解释器
 
@@ -135,7 +167,7 @@ cargo run
 
 `Cargo.toml` 里的包名仍是早期的 `first`，所以可执行文件叫 `first.exe`；窗口标题与任务栏名称取自 `title_bar::APP_TITLE`，即 **Q-IDE**。
 
-`[patch.crates-io]` 把 `gpui-component` 指向 `vendor/gpui-component`（本地补丁：菜单字号更小、取消斜体；设置项说明文字比标题小一档），因此必须连同 `vendor/` 一起克隆，不能只复制 `src/`。
+`[patch.crates-io]` 把 `gpui-component` 指向 `vendor/gpui-component`（本地补丁：菜单字号更小、取消斜体；设置项说明文字比标题小一档；树的 `ListItem` 保留调用方设置的选中态，供资源管理器多选复用自带高亮），因此必须连同 `vendor/` 一起克隆，不能只复制 `src/`。
 
 ## 上手
 
@@ -184,19 +216,23 @@ Debug.Print "名字个数：" & names.Count
 | 路径 | 说明 |
 | --- | --- |
 | `src/main.rs` | 入口：解析命令行（`src/startup.rs`）、初始化 GPUI、设置与主题，按上次记录的窗口矩形开窗 |
-| `src/startup.rs` | 主程序命令行：文件/文件夹路径、`--help`、`--version`，以及没有控制台时的消息框兜底 |
+| `src/startup.rs` | 主程序命令行：文件/文件夹路径、`--help`、`--version`、`--background`，以及没有控制台时的消息框兜底 |
 | `src/app.rs` | `CodeWindow` 主体：窗口构造、共享状态、设置同步与通用辅助函数 |
 | `src/app/*.rs` | 子模块：`ai`（AI 写入文件）、`dock`（面板停靠）、`debug` / `breakpoints`（运行调试与断点）、`editor`（导航与编辑动作）、`files` / `session`（文件与会话）、`dialogs`（通用对话框）、`view`（界面渲染） |
 | `src/interpreter/` | VB 解释器：`lexer` / `parser` / `ast`、`runtime`、`ffi`、`builtins`、`debug`、`sema`、`dialog`、`filelock`、`trampoline` |
 | `src/bin/qide-run.rs` / `src/cli.rs` | 命令行运行器：只链接解释器与编码模块（不链接界面），提供 `run` / `check` 子命令、JSONL 事件与退出码 |
-| `src/panels.rs` | Dock 面板注册、面板标题栏按钮、面板右键菜单项 |
+| `src/bin/qide-mcp.rs` | MCP stdio 桥：把外部 agent 的 `tools/list` / `tools/call` 转发到 Q-IDE；Q-IDE 没在运行时自动用 `--background` 拉起主程序 |
+| `src/agent.rs` / `src/app/agent.rs` | 外部 agent 传输层与工具执行（回环 TCP + token、工具清单、状态/文件/安全命令） |
+| `src/panels.rs` | Dock 面板注册、面板标题栏按钮、面板右键菜单项；输出面板的「输出 / 终端」标签页 |
+| `src/output.rs` | 输出日志模型：级别、重复合并、过滤、行号链接 |
+| `src/terminal.rs` | 输出面板里的终端：内嵌提示符输入、上下键历史、后台执行、`cd` / `cls`、输出解码与滚动 |
 | `src/ai/client.rs` | DeepSeek 网络层：地址解析、请求体（含 tools）/应答解析、WinHTTP 流式调用；不依赖界面，可整体移植 |
 | `src/ai/stream.rs` | SSE 增量解析（纯逻辑，可单测）：字节流 → 文本增量 / 工具调用增量 |
 | `src/ai/markdown.rs` | 极简 Markdown 分段：把回复拆成说明文字与围栏代码块（纯逻辑） |
 | `src/ai/tools.rs` | 工具层：工具清单（JSON Schema）+ 把一次调用算成只读结果或待写入文件（路径限制在项目内） |
 | `src/ai/panel.rs` | AI 编程面板（GPUI）：对话气泡、工具活动、写入确认、代码块折叠/展开/复制、流式追加、输入框、关闭与拖动 |
 | `src/editor_pane.rs` | 编辑区面板：标签栏、路径栏、编辑器右键菜单 |
-| `src/explorer.rs` | 资源管理器模型：根目录、展开状态、拖拽、重命名/删除 |
+| `src/explorer.rs` | 资源管理器模型：根目录、展开状态、拖拽、重命名/删除；圆点触发的选择模式与多选状态 |
 | `src/outline.rs` | 代码大纲、符号解析、转到定义 / 查找引用 |
 | `src/search.rs` | 项目内搜索与跨文件替换的纯逻辑 |
 | `src/layout.rs` | `layout.txt` 的读写与版本迁移 |
@@ -207,7 +243,7 @@ Debug.Print "名字个数：" & names.Count
 | `src/theme.rs` | 内置深/浅配色、自定义主题解析结果与尺寸常量 |
 | `src/*_tests.rs` | crate 级测试文件（在 `src/main.rs` 里用 `#[cfg(test)] mod ...;` 引入） |
 | `assets/`、`app.rc`、`run.rc`、`build.rs` | 图标：`first.exe` 用深蓝的 `app.ico`，`qide-run.exe` 用浅绿的 `run.ico` |
-| `vendor/gpui-component/` | gpui-component 本地补丁 |
+| `vendor/gpui-component/` | gpui-component 本地补丁（菜单字号/斜体、设置项说明文字、树保留调用方选中态） |
 | `docs/` | 项目文档 |
 
 ## 配置与数据
@@ -250,7 +286,7 @@ cargo clippy --all-targets
 - 解释器支持基础 COM Automation（`CreateObject`、活动对象/新对象/moniker `GetObject`、文件和 ProgID `GetObject`、位置/命名参数方法与属性读写）；命名参数要求 COM 组件通过 `IDispatch` 暴露形参名，可写标量/字符串变量按 `ByRef VARIANT` 传递，一维 Variant 数组按值转换为 `SAFEARRAY`；多维/强类型数组、UDT 记录封送、COM 事件及 `Implements` 尚不支持。文件中的 `GetObject` 依赖已注册且支持 `IPersistFile` 的类。`Currency` 使用四位小数定点数；`Date` 是独立类型，内部以 OLE Automation `Double` 序列存储。
 - Win32 调用最多支持 64 个标量参数；结构体里的变长 `String` 仍不支持。
 - `AddressOf` 回调最多支持 64 个参数，需在脚本仍运行的同一线程执行；其他线程的回调会返回默认值。可在 API 调用返回后由脚本持有回调指针，但脚本结束后不会再进入解释器，数组形参因原生指针不包含长度/边界信息而不支持。
-- 资源管理器暂不支持多选（受当前树组件的行选中态限制）。
+- 资源管理器多选通过条目左侧圆点进入（根目录不可选中）；选择模式下只支持删除选中项和拖动移动，不提供批量重命名等其它操作。
 
 ## 声明
 

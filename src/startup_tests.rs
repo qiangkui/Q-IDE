@@ -5,7 +5,17 @@ use std::path::{Path, PathBuf};
 use crate::startup::{Command, Level, Target, classify, covered_by_roots, parse, version};
 
 fn open(paths: &[&str]) -> Command {
-    Command::Open(paths.iter().map(|path| path.to_string()).collect())
+    Command::Open {
+        paths: paths.iter().map(|path| path.to_string()).collect(),
+        background: false,
+    }
+}
+
+fn background(paths: &[&str]) -> Command {
+    Command::Open {
+        paths: paths.iter().map(|path| path.to_string()).collect(),
+        background: true,
+    }
 }
 
 #[test]
@@ -49,6 +59,16 @@ fn unknown_option_is_reported() {
 fn double_dash_stops_option_parsing() {
     assert_eq!(parse(["--", "--help", "-V"]), open(&["--help", "-V"]));
     assert_eq!(parse(["a.vb", "--", "-x"]), open(&["a.vb", "-x"]));
+}
+
+#[test]
+fn background_flag_keeps_paths() {
+    assert_eq!(parse(["--background"]), background(&[]));
+    assert_eq!(parse(["--background", "a.vb"]), background(&["a.vb"]));
+    // 选项顺序无关，重复给出也不报错。
+    assert_eq!(parse(["a.vb", "--background", "--background"]), background(&["a.vb"]));
+    // `--` 之后一律当路径。
+    assert_eq!(parse(["--", "--background"]), open(&["--background"]));
 }
 
 #[test]

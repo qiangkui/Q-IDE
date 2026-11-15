@@ -6,11 +6,12 @@
 use std::fs;
 use std::path::PathBuf;
 
-use crate::explorer::{ExplorerModel, Root};
+use crate::explorer::{ExplorerModel, ExplorerSelection, Root};
 
 /// 造一个临时文件夹：含 `sub/inner.txt` 与 `a.txt`。
 fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("gpui-first-explorer-{}-{name}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("gpui-first-explorer-{}-{name}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(dir.join("sub")).expect("创建子目录");
     fs::write(dir.join("sub").join("inner.txt"), "x").expect("写子文件");
@@ -26,7 +27,10 @@ fn adding_a_folder_expands_it_once() {
     assert!(model.add_folder(dir.clone()));
     assert!(!model.add_folder(dir.clone()), "同一个文件夹只加一次");
     assert_eq!(model.roots().len(), 1);
-    assert_eq!(model.expanded_ids(), vec![dir.to_string_lossy().into_owned()]);
+    assert_eq!(
+        model.expanded_ids(),
+        vec![dir.to_string_lossy().into_owned()]
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -63,11 +67,7 @@ fn folder_items_list_one_level_so_they_can_expand() {
         .expect("子文件夹");
     assert!(sub.is_folder(), "折叠的子文件夹也要能点开");
     assert!(!sub.is_expanded());
-    assert!(
-        root.children
-            .iter()
-            .any(|item| item.label == "a.txt")
-    );
+    assert!(root.children.iter().any(|item| item.label == "a.txt"));
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -156,4 +156,47 @@ fn an_empty_folder_gets_a_placeholder_so_it_looks_like_a_folder() {
     assert_eq!(child.label, crate::explorer::EMPTY_FOLDER_LABEL);
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn selection_mode_enters_on_dot_and_exits_when_empty() {
+    let mut selection = ExplorerSelection::default();
+    assert!(!selection.is_active(), "默认不在选择模式");
+
+    selection.click(r"C:\root\a.txt");
+    assert!(selection.is_active(), "点圆点后进入选择模式");
+    assert!(selection.contains(r"C:\root\a.txt"));
+
+    selection.toggle(r"C:\root\b.txt");
+    assert_eq!(selection.len(), 2, "选择模式下点条目是追加选中");
+
+    selection.toggle(r"C:\root\a.txt");
+    selection.toggle(r"C:\root\b.txt");
+    assert!(selection.is_empty());
+    assert!(!selection.is_active(), "全部取消选中后自动退出选择模式");
+}
+
+#[test]
+fn selection_rewrites_moved_paths() {
+    let mut selection = ExplorerSelection::default();
+    selection.click(r"C:\root\dir\a.txt");
+    selection.toggle(r"C:\root\dir");
+    selection.toggle(r"C:\other.txt");
+
+    selection.rewrite(r"C:\root\dir", r"C:\root\moved");
+
+    assert_eq!(selection.len(), 3);
+    assert!(selection.contains(r"C:\root\moved\a.txt"));
+    assert!(selection.contains(r"C:\root\moved"));
+    assert!(selection.contains(r"C:\other.txt"));
+}
+
+#[test]
+fn clearing_selection_leaves_selection_mode() {
+    let mut selection = ExplorerSelection::default();
+    selection.click(r"C:\root\a.txt");
+    selection.clear();
+
+    assert!(selection.is_empty());
+    assert!(!selection.is_active());
 }

@@ -1,0 +1,31 @@
+# VB6 错误号黄金用例：每行一条语句，VB6 与 QIDE 都要在 `On Error Resume Next` 下跑出同一个 `Err.Number`。
+# 只能放「一定会失败」的语句；不失败会记成 0，生成脚本会提示并从清单里删掉。
+# 注意 `Dim` 声明不会失败；`Len(Null)` / `Null + 1` 在 VB6 里返回 Null 而不报错。
+x = 1 / 0
+x = 1 \ 0
+x = 7 Mod 0
+i = 40000
+b = 300
+l = 2147483648
+x = CInt(40000)
+x = CByte(256)
+x = CByte(-1)
+x = CLng("abc")
+x = CSng(1) / 0
+d = "not a date"
+x = arr(5)
+x = empty_arr(0)
+x = 1 + "abc"
+x = c.Count
+x = Sgn("abc")
+Kill "no_such_file_for_golden_test.txt"
+Open "no_such_dir_for_golden\x.txt" For Input As #2
+x = Int("abc")
+x = Abs("abc")
+Print #9, "x"
+Seek #9, 1
+x = Partition(5, 0, 99, 0)
+x = Partition(5, 0, 99, -1)
+x = Partition(5, -10, 10, 5)
+x = Partition(5, 10, 5, 1)
+x = Partition(5, 0, 0, 1)

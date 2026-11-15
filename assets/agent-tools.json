@@ -1,0 +1,208 @@
+[
+  {
+    "name": "qide_get_app_state",
+    "description": "读取 Q-IDE 当前状态：项目根目录、打开的文件标签、活动文件、面板可见性与调试状态。",
+    "parameters": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "qide_list_commands",
+    "description": "列出 Q-IDE 命令面板中的命令 id、名称和快捷键，用于后续调用 qide_run_command。",
+    "parameters": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "qide_list_files",
+    "description": "列出项目内的文件（相对路径，最多 300 个）。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "dir": {
+          "type": "string",
+          "description": "子目录（可选，默认项目根目录）"
+        }
+      }
+    }
+  },
+  {
+    "name": "qide_read_file",
+    "description": "读取项目内的文件，返回带行号的文本；大文件用 start / end 指定行范围。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "相对项目根目录的路径"
+        },
+        "start": {
+          "type": "integer",
+          "description": "起始行（1 基，可选）"
+        },
+        "end": {
+          "type": "integer",
+          "description": "结束行（含，可选）"
+        }
+      },
+      "required": ["path"]
+    }
+  },
+  {
+    "name": "qide_read_output",
+    "description": "读取输出面板最近的内容（脚本输出与报错都在这里）。",
+    "parameters": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "qide_get_debug_state",
+    "description": "读取当前脚本运行状态、暂停行、调用栈、变量、断点和监视表达式。",
+    "parameters": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "qide_open_file",
+    "description": "在 Q-IDE 编辑器中打开项目内的文件，可同时跳到指定行。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "相对项目根目录的路径"
+        },
+        "line": {
+          "type": "integer",
+          "description": "1 基行号（可选）"
+        }
+      },
+      "required": ["path"]
+    }
+  },
+  {
+    "name": "qide_run_command",
+    "description": "执行 Q-IDE 命令面板中的安全命令（保存、编辑、面板/主题切换等）。不会运行脚本、调试或删除文件。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "命令 id，例如 file.save、view.output"
+        }
+      },
+      "required": ["id"]
+    }
+  },
+  {
+    "name": "qide_write_file",
+    "description": "写入整个文件（新建或整体重写）。执行前 Q-IDE 会弹出确认。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {"type": "string", "description": "相对项目根目录的路径"},
+        "content": {"type": "string", "description": "完整文件内容"}
+      },
+      "required": ["path", "content"]
+    }
+  },
+  {
+    "name": "qide_replace_in_file",
+    "description": "把文件里一段唯一的原文替换成新内容。执行前 Q-IDE 会弹出确认。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {"type": "string"},
+        "old": {"type": "string", "description": "文件里原样出现且只出现一次的片段"},
+        "new": {"type": "string", "description": "替换后的内容"}
+      },
+      "required": ["path", "old", "new"]
+    }
+  },
+  {
+    "name": "qide_delete_path",
+    "description": "删除项目内的文件或文件夹（文件夹连同内容）。执行前 Q-IDE 会弹出确认，且不能删除项目根目录。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {"type": "string", "description": "相对项目根目录的路径"}
+      },
+      "required": ["path"]
+    }
+  },
+  {
+    "name": "qide_move_path",
+    "description": "把项目内的文件或文件夹移动到另一个目录。执行前 Q-IDE 会弹出确认。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {"type": "string", "description": "要移动的文件/文件夹"},
+        "target_dir": {"type": "string", "description": "目标目录"}
+      },
+      "required": ["path", "target_dir"]
+    }
+  },
+  {
+    "name": "qide_check_syntax",
+    "description": "检查当前脚本的语法与语义，结果写进输出面板。",
+    "parameters": {"type": "object", "properties": {}}
+  },
+  {
+    "name": "qide_run_script",
+    "description": "运行当前 VB 脚本。默认执行前弹确认框；在设置「AI → 外部 agent」里打开「允许运行脚本和调试」后直接运行。",
+    "parameters": {"type": "object", "properties": {}}
+  },
+  {
+    "name": "qide_start_debug",
+    "description": "以调试模式启动当前 VB 脚本。默认执行前弹确认框；打开「允许运行脚本和调试」后直接运行。",
+    "parameters": {"type": "object", "properties": {}}
+  },
+  {
+    "name": "qide_debug_continue",
+    "description": "继续当前调试会话到下一个断点或结束。默认执行前弹确认框；打开「允许运行脚本和调试」后直接执行。",
+    "parameters": {"type": "object", "properties": {}}
+  },
+  {
+    "name": "qide_debug_step",
+    "description": "单步执行一条语句。默认执行前弹确认框；打开「允许运行脚本和调试」后直接执行。",
+    "parameters": {"type": "object", "properties": {}}
+  },
+  {
+    "name": "qide_debug_pause",
+    "description": "请求当前脚本在下一条语句处暂停。",
+    "parameters": {"type": "object", "properties": {}}
+  },
+  {
+    "name": "qide_stop_execution",
+    "description": "停止当前脚本或调试会话。",
+    "parameters": {"type": "object", "properties": {}}
+  },
+  {
+    "name": "qide_set_breakpoint",
+    "description": "为当前脚本设置或移除断点，可选条件表达式。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "line": {"type": "integer", "minimum": 1, "description": "1 基行号"},
+        "enabled": {"type": "boolean", "description": "true 设置断点，false 移除断点"},
+        "condition": {"type": "string", "description": "可选的条件表达式"}
+      },
+      "required": ["line", "enabled"]
+    }
+  },
+  {
+    "name": "qide_add_watch",
+    "description": "添加调试监视表达式，暂停时自动求值。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "expression": {"type": "string", "description": "变量名或 VB 表达式"}
+      },
+      "required": ["expression"]
+    }
+  }
+]

@@ -5,7 +5,7 @@
 //! 标题栏最右侧的关闭按钮收起整个面板（等同取消勾选「视图 → 资源管理器」）。
 //! 展开状态与根项列表都由 [`ExplorerModel`] 保存，并随布局写盘，下次启动时恢复。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -38,6 +38,8 @@ pub type PanelCommand = Rc<dyn Fn(&mut Window, &mut App)>;
 pub type ExplorerMenuAction = Rc<dyn Fn(String, bool, bool, Point<Pixels>, &mut Window, &mut App)>;
 /// 把条目拖到某个目录上：源路径、目标目录。
 pub type ExplorerMoveAction = Rc<dyn Fn(&str, &str, &mut Window, &mut App)>;
+/// 点击条目左侧圆点，或选择模式下点击条目：进入选择模式并选中，或切换选中状态。
+pub type ExplorerSelectAction = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 
 /// 拖动资源管理器条目时携带的数据。
 #[derive(Clone)]
@@ -136,6 +138,82 @@ impl Root {
 
     pub fn path(&self) -> &Path {
         &self.0
+    }
+}
+
+/// 资源管理器的多选状态：只有点过条目左侧圆点后才进入选择模式。
+///
+/// 上游 `TreeState` 只保存一个 `selected_index`（单选），没有多选 API，
+/// 所以选中集合由这里维护；进入选择模式时会清掉树自带的单选高亮。
+///
+/// 选择模式下点击条目不会打开文件，只会切换选中状态；全部取消选中后自动退出。
+#[derive(Clone, Debug, Default)]
+pub struct ExplorerSelection {
+    active: bool,
+    paths: HashSet<String>,
+}
+
+impl ExplorerSelection {
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub fn len(&self) -> usize {
+        self.paths.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    pub fn contains(&self, path: &str) -> bool {
+        self.paths.contains(path)
+    }
+
+    pub fn paths(&self) -> impl Iterator<Item = &String> {
+        self.paths.iter()
+    }
+
+    /// 点圆点：未进入选择模式时进入并选中该项，已在选择模式时切换该项。
+    pub fn click(&mut self, path: &str) {
+        if self.active {
+            self.toggle(path);
+        } else {
+            self.active = true;
+            self.paths.insert(path.to_string());
+        }
+    }
+
+    /// 选择模式下点条目：选中/取消选中；全部取消后退出选择模式。
+    pub fn toggle(&mut self, path: &str) {
+        if !self.paths.remove(path) {
+            self.paths.insert(path.to_string());
+        }
+        if self.paths.is_empty() {
+            self.active = false;
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.paths.clear();
+        self.active = false;
+    }
+
+    /// 条目被移动或重命名后，把选中的旧路径改写成新路径。
+    pub fn rewrite(&mut self, old: &str, new: &str) {
+        if self.paths.is_empty() {
+            return;
+        }
+        self.paths = self
+            .paths
+            .iter()
+            .map(|path| {
+                crate::workspace::reprefix_path(path, old, new).unwrap_or_else(|| path.clone())
+            })
+            .collect();
+        if self.paths.is_empty() {
+            self.active = false;
+        }
     }
 }
 
@@ -250,7 +328,8 @@ impl ExplorerModel {
         // 空目录补一个占位子项：树组件靠「有没有子项」判断文件夹。
         if dirs.is_empty() && files.is_empty() {
             item = item.child(
-                TreeItem::new(format!("{id}{EMPTY_FOLDER_SUFFIX}"), EMPTY_FOLDER_LABEL).disabled(true),
+                TreeItem::new(format!("{id}{EMPTY_FOLDER_SUFFIX}"), EMPTY_FOLDER_LABEL)
+                    .disabled(true),
             );
         }
 
@@ -291,6 +370,16 @@ pub struct ExplorerActions {
     pub on_context_menu: ExplorerMenuAction,
     /// 把条目拖到目录上（移动）。
     pub on_move: ExplorerMoveAction,
+    /// 当前多选状态。
+    pub selection: ExplorerSelection,
+    /// 右键菜单当前指向的条目：菜单打开期间高亮它。
+    pub context_path: Option<String>,
+    /// 点圆点或在选择模式下点条目。
+    pub on_select: ExplorerSelectAction,
+    /// 删除选中的条目（选择模式下标题栏按钮）。
+    pub delete_selected: PanelCommand,
+    /// 退出选择模式。
+    pub cancel_selection: PanelCommand,
     /// 树里没有任何根项时显示提示文字。
     pub is_empty: bool,
 }
@@ -344,8 +433,16 @@ pub fn render(
         refresh,
         on_context_menu,
         on_move,
+        selection,
+        context_path,
+        on_select,
+        delete_selected,
+        cancel_selection,
         is_empty,
     } = actions;
+
+    let selection_active = selection.is_active();
+    let selected_count = selection.len();
 
     let add_button = header_icon_button(
         "explorer-add-folder",
@@ -377,6 +474,36 @@ pub fn render(
         palette,
         move |window, cx| close_panel(window, cx),
     );
+    let delete_button = header_icon_button(
+        "explorer-delete-selected",
+        IconName::Delete,
+        palette,
+        move |window, cx| delete_selected(window, cx),
+    );
+    let cancel_button = header_icon_button(
+        "explorer-cancel-selection",
+        IconName::Close,
+        palette,
+        move |window, cx| cancel_selection(window, cx),
+    );
+
+    // 选择模式下只保留删除与退出选择，其它文件操作全部收起。
+    let header_actions = if selection_active {
+        h_flex()
+            .items_center()
+            .gap_1()
+            .child(delete_button)
+            .child(cancel_button)
+    } else {
+        h_flex()
+            .items_center()
+            .gap_1()
+            .child(new_file_button)
+            .child(new_folder_button)
+            .child(refresh_button)
+            .child(add_button)
+            .child(close_button)
+    };
 
     let body = if is_empty {
         v_flex()
@@ -396,170 +523,254 @@ pub fn render(
             )
             .into_any_element()
     } else {
-        component_tree::tree(
-            tree,
-            move |_, entry, selected, _, _| {
-                let is_folder = entry.is_folder();
-                let is_root = entry.is_root();
-                let id = entry.item().id.to_string();
-                // 空文件夹占位项：只画一行灰色说明，不能点、也不能开菜单。
-                if is_empty_folder_placeholder(&id) {
-                    let depth = entry.depth() as f32;
-                    return ListItem::new(entry.item().id.clone()).disabled(true).child(
-                        h_flex()
-                            .w_full()
-                            .items_center()
-                            .gap_1()
-                            .pl(px(8.0 + depth * 12.0 + 12.0))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .overflow_hidden()
-                                    .text_xs()
-                                    .text_color(rgb(palette.muted_text))
-                                    .child(EMPTY_FOLDER_LABEL),
-                            ),
-                    );
-                }
+        component_tree::tree(tree, move |_, entry, selected, _, _| {
+            let is_folder = entry.is_folder();
+            let is_root = entry.is_root();
+            let id = entry.item().id.to_string();
+            // 空文件夹占位项：只画一行灰色说明，不能点、也不能开菜单。
+            if is_empty_folder_placeholder(&id) {
+                let depth = entry.depth() as f32;
+                return ListItem::new(entry.item().id.clone()).disabled(true).child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .gap_1()
+                        .pl(px(8.0 + depth * 12.0 + 12.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .text_xs()
+                                .text_color(rgb(palette.muted_text))
+                                .child(EMPTY_FOLDER_LABEL),
+                        ),
+                );
+            }
 
-                let indicator = if is_folder {
-                    Icon::new(if entry.is_expanded() {
-                        IconName::ChevronDown
+            let indicator = if is_folder {
+                Icon::new(if entry.is_expanded() {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .xsmall()
+                .text_color(rgb(palette.sidebar_text))
+                .into_any_element()
+            } else {
+                div().w(px(12.0)).into_any_element()
+            };
+
+            // 条目左侧的圆点：普通模式是实心小点，选择模式下变成圆圈。
+            // 根目录不参与选择，只保留占位，保持子项缩进对齐。
+            let is_selected = selection.contains(&id);
+            let dot = if is_root {
+                div()
+                    .flex_shrink_0()
+                    .w(px(16.0))
+                    .h(px(16.0))
+                    .into_any_element()
+            } else {
+                let dot_visual = if selection_active {
+                    let accent = if is_selected {
+                        palette.command
                     } else {
-                        IconName::ChevronRight
+                        palette.sidebar_text
+                    };
+                    div()
+                        .size(px(12.0))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(rgb(accent))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(is_selected, |this| {
+                            this.child(div().size(px(6.0)).rounded_full().bg(rgb(palette.command)))
+                        })
+                } else {
+                    div()
+                        .size(px(6.0))
+                        .rounded_full()
+                        .bg(rgb(palette.muted_text))
+                };
+                let select = on_select.clone();
+                let dot_path = id.clone();
+                div()
+                    .id(SharedString::from(format!("explorer-dot-{id}")))
+                    .flex_shrink_0()
+                    .w(px(16.0))
+                    .h(px(16.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor(CursorStyle::PointingHand)
+                    .child(dot_visual)
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        select(&dot_path, window, cx);
+                    })
+                    .into_any_element()
+            };
+
+            let content = h_flex()
+                .flex_1()
+                .min_w_0()
+                .items_center()
+                .gap_1()
+                .pl(px(entry.depth() as f32 * 12.0))
+                .child(indicator)
+                .child(
+                    Icon::new(if is_folder {
+                        IconName::FolderClosed
+                    } else {
+                        IconName::File
                     })
                     .xsmall()
-                    .text_color(rgb(palette.sidebar_text))
-                    .into_any_element()
-                } else {
-                    div().w(px(12.0)).into_any_element()
-                };
-
-                let mut row = h_flex()
-                    .w_full()
-                    .items_center()
-                    .gap_1()
-                    .rounded(px(3.0))
-                    .pl(px(8.0 + entry.depth() as f32 * 12.0))
-                    .child(indicator)
-                    .child(
-                        Icon::new(if is_folder {
-                            IconName::FolderClosed
-                        } else {
-                            IconName::File
-                        })
-                        .xsmall()
-                        .text_color(rgb(if is_folder {
-                            palette.folder
-                        } else {
-                            palette.file
-                        })),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            // 侧栏变窄时用省略号截断，不要让文件名折成多行。
-                            .truncate()
-                            .text_xs()
-                            .text_color(rgb(palette.sidebar_text))
-                            .child(entry.item().label.clone()),
-                    );
-
-                // 每个根项后面都带一个「-」，只从树里移除，不删磁盘文件。
-                if is_root {
-                    let remove_root = remove_root.clone();
-                    let remove_id = id.clone();
-                    row = row.child(
-                        div()
-                            .id(SharedString::from(format!("explorer-remove-{id}")))
-                            .flex_shrink_0()
-                            .size(px(18.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(4.0))
-                            .text_sm()
-                            .text_color(rgb(palette.sidebar_text))
-                            .hover(move |this| this.bg(rgba(palette.hover)))
-                            .child("-")
-                            .on_click(move |_, window, cx| {
-                                cx.stop_propagation();
-                                remove_root(&remove_id, window, cx);
-                            }),
-                    );
-                }
-
-                let item = ListItem::new(entry.item().id.clone())
-                    .selected(selected)
-                    .child(row);
-
-                // 拖动条目：数据里带上路径，拖到目录或标签栏上时用。
-                let drag_path = id.clone();
-                let drag_label = entry.item().label.clone();
-                let item = item.on_drag(
-                    ExplorerDrag {
-                        path: drag_path,
-                        is_dir: is_folder,
-                    },
-                    move |drag: &ExplorerDrag, _, _, cx| {
-                        let label = if drag.is_dir {
-                            format!("{}/", drag_label)
-                        } else {
-                            drag_label.to_string()
-                        };
-                        cx.new(|_| ExplorerDragPreview::new(label))
-                    },
+                    .text_color(rgb(if is_folder {
+                        palette.folder
+                    } else {
+                        palette.file
+                    })),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        // 侧栏变窄时用省略号截断，不要让文件名折成多行。
+                        .truncate()
+                        .text_xs()
+                        .text_color(rgb(palette.sidebar_text))
+                        .child(entry.item().label.clone()),
                 );
 
-                // 文件夹可以作为放置目标：把拖来的条目移动进去。
-                let item = if is_folder {
-                    let target = id.clone();
-                    let move_action = on_move.clone();
-                    let dragged = id.clone();
-                    item.drag_over::<ExplorerDrag>(move |style, drag, _, _| {
-                        if can_move_into(&drag.path, &dragged, drag.is_dir) {
-                            style.bg(rgba(palette.selection))
-                        } else {
-                            style
-                        }
-                    })
-                    .on_drop(move |drag: &ExplorerDrag, window, cx| {
-                        cx.stop_propagation();
-                        if can_move_into(&drag.path, &target, drag.is_dir) {
-                            let source = drag.path.clone();
-                            move_action(&source, &target, window, cx);
-                        }
-                    })
+            let mut row = h_flex()
+                .w_full()
+                .items_center()
+                .gap_1()
+                .rounded(px(3.0))
+                .px(px(4.0))
+                .py(px(4.0))
+                .child(dot)
+                .child(content);
+
+            // 每个根项后面都带一个「-」，只从树里移除，不删磁盘文件。
+            // 选择模式下只允许删除选中项和拖动，隐藏这个按钮。
+            if is_root && !selection_active {
+                let remove_root = remove_root.clone();
+                let remove_id = id.clone();
+                row = row.child(
+                    div()
+                        .id(SharedString::from(format!("explorer-remove-{id}")))
+                        .flex_shrink_0()
+                        .size(px(18.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(4.0))
+                        .text_sm()
+                        .text_color(rgb(palette.sidebar_text))
+                        .hover(move |this| this.bg(rgba(palette.hover)))
+                        .child("-")
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            remove_root(&remove_id, window, cx);
+                        }),
+                );
+            }
+
+            // 复用 ListItem 自带的选中高亮：普通模式跟随树的单选，
+            // 选择模式跟随多选集合；右键菜单指向的行也临时高亮。
+            let highlighted = context_path.as_deref() == Some(id.as_str())
+                || if selection_active {
+                    is_selected
                 } else {
-                    item
+                    selected
                 };
+            let item = ListItem::new(entry.item().id.clone())
+                .w_full()
+                .px(px(0.0))
+                .py(px(0.0))
+                .selected(highlighted)
+                .child(row);
 
-                // 右键在条目上打开自绘菜单（新建/重命名/删除……）。
-                let menu = on_context_menu.clone();
-                let menu_id = id.clone();
-                let item = item.on_mouse_down(MouseButton::Right, move |event, window, cx| {
+            // 拖动条目：数据里带上路径，拖到目录或标签栏上时用。
+            let drag_path = id.clone();
+            let drag_label = entry.item().label.clone();
+            let item = item.on_drag(
+                ExplorerDrag {
+                    path: drag_path,
+                    is_dir: is_folder,
+                },
+                move |drag: &ExplorerDrag, _, _, cx| {
+                    let label = if drag.is_dir {
+                        format!("{}/", drag_label)
+                    } else {
+                        drag_label.to_string()
+                    };
+                    cx.new(|_| ExplorerDragPreview::new(label))
+                },
+            );
+
+            // 文件夹可以作为放置目标：把拖来的条目移动进去。
+            let item = if is_folder {
+                let target = id.clone();
+                let move_action = on_move.clone();
+                let dragged = id.clone();
+                item.drag_over::<ExplorerDrag>(move |style, drag, _, _| {
+                    if can_move_into(&drag.path, &dragged, drag.is_dir) {
+                        style.bg(rgba(palette.selection))
+                    } else {
+                        style
+                    }
+                })
+                .on_drop(move |drag: &ExplorerDrag, window, cx| {
                     cx.stop_propagation();
-                    let path = menu_id.clone();
-                    menu(path, is_folder, is_root, event.position, window, cx);
-                });
+                    if can_move_into(&drag.path, &target, drag.is_dir) {
+                        let source = drag.path.clone();
+                        move_action(&source, &target, window, cx);
+                    }
+                })
+            } else {
+                item
+            };
 
-                // 左键：文件夹展开/收起，文件打开。
-                if is_folder {
-                    let toggle_folder = toggle_folder.clone();
-                    let folder_id = id.clone();
+            // 右键在条目上打开自绘菜单（新建/重命名/删除……）。
+            let menu = on_context_menu.clone();
+            let menu_id = id.clone();
+            let item = item.on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                cx.stop_propagation();
+                let path = menu_id.clone();
+                menu(path, is_folder, is_root, event.position, window, cx);
+            });
+
+            // 左键：普通模式下文件夹展开/收起、文件打开；
+            // 选择模式下只切换选中状态，不打开任何东西；根目录不可选中。
+            if selection_active {
+                if is_root {
+                    // 根目录不能选中，也不要让树的默认点击去展开它。
+                    item.on_click(|_, _, cx| cx.stop_propagation())
+                } else {
+                    let select = on_select.clone();
+                    let path = id.clone();
                     item.on_click(move |_, window, cx| {
                         cx.stop_propagation();
-                        toggle_folder(&folder_id, window, cx);
+                        select(&path, window, cx);
                     })
-                } else {
-                    let open_file = open_file.clone();
-                    let file_id = id.clone();
-                    item.on_click(move |_, window, cx| open_file(&file_id, window, cx))
                 }
-            },
-        )
+            } else if is_folder {
+                let toggle_folder = toggle_folder.clone();
+                let folder_id = id.clone();
+                item.on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    toggle_folder(&folder_id, window, cx);
+                })
+            } else {
+                let open_file = open_file.clone();
+                let file_id = id.clone();
+                item.on_click(move |_, window, cx| open_file(&file_id, window, cx))
+            }
+        })
         .into_any_element()
     };
 
@@ -575,6 +786,11 @@ pub fn render(
         None => panel.w_full(),
     };
 
+    let title_text = if selection_active {
+        format!("已选择 {selected_count} 项")
+    } else {
+        "资源管理器".to_string()
+    };
     let title = div()
         .id("explorer-title")
         .flex_1()
@@ -584,7 +800,7 @@ pub fn render(
         .items_center()
         .text_xs()
         .text_color(rgb(palette.sidebar_text))
-        .child("资源管理器");
+        .child(title_text);
     let title = if let Some(drag) = drag {
         title.on_drag(drag, move |drag, offset, _, cx| {
             cx.stop_propagation();
@@ -609,16 +825,7 @@ pub fn render(
                     .items_center()
                     .justify_between()
                     .child(title)
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_1()
-                            .child(new_file_button)
-                            .child(new_folder_button)
-                            .child(refresh_button)
-                            .child(add_button)
-                            .child(close_button),
-                    ),
+                    .child(header_actions),
             )
         })
         .child(
@@ -654,5 +861,8 @@ fn same_folder(root: &Root, path: &Path) -> bool {
         .to_string_lossy()
         .to_lowercase()
         .trim_end_matches(['\\', '/'])
-        == path.to_string_lossy().to_lowercase().trim_end_matches(['\\', '/'])
+        == path
+            .to_string_lossy()
+            .to_lowercase()
+            .trim_end_matches(['\\', '/'])
 }

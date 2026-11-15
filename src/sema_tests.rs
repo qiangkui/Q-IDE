@@ -48,9 +48,7 @@ fn declared_variables_and_parameters_are_accepted() {
 fn for_loop_variable_must_be_declared() {
     let missing = issues("Option Explicit\nFor i = 1 To 3\nNext i\n");
     assert!(
-        missing
-            .iter()
-            .any(|issue| issue.message.contains("`i`")),
+        missing.iter().any(|issue| issue.message.contains("`i`")),
         "{missing:?}"
     );
 
@@ -201,4 +199,127 @@ fn array_indexing_is_not_reported_as_a_call() {
 fn each_issue_is_reported_once_per_line() {
     let found = issues("Option Explicit\nx = x + x\n");
     assert_eq!(found.len(), 1, "{found:?}");
+}
+
+#[test]
+fn implemented_interface_member_missing_is_reported() {
+    // 没写 `Option Explicit` 也要报：VB6 把接口实现当成编译错误。
+    let found = issues(
+        "Class IShape\n\
+             Public Function Area() As Long\n\
+         End Function\n\
+         End Class\n\
+         Class Square\n\
+             Implements IShape\n\
+         End Class\n",
+    );
+    assert!(
+        found
+            .iter()
+            .any(|issue| issue.message.contains("没有实现接口")
+                && issue.message.contains("ishape")
+                && issue.message.contains("area")),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn implemented_interface_member_with_wrong_name_is_reported() {
+    let found = issues(
+        "Class IShape\n\
+             Public Function Area() As Long\n\
+         End Function\n\
+         End Class\n\
+         Class Square\n\
+             Implements IShape\n\
+             Private Function GetArea() As Long\n\
+             End Function\n\
+         End Class\n",
+    );
+    assert!(
+        found
+            .iter()
+            .any(|issue| issue.message.contains("没有实现接口")),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn implemented_interface_extra_member_is_reported() {
+    let found = issues(
+        "Class IShape\n\
+             Public Function Area() As Long\n\
+         End Function\n\
+         End Class\n\
+         Class Square\n\
+             Implements IShape\n\
+             Private Function IShape_Area() As Long\n\
+             End Function\n\
+             Private Sub IShape_Draw()\n\
+             End Sub\n\
+         End Class\n",
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].message.contains("没有成员 `draw`"), "{found:?}");
+}
+
+#[test]
+fn complete_interface_implementation_reports_nothing() {
+    let found = issues(
+        "Option Explicit\n\
+         Class IShape\n\
+             Public Function Area() As Long\n\
+             End Function\n\
+             Public Property Get Name() As String\n\
+             End Property\n\
+         End Class\n\
+         Class Square\n\
+             Implements IShape\n\
+             Private Function IShape_Area() As Long\n\
+                 IShape_Area = 4\n\
+             End Function\n\
+             Private Property Get IShape_Name() As String\n\
+                 IShape_Name = \"square\"\n\
+             End Property\n\
+         End Class\n",
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn implementation_declaration_form_must_match_the_interface() {
+    let found = issues(
+        "Class IShape\n\
+             Public Property Let Value(ByVal item As Long)\n\
+             End Property\n\
+         End Class\n\
+         Class Square\n\
+             Implements IShape\n\
+             Private Function IShape_Value() As Long\n\
+             End Function\n\
+         End Class\n",
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].message.contains("声明形式") && found[0].line == 7,
+        "{found:?}"
+    );
+}
+
+#[test]
+fn interface_private_members_are_not_required() {
+    let found = issues(
+        "Class IShape\n\
+             Public Function Area() As Long\n\
+             End Function\n\
+             Private Sub Hidden()\n\
+             End Sub\n\
+         End Class\n\
+         Class Square\n\
+             Implements IShape\n\
+             Private Function IShape_Area() As Long\n\
+             End Function\n\
+         End Class\n",
+    );
+    assert!(found.is_empty(), "{found:?}");
 }

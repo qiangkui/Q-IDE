@@ -3,18 +3,18 @@
 //! 打开方式：活动栏齿轮、状态栏“设置”按钮、`文件 -> 设置…`。
 //! 窗口是单例的：重复打开只会激活已有窗口。
 
+use gpui_kit::component::Colorize as _;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::setting::{
     NumberFieldOptions, SettingField, SettingGroup, SettingItem, SettingPage, Settings,
 };
-use gpui_kit::component::Colorize as _;
 use gpui_kit::component::*;
 use gpui_kit::*;
 
 use super::{AppSettings, SettingsStore, SyntaxLanguage, ThemeChoice};
-use crate::custom_theme::{self, ColorSpec, DraftKind, ThemeDraft, ThemeStore, COLORS};
+use crate::custom_theme::{self, COLORS, ColorSpec, DraftKind, ThemeDraft, ThemeStore};
 use crate::secret_store;
 use crate::theme::{self as ui_theme, Palette};
 use crate::title_bar;
@@ -43,10 +43,7 @@ pub fn remembered_window_size(cx: &App) -> Option<(f32, f32)> {
 
 fn remember_window_size(window: &Window, cx: &mut App) {
     let bounds = window.bounds();
-    let next = (
-        f32::from(bounds.size.width),
-        f32::from(bounds.size.height),
-    );
+    let next = (f32::from(bounds.size.width), f32::from(bounds.size.height));
     let changed = cx
         .try_global::<SettingsWindowSize>()
         .is_none_or(|size| size.0 != Some(next));
@@ -125,11 +122,10 @@ impl SettingsWindow {
         let draft = cx.new(|_| draft_value);
         let settings_draft = draft.clone();
         let settings_themes = themes.clone();
-        let settings_subscription =
-            cx.observe_in(&settings, window, move |_, settings, _, cx| {
-                sync_draft_with_settings(&settings, &settings_draft, &settings_themes, cx);
-                cx.notify();
-            });
+        let settings_subscription = cx.observe_in(&settings, window, move |_, settings, _, cx| {
+            sync_draft_with_settings(&settings, &settings_draft, &settings_themes, cx);
+            cx.notify();
+        });
         let size_subscription =
             cx.observe_window_bounds(window, |_, window, cx| remember_window_size(window, cx));
         let subscriptions = vec![
@@ -155,14 +151,11 @@ impl SettingsWindow {
     fn track_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) -> f32 {
         let panes = window.use_keyed_state(SETTINGS_ID, cx, |_, _| ResizableState::default());
         if self.panes.as_ref() != Some(&panes) {
-            self._panes_subscription = Some(cx.observe_in(&panes, window, |_, _, _, cx| cx.notify()));
+            self._panes_subscription =
+                Some(cx.observe_in(&panes, window, |_, _, _, cx| cx.notify()));
             self.panes = Some(panes.clone());
         }
-        let width = panes
-            .read(cx)
-            .sizes()
-            .first()
-            .map(|width| width.as_f32());
+        let width = panes.read(cx).sizes().first().map(|width| width.as_f32());
         width.unwrap_or(ui_theme::SETTINGS_SIDEBAR_WIDTH)
     }
 }
@@ -198,32 +191,28 @@ impl Render for SettingsWindow {
                     .bg(rgba(palette.border)),
             )
             .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .p(px(ui_theme::PANE_GAP))
-                    .child(
-                        div()
-                            .relative()
-                            .size_full()
-                            .child(
-                                Settings::new(SETTINGS_ID)
-                                    .pages(pages)
-                                    .sidebar_width(px(ui_theme::SETTINGS_SIDEBAR_WIDTH))
-                                    .sidebar_style(&sidebar_style),
-                            )
-                            .child(
-                                // 拖动分隔条自带一条 1px 竖线，紧贴着侧栏边框；
-                                // 用底色盖住它，只留下侧栏自己的边框。
-                                div()
-                                    .absolute()
-                                    .top_0()
-                                    .bottom_0()
-                                    .left(px(sidebar_width + 0.5))
-                                    .w(px(1.0))
-                                    .bg(rgb(palette.sidebar_bg)),
-                            ),
-                    ),
+                div().flex_1().min_h_0().p(px(ui_theme::PANE_GAP)).child(
+                    div()
+                        .relative()
+                        .size_full()
+                        .child(
+                            Settings::new(SETTINGS_ID)
+                                .pages(pages)
+                                .sidebar_width(px(ui_theme::SETTINGS_SIDEBAR_WIDTH))
+                                .sidebar_style(&sidebar_style),
+                        )
+                        .child(
+                            // 拖动分隔条自带一条 1px 竖线，紧贴着侧栏边框；
+                            // 用底色盖住它，只留下侧栏自己的边框。
+                            div()
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .left(px(sidebar_width + 0.5))
+                                .w(px(1.0))
+                                .bg(rgb(palette.sidebar_bg)),
+                        ),
+                ),
             )
     }
 }
@@ -447,6 +436,53 @@ fn build_pages(
                         |s, v| s.ai.font_size = v.round() as u32,
                     )
                     .description("AI 对话区的文字大小，包含消息、代码块和提示")]),
+            )
+            .group(
+                SettingGroup::new()
+                    .title("外部 agent（MCP）")
+                    .description("qide-mcp 通过本机回环端口调用 Q-IDE；修改后立即生效")
+                    .items([
+                        bool_item(
+                            store,
+                            "启用外部 agent 接口",
+                            |s| s.ai.agent_enabled,
+                            |s, value| s.ai.agent_enabled = value,
+                            true,
+                        )
+                        .description("关闭后 qide-mcp 找不到端点，外部 agent 无法连接"),
+                        bool_item(
+                            store,
+                            "允许写入/删除/移动",
+                            |s| s.ai.agent_allow_write,
+                            |s, value| s.ai.agent_allow_write = value,
+                            false,
+                        )
+                        .description("关闭时外部 agent 只能读取和打开文件"),
+                        bool_item(
+                            store,
+                            "危险操作跳过确认",
+                            |s| s.ai.agent_auto_confirm,
+                            |s, value| s.ai.agent_auto_confirm = value,
+                            false,
+                        )
+                        .description("打开后外部 agent 写入/删除/移动文件不再弹确认框；运行脚本和调试由下一项单独控制"),
+                        bool_item(
+                            store,
+                            "允许运行脚本和调试",
+                            |s| s.ai.agent_allow_run,
+                            |s, value| s.ai.agent_allow_run = value,
+                            false,
+                        )
+                        .description("打开后外部 agent 可以直接运行脚本、启动调试、继续和单步，不再弹确认框；关闭时这些操作仍会先弹确认框"),
+                        bool_item(
+                            store,
+                            "记录调用日志",
+                            |s| s.ai.agent_audit,
+                            |s, value| s.ai.agent_audit = value,
+                            true,
+                        )
+                        .description("把外部 agent 的写入、运行、调试等操作写进输出面板"),
+                    ]),
             ),
     ]
 }
@@ -458,8 +494,14 @@ fn theme_choice_item(
     cx: &App,
 ) -> SettingItem {
     let mut options = vec![
-        (SharedString::from("dark"), SharedString::from("深色（内置）")),
-        (SharedString::from("light"), SharedString::from("浅色（内置）")),
+        (
+            SharedString::from("dark"),
+            SharedString::from("深色（内置）"),
+        ),
+        (
+            SharedString::from("light"),
+            SharedString::from("浅色（内置）"),
+        ),
     ];
     for theme in themes.read(cx).themes() {
         options.push((
@@ -613,12 +655,7 @@ fn draft_color_item(
     let write = draft.clone();
     let key = SharedString::from(format!("theme-color-{index}"));
     let field = SettingField::render(move |_, window, cx| {
-        let text = read
-            .read(cx)
-            .colors
-            .get(index)
-            .cloned()
-            .unwrap_or_default();
+        let text = read.read(cx).colors.get(index).cloned().unwrap_or_default();
         let editable = read.read(cx).is_editable();
         let state = color_field_state(window, cx, &write, index, &text, key.clone());
         sync_color_field(&state, &text, window, cx);
@@ -1077,11 +1114,13 @@ fn api_key_item() -> SettingItem {
             .w_64()
             .items_center()
             .gap_2()
-            .child(div().flex_1().min_w_0().child(
-                Input::new(&input)
-                    .mask_toggle()
-                    .aria_label("DeepSeek API Key"),
-            ))
+            .child(
+                div().flex_1().min_w_0().child(
+                    Input::new(&input)
+                        .mask_toggle()
+                        .aria_label("DeepSeek API Key"),
+                ),
+            )
             .child(
                 Button::new("ai-key-clear")
                     .label("清除")

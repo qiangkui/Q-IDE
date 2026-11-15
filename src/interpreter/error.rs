@@ -25,19 +25,22 @@ impl fmt::Display for ParseError {
 }
 
 /// 运行时错误（求值阶段）。
+///
+/// `message` / `source` 用 `Arc<str>`：`Result<Value, RuntimeError>` 是解释器每条表达式、
+/// 每条语句的返回类型，错误体越小，成功路径上的搬运成本越低（`String` 24 字节 → `Arc<str>` 16 字节）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeError {
-    pub message: String,
+    pub message: std::sync::Arc<str>,
     pub line: usize,
     /// VB 错误号，供 `Err.Number` 与 `Error()` 使用。
     pub number: i64,
     /// `Err.Raise` 传入的错误来源（`Err.Source`）。
-    pub source: Option<String>,
+    pub source: Option<std::sync::Arc<str>>,
 }
 
 impl RuntimeError {
     /// 默认错误号 5：VB 的「无效的过程调用或参数」。
-    pub fn new(message: impl Into<String>, line: usize) -> Self {
+    pub fn new(message: impl Into<std::sync::Arc<str>>, line: usize) -> Self {
         Self {
             message: message.into(),
             line,
@@ -67,7 +70,7 @@ impl RuntimeError {
         self
     }
 
-    pub fn with_source(mut self, source: Option<String>) -> Self {
+    pub fn with_source(mut self, source: Option<std::sync::Arc<str>>) -> Self {
         self.source = source;
         self
     }

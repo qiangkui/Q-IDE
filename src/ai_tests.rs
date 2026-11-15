@@ -1,17 +1,15 @@
 //! AI 对话的纯逻辑测试：地址解析、请求体拼装、应答解析与 SSE 增量解析。
 
 use crate::ai::client::{
-    ChatMessage, Endpoint, Role, ToolCall, endpoint_from, fit_history, parse_reply, request_body,
-    REQUEST_CHAR_BUDGET,
+    ChatMessage, Endpoint, REQUEST_CHAR_BUDGET, Role, ToolCall, endpoint_from, fit_history,
+    parse_reply, request_body,
 };
 use crate::ai::stream::{SseDecoder, SseEvent};
 use serde_json::json;
 
 /// 拼一条 DeepSeek 风格的增量事件（带空行）。
 fn sse_delta(content: &str) -> String {
-    format!(
-        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{content}\"}}}}]}}\n\n"
-    )
+    format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{content}\"}}}}]}}\n\n")
 }
 
 fn endpoint(secure: bool, host: &str, port: u16, path: &str) -> Endpoint {
@@ -154,10 +152,7 @@ fn sse_decoder_reassembles_events_split_across_chunks() {
 #[test]
 fn sse_decoder_stops_at_done_and_ignores_later_bytes() {
     let mut decoder = SseDecoder::new();
-    assert_eq!(
-        decoder.push(b"data: [DONE]\r\n\r\n"),
-        vec![SseEvent::Done]
-    );
+    assert_eq!(decoder.push(b"data: [DONE]\r\n\r\n"), vec![SseEvent::Done]);
     assert!(decoder.is_done());
     assert!(decoder.push(b"data: {\"choices\":[]}\n").is_empty());
     assert!(decoder.finish().is_empty());
@@ -258,7 +253,9 @@ fn request_body_puts_the_file_context_into_the_system_prompt() {
     let value: serde_json::Value = serde_json::from_str(&body).expect("请求体是合法 JSON");
     let messages = value["messages"].as_array().expect("messages 是数组");
     assert_eq!(messages.len(), 1, "上下文不额外占一条消息");
-    let system = messages[0]["content"].as_str().expect("system 内容是字符串");
+    let system = messages[0]["content"]
+        .as_str()
+        .expect("system 内容是字符串");
     assert_eq!(messages[0]["role"], "system");
     assert!(system.contains("src/main.vb"));
     assert!(system.contains("Sub Main()"));
@@ -281,10 +278,7 @@ fn file_context_truncates_very_long_files() {
         .split("…（文件过长")
         .next()
         .expect("截断标记之前是文件内容");
-    assert!(
-        head.ends_with('\n'),
-        "截断点要落在整行末尾，不能把一行劈开"
-    );
+    assert!(head.ends_with('\n'), "截断点要落在整行末尾，不能把一行劈开");
 }
 
 // ---------- 工具调用 ----------
@@ -371,7 +365,10 @@ fn tool_replace_in_file_requires_a_unique_snippet() {
         match run_tool(
             &root,
             &files,
-            &call("replace_in_file", json!({"path": "a.vb", "old": old, "new": ""})),
+            &call(
+                "replace_in_file",
+                json!({"path": "a.vb", "old": old, "new": ""}),
+            ),
         ) {
             ToolPlan::Read { content, .. } => assert!(content.starts_with("错误：")),
             _ => panic!("有问题的替换不该写盘：{old}"),
@@ -382,7 +379,11 @@ fn tool_replace_in_file_requires_a_unique_snippet() {
 #[test]
 fn tool_paths_cannot_escape_the_project() {
     let (root, files) = project();
-    match run_tool(&root, &files, &call("read_file", json!({"path": "../secret.vb"}))) {
+    match run_tool(
+        &root,
+        &files,
+        &call("read_file", json!({"path": "../secret.vb"})),
+    ) {
         ToolPlan::Read { content, .. } => {
             assert!(content.contains("路径不在项目目录内"), "{content}");
         }
@@ -396,7 +397,10 @@ fn tool_write_file_plans_a_new_file() {
     match run_tool(
         &root,
         &files,
-        &call("write_file", json!({"path": "new.vb", "content": "Dim y\n"})),
+        &call(
+            "write_file",
+            json!({"path": "new.vb", "content": "Dim y\n"}),
+        ),
     ) {
         ToolPlan::Write { path, content, .. } => {
             assert_eq!(path, root.join("new.vb"));
@@ -410,7 +414,11 @@ fn tool_write_file_plans_a_new_file() {
 fn tool_check_syntax_reports_the_broken_line() {
     let (root, mut files) = project();
     files.insert(root.join("bad.vb"), "Dim a = {1, 2\n".to_string());
-    match run_tool(&root, &files, &call("check_syntax", json!({"path": "bad.vb"}))) {
+    match run_tool(
+        &root,
+        &files,
+        &call("check_syntax", json!({"path": "bad.vb"})),
+    ) {
         ToolPlan::Read { content, summary } => {
             assert!(content.contains("数组字面量"), "{content}");
             assert!(summary.contains("1 个问题"), "{summary}");
@@ -557,17 +565,15 @@ fn request_body_encodes_tools_and_tool_results() {
         assistant,
         ChatMessage::tool("call_0", "1| Dim x"),
     ];
-    let body = request_body(
-        "deepseek-chat",
-        &messages,
-        true,
-        None,
-        &tools::tools_json(),
-    );
+    let body = request_body("deepseek-chat", &messages, true, None, &tools::tools_json());
     let value: serde_json::Value = serde_json::from_str(&body).expect("请求体是合法 JSON");
 
     assert_eq!(value["tool_choice"], "auto");
-    assert!(value["tools"].as_array().is_some_and(|list| list.len() >= 5));
+    assert!(
+        value["tools"]
+            .as_array()
+            .is_some_and(|list| list.len() >= 5)
+    );
     let json_messages = value["messages"].as_array().expect("messages 是数组");
     assert_eq!(
         json_messages[2]["tool_calls"][0]["function"]["name"],
@@ -612,7 +618,10 @@ fn a_long_conversation_is_trimmed_and_marked() {
     let system = value["messages"][0]["content"]
         .as_str()
         .expect("第一条是系统提示");
-    assert!(system.contains("已省略"), "系统提示里要有省略标记：{system}");
+    assert!(
+        system.contains("已省略"),
+        "系统提示里要有省略标记：{system}"
+    );
     // 最新的提问一定还在。
     let sent = value["messages"].as_array().expect("messages 是数组");
     assert!(sent.iter().any(|item| item["content"] == "最后一个问题"));
@@ -640,7 +649,10 @@ fn an_over_long_tool_output_is_clipped_with_a_marker() {
     );
     let value: serde_json::Value = serde_json::from_str(&body).expect("请求体是合法 JSON");
     let system = value["messages"][0]["content"].as_str().expect("系统提示");
-    assert!(system.contains("已截断"), "系统提示里要有截断标记：{system}");
+    assert!(
+        system.contains("已截断"),
+        "系统提示里要有截断标记：{system}"
+    );
 }
 
 fn temp_rules_dir(name: &str) -> std::path::PathBuf {
@@ -668,10 +680,16 @@ fn ai_rules_select_common_plus_language_file() {
     assert!(!rust.contains("DEFAULT") && !rust.contains("VB"), "{rust}");
 
     let other = crate::ai::rules::rules_for_language_in(Some(&dir), Some("python"));
-    assert!(other.contains("COMMON") && other.contains("DEFAULT"), "{other}");
+    assert!(
+        other.contains("COMMON") && other.contains("DEFAULT"),
+        "{other}"
+    );
 
     let none = crate::ai::rules::rules_for_language_in(Some(&dir), None);
-    assert!(none.contains("COMMON") && none.contains("DEFAULT"), "{none}");
+    assert!(
+        none.contains("COMMON") && none.contains("DEFAULT"),
+        "{none}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -753,7 +771,11 @@ fn the_reasoner_model_gets_no_tools() {
         &tools::tools_for_model("deepseek-chat"),
     );
     let value: serde_json::Value = serde_json::from_str(&body).expect("请求体是合法 JSON");
-    assert!(value["tools"].as_array().is_some_and(|list| !list.is_empty()));
+    assert!(
+        value["tools"]
+            .as_array()
+            .is_some_and(|list| !list.is_empty())
+    );
 
     // 推理模型不支持函数调用：不带 tools，也就不会去改文件。
     assert!(!tools::model_supports_tools("deepseek-reasoner"));
@@ -767,4 +789,79 @@ fn the_reasoner_model_gets_no_tools() {
     let value: serde_json::Value = serde_json::from_str(&body).expect("请求体是合法 JSON");
     assert!(value.get("tools").is_none());
     assert!(value.get("tool_choice").is_none());
+}
+
+#[test]
+fn tool_delete_path_plans_action_and_rejects_roots() {
+    use crate::ai::tools::AppAction;
+
+    let root = std::env::temp_dir().join(format!("qide-ai-delete-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("创建测试目录");
+    std::fs::write(root.join("a.vb"), "Dim x\n").expect("写文件");
+    let files = std::collections::HashMap::new();
+
+    match run_tool(&root, &files, &call("delete_path", json!({"path": "a.vb"}))) {
+        ToolPlan::Action {
+            action: AppAction::DeletePath { path, is_dir },
+            summary,
+        } => {
+            assert!(path.ends_with("a.vb"));
+            assert!(!is_dir);
+            assert!(summary.contains("删除"));
+        }
+        _ => panic!("delete_path 应当给出动作计划"),
+    }
+    assert!(
+        AppAction::DeletePath {
+            path: root.join("a.vb").to_string_lossy().into_owned(),
+            is_dir: false,
+        }
+        .requires_confirmation()
+    );
+
+    match run_tool(&root, &files, &call("delete_path", json!({"path": "."}))) {
+        ToolPlan::Read { content, .. } => assert!(content.contains("项目根目录"), "{content}"),
+        _ => panic!("不能删除项目根目录"),
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn tool_move_path_validates_targets() {
+    use crate::ai::tools::AppAction;
+
+    let root = std::env::temp_dir().join(format!("qide-ai-move-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("sub")).expect("创建子目录");
+    std::fs::write(root.join("a.vb"), "Dim x\n").expect("写文件");
+    let files = std::collections::HashMap::new();
+
+    match run_tool(
+        &root,
+        &files,
+        &call("move_path", json!({"path": "a.vb", "target_dir": "sub"})),
+    ) {
+        ToolPlan::Action {
+            action: AppAction::MovePath { source, target_dir },
+            summary,
+        } => {
+            assert!(source.ends_with("a.vb"));
+            assert!(target_dir.ends_with("sub"));
+            assert!(summary.contains("移动"));
+        }
+        _ => panic!("move_path 应当给出动作计划"),
+    }
+
+    match run_tool(
+        &root,
+        &files,
+        &call("move_path", json!({"path": "a.vb", "target_dir": "."})),
+    ) {
+        ToolPlan::Read { content, .. } => assert!(content.contains("已经在"), "{content}"),
+        _ => panic!("已经在目标目录里的移动应当被拒绝"),
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
 }

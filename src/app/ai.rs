@@ -8,7 +8,7 @@ impl CodeWindow {
     pub(crate) fn ai_execute_action(
         &mut self,
         action: crate::ai::tools::AppAction,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<String, String> {
         use crate::ai::tools::AppAction;
@@ -73,6 +73,33 @@ impl CodeWindow {
                 condition,
             } => self.ai_set_breakpoint(line, enabled, condition.as_deref(), cx),
             AppAction::AddWatch { expression } => self.ai_add_watch(&expression, cx),
+            AppAction::DeletePath { path, is_dir } => {
+                match self.delete_path_checked(&path, is_dir, window, cx) {
+                    Ok(()) => {
+                        let text = format!("已删除 {path}");
+                        self.output().success(cx, text.clone());
+                        Ok(text)
+                    }
+                    Err(error) => {
+                        let text = format!("删除失败：{error}");
+                        self.output().error(cx, text.clone());
+                        Err(text)
+                    }
+                }
+            }
+            AppAction::MovePath { source, target_dir } => {
+                match self.move_path_checked(&source, &target_dir, cx) {
+                    Ok(text) => {
+                        self.output().success(cx, text.clone());
+                        Ok(text)
+                    }
+                    Err(error) => {
+                        let text = format!("移动失败：{error}");
+                        self.output().error(cx, text.clone());
+                        Err(text)
+                    }
+                }
+            }
         }
     }
 
@@ -267,7 +294,12 @@ impl CodeWindow {
     }
 
     /// 「写入文件」：先让用户确认目标路径，再写盘。
-    pub(crate) fn apply_ai_code(&mut self, code: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn apply_ai_code(
+        &mut self,
+        code: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let hint = self.ai_target_hint();
         let input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -280,8 +312,9 @@ impl CodeWindow {
             let field = input.clone();
             Rc::new(move |window, cx| {
                 let target = field.read(cx).value().to_string();
-                let _ = handle
-                    .update(cx, |this, cx| this.write_ai_code(&target, &code, window, cx));
+                let _ = handle.update(cx, |this, cx| {
+                    this.write_ai_code(&target, &code, window, cx)
+                });
                 window.close_dialog(cx);
             })
         };
@@ -388,8 +421,8 @@ impl CodeWindow {
                 };
                 editor.update(cx, |editor, cx| {
                     editor.set_value(content.to_string(), window, cx);
-                    let selection = selection.start.min(content.len())
-                        ..selection.end.min(content.len());
+                    let selection =
+                        selection.start.min(content.len())..selection.end.min(content.len());
                     let start = char_boundary_at_or_before(content, selection.start);
                     let end = char_boundary_at_or_before(content, selection.end).max(start);
                     editor.set_selected_range(start..end, cx);

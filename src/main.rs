@@ -21,6 +21,7 @@
 
 // 资源管理器的模型测试放在独立文件里：写在 explorer.rs 的 tests 子模块中会
 // 触发 rustc 的宏展开递归上限。
+mod agent;
 mod ai;
 mod app;
 mod assets;
@@ -28,8 +29,8 @@ mod brackets;
 mod commands;
 mod completion;
 mod custom_theme;
-mod editor_pane;
 mod editing;
+mod editor_pane;
 mod encoding;
 mod explorer;
 mod interpreter;
@@ -38,18 +39,22 @@ mod lint;
 mod menu;
 mod outline;
 mod output;
-mod panels;
 mod panel_drag;
+mod panels;
 mod search;
 mod secret_store;
 mod settings;
 mod startup;
 mod status_bar;
 mod syntax;
+mod terminal;
 mod theme;
 mod title_bar;
 mod window_frame;
 mod workspace;
+
+#[cfg(test)]
+mod agent_tests;
 
 #[cfg(test)]
 mod ai_tests;
@@ -86,6 +91,12 @@ mod shell_tests;
 
 #[cfg(test)]
 mod builtins_tests;
+
+#[cfg(test)]
+mod vb6_golden_data;
+
+#[cfg(test)]
+mod vb6_golden_tests;
 
 #[cfg(test)]
 mod encoding_tests;
@@ -137,8 +148,8 @@ use gpui_kit::*;
 fn main() {
     // 命令行：`--help` / `--version` 直接输出后退出，其余参数是待打开的文件或文件夹。
     // 文件的“打开方式”指到 first.exe 时，Windows 就是这样把路径传进来的。
-    let startup_paths = match startup::parse(std::env::args().skip(1)) {
-        startup::Command::Open(paths) => paths,
+    let (startup_paths, startup_background) = match startup::parse(std::env::args().skip(1)) {
+        startup::Command::Open { paths, background } => (paths, background),
         startup::Command::Help => {
             startup::report(startup::USAGE, startup::Level::Info);
             return;
@@ -202,6 +213,8 @@ fn main() {
                 window_min_size: Some(size(px(480.0), px(320.0))),
                 // 交给系统自带的边框处理缩放，外沿只有 1px 边框。
                 is_resizable: true,
+                // 由 qide-mcp 自动拉起时不抢当前窗口的焦点。
+                focus: !startup_background,
                 window_background: WindowBackgroundAppearance::Opaque,
                 ..Default::default()
             };

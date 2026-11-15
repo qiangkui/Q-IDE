@@ -895,9 +895,8 @@ fn runtime_error_number(source: &str) -> i64 {
 fn longlong_division_overflow_reports_vb_error_6() {
     // `LongLong` 最小值 `\ -1` 与 `Mod -1` 在 Rust 里会 panic，解释器应当报错误号 6。
     for operator in ["\\", "Mod"] {
-        let source = format!(
-            "Dim x As LongLong\nx = -9223372036854775807 - 1\nDebug.Print x {operator} -1"
-        );
+        let source =
+            format!("Dim x As LongLong\nx = -9223372036854775807 - 1\nDebug.Print x {operator} -1");
         assert_eq!(runtime_error_number(&source), 6, "整数溢出应当报错误号 6");
     }
 }
@@ -945,6 +944,109 @@ Debug.Print a(2)
 Debug.Print UBound(a)
 "#;
     assert_eq!(output(source), ["7", "3"]);
+}
+
+/// 循环结束后计数器停在「第一个不满足条件的值」（本机 VB6 实测）。
+#[test]
+fn for_leaves_the_counter_at_the_first_failing_value() {
+    let cases = [
+        ("For i = 1 To 4\nNext i", "5"),
+        ("For i = 1 To 10 Step 3\nNext i", "13"),
+        ("For i = 5 To 1 Step -2\nNext i", "-1"),
+        ("For i = 5 To 1\nNext i", "5"),
+        ("For i = 1 To 10\nIf i = 4 Then Exit For\nNext i", "4"),
+    ];
+    for (loop_source, expected) in cases {
+        let source = format!("Dim i As Long\n{loop_source}\nDebug.Print i");
+        assert_eq!(output(&source), [expected], "{loop_source}");
+    }
+}
+
+/// `For` 的计数器溢出按 VB6 报错误号 6（`Integer` 到 32767、`Long` 到 2147483647 之后再加一步）。
+#[test]
+fn for_counter_overflow_reports_error_six() {
+    let source = r#"
+Dim i As Integer, n As Long
+On Error Resume Next
+For i = 32767 To 32767
+    n = n + 1
+Next i
+Debug.Print n
+Debug.Print Err.Number
+Err.Clear
+For i = -32768 To -32768
+    n = n + 1
+Next i
+Debug.Print n
+Debug.Print Err.Number
+"#;
+    assert_eq!(output(source), ["1", "6", "2", "0"]);
+}
+
+/// `Loc(n)` 在二进制模式下返回「最后一个读写过的字节」的 1 基位置（VB6 实测：Seek 2 后 Get 一个字节 → 2）。
+#[test]
+fn loc_reports_the_last_byte_accessed() {
+    let dir = std::env::temp_dir().join(format!("qide-loc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("loc.dat"), [1u8, 2, 3]).unwrap();
+    let source = r#"
+Dim fn As Integer, a As Byte
+fn = FreeFile
+Open "loc.dat" For Binary As #fn
+Debug.Print Loc(fn)
+Debug.Print LOF(fn)
+Seek #fn, 2
+Get #fn, , a
+Debug.Print a
+Debug.Print Loc(fn)
+Close #fn
+"#;
+    let interrupt = AtomicBool::new(false);
+    let mut lines = Vec::new();
+    let options = crate::interpreter::RunOptions {
+        script_path: Some(dir.join("loc.vb")),
+        allow_ui: false,
+        ..crate::interpreter::RunOptions::default()
+    };
+    crate::interpreter::run_with(
+        source,
+        |line| lines.push(line.to_string()),
+        &interrupt,
+        options,
+    )
+    .expect("脚本应当执行成功");
+    assert_eq!(lines, ["0", "3", "2", "2"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 下标超过栈上缓冲上限（8 维）时退回堆分配的分支也要正确。
+#[test]
+fn nine_dimension_array_indexing_round_trips() {
+    let source = r#"
+Dim a() As Long
+ReDim a(1 To 2, 1 To 2, 1 To 2, 1 To 2, 1 To 2, 1 To 2, 1 To 2, 1 To 2, 1 To 2)
+a(2, 2, 2, 2, 2, 2, 2, 2, 2) = 42
+Debug.Print a(2, 2, 2, 2, 2, 2, 2, 2, 2)
+Debug.Print a(1, 1, 1, 1, 1, 1, 1, 1, 1)
+Debug.Print UBound(a, 9)
+"#;
+    assert_eq!(output(source), ["42", "0", "2"]);
+}
+
+/// 数组元素是强类型时，写入仍要按元素类型检查（快路径不能绕过溢出）。
+#[test]
+fn array_element_assignment_still_checks_the_element_type() {
+    assert_eq!(
+        runtime_error_number("Dim a(1) As Integer\na(0) = 40000"),
+        6,
+        "数组元素溢出应当报错误号 6"
+    );
+    assert_eq!(
+        output("Dim a(1) As String\na(0) = 5\nDebug.Print a(0)"),
+        ["5"],
+        "字符串数组元素仍按元素类型转换"
+    );
 }
 
 #[test]
@@ -1072,7 +1174,8 @@ fn for_loop_uses_exact_integer_steps() {
         ["0", "3", "6", "9"]
     );
     // 超过 2^53 的整数步进：浮点累加会原地打转，整数路径必须精确。
-    let source = "Dim i As LongLong\nFor i = 9007199254740990 To 9007199254740992\nDebug.Print i\nNext i";
+    let source =
+        "Dim i As LongLong\nFor i = 9007199254740990 To 9007199254740992\nDebug.Print i\nNext i";
     assert_eq!(
         output(source),
         ["9007199254740990", "9007199254740991", "9007199254740992"]
@@ -1139,8 +1242,11 @@ fn include_dir_can_replace_the_bundled_assets_folder() {
     let dir = std::env::temp_dir().join(format!("qide_include_dir_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("建临时目录");
-    std::fs::write(dir.join("shared.vb"), "Private Const FROM_DIR As Long = 7\n")
-        .expect("写 include 文件");
+    std::fs::write(
+        dir.join("shared.vb"),
+        "Private Const FROM_DIR As Long = 7\n",
+    )
+    .expect("写 include 文件");
     let script_dir = dir.join("scripts");
     std::fs::create_dir_all(&script_dir).expect("建脚本目录");
     let script = script_dir.join("main.vb");
@@ -1265,8 +1371,3 @@ Debug.Print Down(190)
         "错误信息：{message}"
     );
 }
-
-
-
-
-

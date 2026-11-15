@@ -245,6 +245,8 @@ pub enum TokenKind {
     Int(i64),
     Float(f64),
     Date(f64),
+    /// `123@`：十进制 `Currency` 字面量，值已按 1/10000 定点缩放。
+    Currency(i64),
     Str(String),
     Kw(Kw),
     Op(Op),
@@ -303,6 +305,7 @@ impl Token {
             TokenKind::Int(value) => format!("数字 `{value}`"),
             TokenKind::Float(value) => format!("数字 `{value}`"),
             TokenKind::Date(value) => format!("日期 `{value}`"),
+            TokenKind::Currency(value) => format!("货币 `{}`", *value as f64 / 10_000.0),
             TokenKind::Str(value) => format!("字符串 \"{value}\""),
             TokenKind::Kw(kw) => format!("关键字 `{}`", kw.text()),
             TokenKind::Op(op) => format!("符号 `{}`", op.text()),
@@ -760,6 +763,31 @@ fn scan_number(
             text.push_str(&digits);
             index = cursor;
         }
+    }
+
+    // 类型后缀：`123&`（Long）、`45%`（Integer）、`1.5!`（Single）、`2#`（Double）、`3.25@`（Currency）。
+    let suffix = match chars.get(index) {
+        Some(&suffix @ ('%' | '&' | '!' | '#' | '@')) => {
+            index += 1;
+            Some(suffix)
+        }
+        _ => None,
+    };
+
+    if matches!(suffix, Some('@')) {
+        let value: f64 = text
+            .parse()
+            .map_err(|_| ParseError::new(format!("无法解析数字 `{text}`"), line))?;
+        let scaled = crate::interpreter::value::currency_from_float(value).map_err(|message| {
+            ParseError::new(format!("Currency 字面量 `{text}`：{message}"), line)
+        })?;
+        return Ok((TokenKind::Currency(scaled), index));
+    }
+    if matches!(suffix, Some('!' | '#')) {
+        let value: f64 = text
+            .parse()
+            .map_err(|_| ParseError::new(format!("无法解析数字 `{text}`"), line))?;
+        return Ok((TokenKind::Float(value), index));
     }
 
     if is_float {

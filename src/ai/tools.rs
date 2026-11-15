@@ -99,6 +99,27 @@ pub fn specs() -> &'static [ToolSpec] {
             }"#,
         },
         ToolSpec {
+            name: "delete_path",
+            description: "删除项目内的文件或文件夹（文件夹连同内容）。执行前会先问用户。",
+            parameters: r#"{
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "相对项目根目录的路径"}},
+                "required": ["path"]
+            }"#,
+        },
+        ToolSpec {
+            name: "move_path",
+            description: "把项目内的文件或文件夹移动到另一个目录。执行前会先问用户。",
+            parameters: r#"{
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "要移动的文件/文件夹"},
+                    "target_dir": {"type": "string", "description": "目标目录"}
+                },
+                "required": ["path", "target_dir"]
+            }"#,
+        },
+        ToolSpec {
             name: "check_syntax",
             description: "对文件做语法与语义检查，返回问题列表（第几行、什么错误）。改完代码后用它自查。",
             parameters: r#"{
@@ -219,14 +240,27 @@ pub enum AppAction {
     AddWatch {
         expression: String,
     },
+    DeletePath {
+        path: String,
+        is_dir: bool,
+    },
+    MovePath {
+        source: String,
+        target_dir: String,
+    },
 }
 
 impl AppAction {
-    /// 这些操作会启动或推进脚本，遵循 AI 面板的确认设置。
+    /// 这些操作会启动或推进脚本，或者改动磁盘；遵循 AI 面板的确认设置。
     pub fn requires_confirmation(&self) -> bool {
         matches!(
             self,
-            Self::RunScript | Self::StartDebug | Self::ContinueDebug | Self::StepDebug
+            Self::RunScript
+                | Self::StartDebug
+                | Self::ContinueDebug
+                | Self::StepDebug
+                | Self::DeletePath { .. }
+                | Self::MovePath { .. }
         )
     }
 }
@@ -242,7 +276,9 @@ fn arguments(call: &crate::ai::client::ToolCall) -> Result<Value, String> {
 }
 
 fn text_arg(args: &Value, name: &str) -> Option<String> {
-    args.get(name).and_then(|value| value.as_str()).map(str::to_string)
+    args.get(name)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
 }
 
 fn int_arg(args: &Value, name: &str) -> Option<usize> {
@@ -269,6 +305,8 @@ pub fn plan(ctx: &PlanCtx<'_>, call: &crate::ai::client::ToolCall) -> ToolPlan {
         "list_files" => list_files(ctx, &args),
         "replace_in_file" => replace_in_file(ctx, &args),
         "write_file" => write_file(ctx, &args),
+        "delete_path" => delete_path(ctx, &args),
+        "move_path" => move_path(ctx, &args),
         "check_syntax" => check_syntax(ctx, &args),
         "read_output" => read_output(ctx),
         "run_script" => action(AppAction::RunScript, "运行当前 VB 脚本"),
@@ -369,7 +407,10 @@ fn read_file(ctx: &PlanCtx<'_>, args: &Value) -> ToolPlan {
     let lines: Vec<&str> = text.lines().collect();
     let total = lines.len();
     let start = int_arg(args, "start").unwrap_or(1).max(1);
-    let end = int_arg(args, "end").unwrap_or(start + 399).min(total).max(start.min(total));
+    let end = int_arg(args, "end")
+        .unwrap_or(start + 399)
+        .min(total)
+        .max(start.min(total));
     let shown = &lines[(start - 1).min(total)..end.min(total)];
 
     let mut content = String::new();
@@ -380,7 +421,10 @@ fn read_file(ctx: &PlanCtx<'_>, args: &Value) -> ToolPlan {
         content.push_str("（空文件）\n");
     }
     if end < total {
-        content.push_str(&format!("…… 还有 {} 行，需要时用 start/end 继续读\n", total - end));
+        content.push_str(&format!(
+            "…… 还有 {} 行，需要时用 start/end 继续读\n",
+            total - end
+        ));
     }
     let summary = format!(
         "读取 {}（第 {}–{} 行／共 {} 行）",
@@ -482,6 +526,68 @@ fn write_file(ctx: &PlanCtx<'_>, args: &Value) -> ToolPlan {
     }
 }
 
+fn delete_path(ctx: &PlanCtx<'_>, args: &Value) -> ToolPlan {
+    let Some(raw) = text_arg(args, "path") else {
+        return read_failure("参数错误".to_string(), "错误：缺少 path".to_string());
+    };
+    let path = match resolve(ctx.root, &raw) {
+        Ok(path) => path,
+        Err(error) => return read_failure("路径不合法".to_string(), format!("错误：{error}")),
+    };
+    let roots = [ctx.root.to_path_buf()];
+    if let Err(error) = crate::agent::ensure_not_root(&path, &roots) {
+        return read_failure("不能删除项目根目录".to_string(), format!("错误：{error}"));
+    }
+    if !path.exists() {
+        return read_failure(
+            format!("路径不存在：{raw}"),
+            format!("错误：路径不存在 `{raw}`"),
+        );
+    }
+    let display = display_path(ctx.root, &path);
+    action(
+        AppAction::DeletePath {
+            path: path.to_string_lossy().into_owned(),
+            is_dir: path.is_dir(),
+        },
+        &format!("删除 {display}"),
+    )
+}
+
+fn move_path(ctx: &PlanCtx<'_>, args: &Value) -> ToolPlan {
+    let (Some(raw), Some(target_raw)) = (text_arg(args, "path"), text_arg(args, "target_dir"))
+    else {
+        return read_failure(
+            "参数错误".to_string(),
+            "错误：需要 path 和 target_dir".to_string(),
+        );
+    };
+    let source = match resolve(ctx.root, &raw) {
+        Ok(path) => path,
+        Err(error) => return read_failure("路径不合法".to_string(), format!("错误：{error}")),
+    };
+    let target_dir = match resolve(ctx.root, &target_raw) {
+        Ok(path) => path,
+        Err(error) => return read_failure("路径不合法".to_string(), format!("错误：{error}")),
+    };
+    let roots = [ctx.root.to_path_buf()];
+    if let Err(error) = crate::agent::ensure_not_root(&source, &roots) {
+        return read_failure("不能移动项目根目录".to_string(), format!("错误：{error}"));
+    }
+    if let Err(error) = crate::agent::validate_move(&source, &target_dir) {
+        return read_failure("移动目标不合法".to_string(), format!("错误：{error}"));
+    }
+    let display = display_path(ctx.root, &source);
+    let target_display = display_path(ctx.root, &target_dir);
+    action(
+        AppAction::MovePath {
+            source: source.to_string_lossy().into_owned(),
+            target_dir: target_dir.to_string_lossy().into_owned(),
+        },
+        &format!("移动 {display} 到 {target_display}"),
+    )
+}
+
 fn check_syntax(ctx: &PlanCtx<'_>, args: &Value) -> ToolPlan {
     let Some(raw) = text_arg(args, "path") else {
         return read_failure("参数错误".to_string(), "错误：缺少 path".to_string());
@@ -545,10 +651,7 @@ fn syntax_report(source: &str, path: Option<&Path>) -> (String, usize) {
                 (text, issues.len())
             }
         }
-        Err(error) => (
-            format!("第 {} 行: {}", error.line(), error.message()),
-            1,
-        ),
+        Err(error) => (format!("第 {} 行: {}", error.line(), error.message()), 1),
     }
 }
 
@@ -569,7 +672,10 @@ fn collect_files(root: &Path, dir: &Path, limit: usize) -> Vec<String> {
                 continue;
             }
             if path.is_dir() {
-                if matches!(name.as_str(), "target" | "node_modules" | "vendor" | "build" | "dist") {
+                if matches!(
+                    name.as_str(),
+                    "target" | "node_modules" | "vendor" | "build" | "dist"
+                ) {
                     continue;
                 }
                 stack.push(path);

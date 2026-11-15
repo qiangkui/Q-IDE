@@ -30,3 +30,20 @@ fn undeclared_variable_is_reported_live() {
     assert_eq!(issues[0].line, 2);
     assert!(issues[0].message.contains("`x`"));
 }
+
+#[test]
+fn missing_interface_member_is_reported_live() {
+    let issues = analyze(
+        "Class IShape\n\
+             Public Function Area() As Long\n\
+         End Function\n\
+         End Class\n\
+         Class Square\n\
+             Implements IShape\n\
+         End Class\n",
+    )
+    .issues;
+    assert_eq!(issues.len(), 1, "{issues:?}");
+    assert_eq!(issues[0].line, 5);
+    assert!(issues[0].message.contains("ishape_area"), "{issues:?}");
+}

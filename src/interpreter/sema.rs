@@ -17,10 +17,10 @@ pub struct Issue {
     pub message: String,
 }
 
-/// 检查整份程序。没有 `Option Explicit` 时返回空（与运行时的宽松模式一致）。
+/// 检查整份程序。没有 `Option Explicit` 时只做 `Implements` 检查。
 pub fn analyze(program: &Program) -> Vec<Issue> {
     if !program.option_explicit {
-        return Vec::new();
+        return check_implements(program);
     }
 
     let mut checker = Checker {
@@ -72,7 +72,75 @@ pub fn analyze(program: &Program) -> Vec<Issue> {
         }
     }
 
-    checker.issues
+    let mut issues = check_implements(program);
+    issues.extend(checker.issues);
+    issues
+}
+
+/// `Implements` 的成员一致性检查。
+///
+/// 接口类的每个公开成员都要求在实现类里存在 `接口名_成员名`（VB6 的约定），
+/// 反向也要求实现类里不存在接口没有的 `接口名_xxx`。这条检查与 `Option
+/// Explicit` 无关：VB6 无论有没有该选项都会在编译期报错。
+fn check_implements(program: &Program) -> Vec<Issue> {
+    let mut issues = Vec::new();
+    for class in &program.classes {
+        for interface in &class.implements {
+            // 解析阶段已经校验过接口类存在，这里再兜一次底。
+            let Some(def) = program.classes.iter().find(|def| &def.name == interface) else {
+                continue;
+            };
+            let interface_members = def
+                .methods
+                .iter()
+                .filter(|method| !method.is_private)
+                .collect::<Vec<_>>();
+            let members = interface_members
+                .iter()
+                .map(|method| method.name.clone())
+                .collect::<HashSet<_>>();
+            for member in &interface_members {
+                let expected = format!("{interface}_{}", member.name);
+                let Some(implementation) =
+                    class.methods.iter().find(|method| method.name == expected)
+                else {
+                    issues.push(Issue {
+                        line: class.line,
+                        message: format!(
+                            "类 `{}` 没有实现接口 `{interface}` 的成员 `{}`（应写 `{}`）",
+                            class.name, member.name, expected
+                        ),
+                    });
+                    continue;
+                };
+                // `Function` 与 `Property Get` 在解释器里是同一种过程，不区分。
+                if implementation.is_let != member.is_let || implementation.is_set != member.is_set
+                {
+                    issues.push(Issue {
+                        line: implementation.line,
+                        message: format!(
+                            "`{expected}` 的声明形式与接口 `{interface}` 的成员 `{}` 不一致",
+                            member.name
+                        ),
+                    });
+                }
+            }
+            let prefix = format!("{interface}_");
+            for method in &class.methods {
+                let Some(rest) = method.name.strip_prefix(&prefix) else {
+                    continue;
+                };
+                if members.contains(rest) {
+                    continue;
+                }
+                issues.push(Issue {
+                    line: method.line,
+                    message: format!("接口 `{interface}` 没有成员 `{rest}`"),
+                });
+            }
+        }
+    }
+    issues
 }
 
 struct Checker {

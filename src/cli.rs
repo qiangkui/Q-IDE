@@ -51,6 +51,8 @@ qide-run —— 不开界面的 VB 脚本运行器
   --timeout <时长>      超时后中断脚本，例如 30s、500ms、2m（默认不限制）
   --include-dir <目录>  #Include 在脚本目录找不到时再搜这里
   --arg <文本>          脚本里 Command() 返回的参数
+  --stats               运行结束后输出语句/表达式/调用/数组访问的频次统计
+  --trace               逐条输出执行轨迹（`» 第 N 行`，走 stderr / `trace` 事件）
   --ui / --no-ui        允许 / 禁止 MsgBox、InputBox 弹窗
                         （默认：人直接运行时允许；--json 或输出被重定向时禁止）
   --pause / --no-pause  结束时等待回车（默认规则同上；双击运行会自动等待）
@@ -79,6 +81,10 @@ pub struct Args {
     pub timeout: Option<Duration>,
     pub include_dir: Option<PathBuf>,
     pub command_line: String,
+    /// `--stats`：运行结束后输出执行频次统计。
+    pub stats: bool,
+    /// `--trace`：逐条输出执行轨迹。
+    pub trace: bool,
     /// `--ui` / `--no-ui`；`None` 表示按「是不是人直接运行」决定。
     pub ui: Option<bool>,
     /// `--pause` / `--no-pause`；`None` 表示按「是不是人直接运行」决定。
@@ -113,6 +119,8 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
     let mut command_line = String::new();
     let mut ui = None;
     let mut pause = None;
+    let mut stats = false;
+    let mut trace = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -122,6 +130,8 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
             "-V" | "--version" => return Ok(Invocation::Version),
             "--json" => json = true,
             "-q" | "--quiet" => quiet = true,
+            "--stats" => stats = true,
+            "--trace" => trace = true,
             "--ui" => ui = Some(true),
             "--no-ui" => ui = Some(false),
             "--pause" => pause = Some(true),
@@ -189,6 +199,8 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
         command_line,
         ui,
         pause,
+        stats,
+        trace,
     }))
 }
 
@@ -368,13 +380,15 @@ fn run_command(args: &Args) -> i32 {
     if let Some(depth) = args.max_depth {
         options.max_depth = depth;
     }
+    options.count_stats = args.stats;
+    options.trace = args.trace;
 
-    let (sender, receiver) = mpsc::channel::<(i32, u64)>();
+    let (sender, receiver) = mpsc::channel::<(i32, u64, interpreter::runtime::RunStats)>();
     let worker_sink = sink.clone();
     let spawned = interpreter::spawn_script_thread(move || {
         let started = Instant::now();
         let mut emit = |line: &str| worker_sink.line(line);
-        let result = interpreter::run_with(&source, &mut emit, &INTERRUPT, options);
+        let (result, stats) = interpreter::run_with_stats(&source, &mut emit, &INTERRUPT, options);
         let elapsed = started.elapsed().as_millis() as u64;
         // 被中断时不发 `finished`：最终事件由主线程统一发，才能区分超时与 Ctrl+C。
         let code = if INTERRUPT.load(Ordering::SeqCst) {
@@ -383,7 +397,7 @@ fn run_command(args: &Args) -> i32 {
             worker_sink.finished(&result, elapsed);
             exit_code(&result)
         };
-        let _ = sender.send((code, elapsed));
+        let _ = sender.send((code, elapsed, stats));
     });
     if let Err(error) = spawned {
         eprintln!("无法启动脚本线程：{error}");
@@ -392,7 +406,7 @@ fn run_command(args: &Args) -> i32 {
 
     let limit = args.timeout;
     let mut timed_out = false;
-    let (code, elapsed) = match limit {
+    let (code, elapsed, stats) = match limit {
         None => match receiver.recv() {
             Ok(outcome) => outcome,
             Err(_) => return report_dead_worker(&sink),
@@ -404,12 +418,35 @@ fn run_command(args: &Args) -> i32 {
                 // 先让脚本在语句边界自己收尾，收不了就由进程退出兜底。
                 timed_out = true;
                 INTERRUPT.store(true, Ordering::SeqCst);
-                receiver
-                    .recv_timeout(Duration::from_secs(2))
-                    .unwrap_or((EXIT_INTERRUPTED, limit.as_millis() as u64))
+                receiver.recv_timeout(Duration::from_secs(2)).unwrap_or((
+                    EXIT_INTERRUPTED,
+                    limit.as_millis() as u64,
+                    interpreter::runtime::RunStats::default(),
+                ))
             }
         },
     };
+
+    if args.stats {
+        sink.event(
+            json!({
+                "type": "stats",
+                "statements": stats.statements,
+                "expressions": stats.expressions,
+                "calls": stats.calls,
+                "array_accesses": stats.array_accesses,
+                "variable_reads": stats.variable_reads,
+            }),
+            Some(format!(
+                "统计：语句 {}，表达式 {}，调用 {}，数组访问 {}，变量读取 {}",
+                stats.statements,
+                stats.expressions,
+                stats.calls,
+                stats.array_accesses,
+                stats.variable_reads
+            )),
+        );
+    }
 
     if code == EXIT_INTERRUPTED {
         let (plain, reason) = if timed_out {
@@ -459,11 +496,7 @@ fn check_command(args: &Args) -> i32 {
     };
     let path = absolute(&args.script);
     let sink = Sink::new(args.json, args.quiet);
-    match interpreter::parse_with_include_dir(
-        &source,
-        Some(&path),
-        args.include_dir.as_deref(),
-    ) {
+    match interpreter::parse_with_include_dir(&source, Some(&path), args.include_dir.as_deref()) {
         Ok((program, map)) => {
             let issues: Vec<(usize, String)> = interpreter::sema::analyze(&program)
                 .into_iter()
@@ -560,6 +593,17 @@ impl Sink {
 
     /// 脚本的一行输出。
     fn line(&self, text: &str) {
+        // 执行轨迹（`--trace`）是诊断信息：JSON 模式单独给一种事件，普通模式走 stderr，
+        // 这样 stdout 里始终只有脚本自己打印的内容。
+        if text.starts_with(interpreter::TRACE_PREFIX) {
+            if self.json {
+                self.write(json!({"type": "trace", "text": text}), None);
+            } else {
+                let mut err = std::io::stderr();
+                let _ = writeln!(err, "{text}");
+            }
+            return;
+        }
         if self.quiet {
             return;
         }
@@ -668,4 +712,3 @@ fn install_ctrl_c_handler() {
 #[cfg(test)]
 #[path = "cli_tests.rs"]
 mod tests;
-

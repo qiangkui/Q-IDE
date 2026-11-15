@@ -1,0 +1,267 @@
+# VB6 黄金测试用例：每行一个表达式，由 tools/vb6_golden.py 用本机 VB6 编译执行后生成期望值。
+# 只能放「结果能被 CStr 转换」的表达式（Null / 数组 / 对象不行）。
+# 已知与 QIDE 有意的差异写在 src/vb6_golden_tests.rs 的 KNOWN_DIFFERENCES 里。
+1 + 2 * 3
+2 ^ 3 ^ 2
+-2 ^ 2
+7 \ 2
+7 Mod 2
+1 / 2
+"a" & "b"
+"a" + "b"
+True + 1
+Not 0
+5 And 3
+5 Or 3
+5 Xor 3
+5 Eqv 3
+5 Imp 3
+CInt(2.5)
+CInt(3.5)
+CLng(-2.5)
+CStr(1.5)
+CStr(True)
+CSng(1.23456789)
+CCur(1.5)
+CByte(200)
+CDbl("1e3")
+CVar(3)
+VarType(1.5)
+VarType("s")
+VarType(True)
+Len("abc")
+Left("abcdef", 2)
+Mid("abcdef", 2, 3)
+InStr("abcabc", "b")
+StrReverse("abc")
+UCase("aB")
+LCase("aB")
+Replace("aXbX", "X", "-")
+StrComp("a", "A", 1)
+Trim("  x  ")
+Int(-1.5)
+Fix(-1.5)
+Round(2.5)
+Abs(-3)
+Sgn(-5)
+Sqr(9)
+Hex(255)
+Oct(8)
+Val("12abc")
+Str(5)
+Format(1234.5678, "0.00")
+Format(0.5, "0.00%")
+IsNumeric("12")
+IsNumeric("1a")
+IsEmpty(Empty)
+Choose(2, "a", "b")
+Switch(True, 1, False, 2)
+# —— 运算符优先级与结合性 ——
+2 * 3 + 4
+2 + 3 * 4
+1 - 2 - 3
+100 / 10 / 5
+2 ^ 2 ^ 3
+-3 ^ 2
+Not True
+Not 5
+1 = 1
+1 <> 1
+1 < 2
+"a" < "b"
+True And False
+True Or False
+True Xor True
+"abc" Like "a*"
+"abc" Like "a?"
+"abc" Like "a[bd]c"
+5 \ 2 * 2
+7 Mod 3 + 1
+# —— 字符串细节 ——
+Len("")
+Len("中文")
+Left("abc", 10)
+Right("abc", 10)
+Mid("abc", 10)
+
+UCase("")
+Space(3) & "x"
+String(3, "ab")
+InStr("abc", "")
+InStrRev("abcabc", "b")
+Replace("aaa", "a", "bb")
+StrComp("a", "b")
+StrComp("b", "a")
+StrComp("a", "a", 0)
+Str(0)
+Str(0.5)
+Str(-0.5)
+Str(1.5)
+CStr(0.5)
+CStr(-0.5)
+CStr(1.5)
+Trim(Str(0.5))
+Val("  12")
+Val("&H10")
+Val("1.5e2")
+Hex(0)
+Oct(0)
+Format(255, "0.00")
+Format(-1.5, "0.00")
+Format(1234567, "#,##0")
+# —— 数值转换与边界 ——
+CInt(1.5)
+CInt(-1.5)
+CInt(0.5)
+CLng(1.5)
+CInt(32767)
+CLng(2147483647)
+CCur(0.0001)
+CCur(-0.0001)
+CSng(0.1)
+CDbl(0.1)
+CByte(0)
+CByte(255)
+Abs(-1.5)
+Int(1.9)
+Fix(1.9)
+Round(1.5)
+Round(3.14159, 2)
+Sgn(0)
+Sqr(2)
+Exp(0)
+Log(1)
+# —— 类型判断 ——
+VarType(Empty)
+VarType(Null)
+VarType(True)
+VarType(1.5)
+VarType(CCur(1))
+VarType(CDate(0))
+IsNumeric("")
+IsNumeric(Empty)
+IsEmpty(Empty)
+IsNull(Null)
+TypeName(1)
+TypeName(1.5)
+TypeName("s")
+TypeName(True)
+# —— 日期（固定值，避免受当前时间影响） ——
+Year(DateSerial(2024, 2, 29))
+Month(DateSerial(2024, 2, 29))
+Day(DateSerial(2024, 2, 29))
+Weekday(DateSerial(2024, 1, 1))
+DateAdd("d", 1, DateSerial(2024, 2, 28))
+DateDiff("d", DateSerial(2024, 1, 1), DateSerial(2024, 3, 1))
+CStr(CDate(0))
+CStr(CDate(1))
+Hour(TimeSerial(13, 5, 9))
+Minute(TimeSerial(13, 5, 9))
+Second(TimeSerial(13, 5, 9))
+# —— Partition（区间文本） ——
+Partition(5, 0, 99, 10)
+Partition(0, 0, 99, 10)
+Partition(99, 0, 99, 10)
+Partition(100, 0, 99, 10)
+Partition(0, 1, 99, 10)
+Partition(5, 1, 10, 1)
+Partition(5, 0, 999, 1)
+Partition(5, 0, 9999, 10)
+Partition(5, 0, 100000, 1000)
+Partition(5, 0, 100, 1000)
+Partition(23, 0, 99, 50)
+Partition(150, 0, 99, 10)
+# —— 字符串函数（`$` 形式与比较方式参数） ——
+Left$("abcdef", 2)
+Right$("abcdef", 3)
+Mid$("abcdef", 2)
+Mid$("abcdef", 2, 2)
+Trim$("  x  ")
+LTrim$("  x  ")
+RTrim$("  x  ")
+UCase$("aB")
+LCase$("aB")
+Space$(0)
+Space$(3) & "x"
+String$(3, "ab")
+Chr$(65)
+InStr(2, "abcabc", "b")
+InStr(1, "abc", "B")
+InStr(1, "abc", "B", 1)
+InStr(1, "aBc", "b", 1)
+InStr(3, "aBcaBc", "b", 1)
+InStr(4, "abc", "a", 0)
+InStrRev("aBcaBc", "b")
+InStrRev("aBcaBc", "b", -1, 1)
+InStrRev("abcabc", "b", 3)
+InStrRev("abcabc", "b", 3, 0)
+Replace("aXbX", "X", "-", 1, -1, 1)
+Replace("aXbX", "x", "-", 1, -1, 1)
+Replace("aXbX", "X", "-", 3)
+Replace("aXbX", "X", "-", 1, 1)
+Replace("abc", "", "-")
+Replace("aaa", "a", "b", 2)
+# —— 数值取整与整数运算 ——
+Round(0.5)
+Round(1.5)
+Round(-1.5)
+Round(-2.5)
+Round(2.675, 2)
+Round(1.2345, 2)
+Int(-0.5)
+Fix(-0.5)
+-7 \ 2
+7 \ -2
+-7 Mod 2
+7 Mod -2
+-7.5 \ 2
+5.5 \ 2
+5.5 Mod 2
+Int(-7 / 2)
+# —— 进制与字符编码 ——
+Hex(-1)
+Oct(-1)
+Hex(3.9)
+Oct(3.9)
+Hex(255.4)
+AscW("中")
+ChrW(20013)
+Asc("A")
+Asc(" ")
+# —— 数组内建 ——
+UBound(Array())
+UBound(Array(1, 2, 3))
+LBound(Array(1, 2, 3))
+UBound(Split("a,b,c", ","))
+UBound(Split(""))
+Join(Array("a", "b"), "-")
+Join(Array(1, 2, 3), "+")
+UBound(Filter(Array("ax", "b", "ay"), "a"))
+# —— 长度与杂项 ——
+Len(CStr(123))
+Len(CStr(1.5))
+Len(CStr(True))
+IIf(True, 1, 2)
+IIf(False, "a", "b")
+IIf(1, "yes", "no")
+# —— Format：命名格式 ——
+Format(1234.5678, "General Number")
+Format(1234.5678, "Fixed")
+Format(1234.5678, "Standard")
+Format(1234, "Scientific")
+Format(0.5, "Percent")
+Format(True, "Yes/No")
+Format(False, "Yes/No")
+Format(True, "True/False")
+Format(True, "On/Off")
+# —— Format：自定义格式细节 ——
+Format(1234.5678, "##0.0")
+Format(1234.5678, "0.00E+00")
+Format(-1234.5, "#,##0.00;(#,##0.00)")
+Format(0, "0.00")
+Format(0.5, "0")
+Format(2.5, "0")
+Format(1.5, "0")
+Format(1234567, "#,##0")
+Format(0.5, "0.00%")
+Format(12, "000")

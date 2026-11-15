@@ -3,13 +3,12 @@
 //! 主窗口只负责活动栏、标题栏、状态栏和 DockArea；各面板的内容与交互都由这里的实体实现。
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use ::gpui::Action;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::*;
 use gpui_kit::component::dock::{
     BasePanel, DragPanel, Panel as DockPanel, PanelEvent, PanelId, TabGroup,
 };
@@ -18,12 +17,14 @@ use gpui_kit::component::input::{
     SelectAll, Undo,
 };
 use gpui_kit::component::tree::TreeState;
+use gpui_kit::component::*;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::CodeWindow;
 use crate::editor_pane::{
-    self, ContextMenuItem, EditorContextMenu, EditorPaneProps, MenuCallback,
-    OpenContextMenuAction, TabAction, TabMenuAction,
+    self, ContextMenuItem, EditorContextMenu, EditorPaneProps, MenuCallback, OpenContextMenuAction,
+    TabAction, TabMenuAction,
 };
 use crate::explorer::{self, ExplorerActions};
 use crate::interpreter::debug::DebugSnapshot;
@@ -31,6 +32,7 @@ use crate::outline::{self, BreakpointEntry, OutlineModel, OutlineSection, WatchE
 use crate::output::{self, OutputLog, OutputPanelProps};
 use crate::search::{self, SearchProgress, SearchQuery, SearchResults};
 use crate::settings::SettingsStore;
+use crate::terminal::TerminalState;
 use crate::theme::{self as ui_theme, Palette};
 use crate::workspace::OpenFile;
 
@@ -60,11 +62,7 @@ pub struct EditorPanel {
 }
 
 impl EditorPanel {
-    pub fn new(
-        app: WeakEntity<CodeWindow>,
-        editor: Entity<EditorState>,
-        font_size: f32,
-    ) -> Self {
+    pub fn new(app: WeakEntity<CodeWindow>, editor: Entity<EditorState>, font_size: f32) -> Self {
         let on_activate = {
             let app = app.clone();
             Rc::new(move |index: usize, window: &mut Window, cx: &mut App| {
@@ -248,7 +246,9 @@ impl EditorPanel {
         let set_condition = {
             let app = app.clone();
             Rc::new(move |window: &mut Window, cx: &mut App| {
-                let _ = app.update(cx, |this, cx| this.set_breakpoint_condition_dialog(window, cx));
+                let _ = app.update(cx, |this, cx| {
+                    this.set_breakpoint_condition_dialog(window, cx)
+                });
             }) as MenuCallback
         };
         let run_to_cursor = {
@@ -425,8 +425,9 @@ impl Render for EditorPanel {
         });
         let panel = cx.entity().downgrade();
         let on_tab_menu: TabMenuAction = Rc::new(move |index, position, _window, cx| {
-            let _ =
-                panel.update(cx, |panel, cx| panel.set_tab_menu(Some((index, position)), cx));
+            let _ = panel.update(cx, |panel, cx| {
+                panel.set_tab_menu(Some((index, position)), cx)
+            });
         });
         let on_drop_file = {
             let app = self.app.clone();
@@ -482,6 +483,10 @@ pub struct ExplorerPanel {
     app: WeakEntity<CodeWindow>,
     tree: Entity<TreeState>,
     is_empty: bool,
+    /// 多选状态：点条目左侧圆点后进入选择模式。
+    selection: explorer::ExplorerSelection,
+    /// 右键菜单当前指向的条目：菜单打开期间高亮这一行。
+    context_path: Option<String>,
     /// 树条目右键菜单（复用编辑器面板的自绘菜单外观）。
     menu: Option<EditorContextMenu>,
     group: Option<WeakEntity<TabGroup>>,
@@ -499,6 +504,8 @@ impl ExplorerPanel {
             app,
             tree,
             is_empty,
+            selection: explorer::ExplorerSelection::default(),
+            context_path: None,
             menu: None,
             group: None,
             focus: cx.focus_handle(),
@@ -508,6 +515,70 @@ impl ExplorerPanel {
     fn set_menu(&mut self, menu: Option<EditorContextMenu>, cx: &mut Context<Self>) {
         self.menu = menu;
         cx.notify();
+    }
+
+    /// 关闭右键菜单，同时取消右键指向的高亮。
+    fn dismiss_menu(&mut self, cx: &mut Context<Self>) {
+        self.menu = None;
+        self.context_path = None;
+        cx.notify();
+    }
+
+    /// 给外部 agent 读取：当前是否在选择模式，以及选中的路径。
+    pub(crate) fn selection_snapshot(&self) -> (bool, Vec<String>) {
+        (
+            self.selection.is_active(),
+            self.selection.paths().cloned().collect(),
+        )
+    }
+
+    /// 点条目左侧圆点：第一次进入选择模式并选中，之后切换选中状态。
+    fn select_path(&mut self, path: &str, cx: &mut Context<Self>) {
+        let was_active = self.selection.is_active();
+        self.selection.click(path);
+        if !was_active && self.selection.is_active() {
+            // 进入选择模式时清掉树自己的单选高亮，避免和本轮多选混在一起。
+            self.tree
+                .update(cx, |tree, cx| tree.set_selected_index(None, cx));
+        }
+        cx.notify();
+    }
+
+    fn cancel_selection(&mut self, cx: &mut Context<Self>) {
+        self.selection.clear();
+        cx.notify();
+    }
+
+    fn delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selection.is_empty() {
+            return;
+        }
+        let paths: Vec<(String, bool)> = self
+            .selection
+            .paths()
+            .map(|path| (path.clone(), Path::new(path).is_dir()))
+            .collect();
+        self.selection.clear();
+        cx.notify();
+        let app = self.app.clone();
+        let _ = app.update(cx, |this, cx| this.delete_paths_dialog(paths, window, cx));
+    }
+
+    /// 右键菜单里删除当前指向的条目（不是整个多选集合）。
+    fn delete_context_path(
+        &mut self,
+        path: String,
+        is_folder: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 选择模式下删掉单条后，选中集合可能留下失效路径，直接退出选择模式。
+        self.selection.clear();
+        cx.notify();
+        let app = self.app.clone();
+        let _ = app.update(cx, |this, cx| {
+            this.delete_path_dialog(path, is_folder, window, cx)
+        });
     }
 
     /// 树条目右键菜单：文件和文件夹各一组命令。
@@ -521,9 +592,29 @@ impl ExplorerPanel {
     ) -> EditorContextMenu {
         let panel = cx.entity().downgrade();
         let dismiss: MenuCallback = Rc::new(move |_window, cx| {
-            let _ = panel.update(cx, |panel, cx| panel.set_menu(None, cx));
+            let _ = panel.update(cx, |panel, cx| panel.dismiss_menu(cx));
         });
         let app = self.app.clone();
+
+        // 选择模式下只允许删除右键指向的条目，其它菜单命令一律收起。
+        if self.selection.is_active() {
+            let delete_panel = cx.entity().downgrade();
+            let delete: MenuCallback = Rc::new(move |window, cx| {
+                let path = path.clone();
+                let _ = delete_panel.update(cx, |panel, cx| {
+                    panel.delete_context_path(path, is_folder, window, cx)
+                });
+            });
+            return EditorContextMenu {
+                position,
+                items: vec![ContextMenuItem {
+                    label: "删除…",
+                    separator_before: false,
+                    action: delete,
+                }],
+                dismiss,
+            };
+        }
 
         // 文件才有「打开」，文件夹把新建命令放在最上面。
         let open: Option<MenuCallback> = (!is_folder).then(|| {
@@ -565,7 +656,9 @@ impl ExplorerPanel {
             let path = path.clone();
             Rc::new(move |window: &mut Window, cx: &mut App| {
                 let path = path.clone();
-                let _ = app.update(cx, |this, cx| this.delete_path_dialog(path, is_folder, window, cx));
+                let _ = app.update(cx, |this, cx| {
+                    this.delete_path_dialog(path, is_folder, window, cx)
+                });
             }) as MenuCallback
         };
         let copy_path = {
@@ -752,6 +845,22 @@ impl Render for ExplorerPanel {
         let on_context_menu: explorer::ExplorerMenuAction =
             Rc::new(move |path, is_folder, is_root, position, _window, cx| {
                 let _ = panel.update(cx, |panel, cx| {
+                    if panel.selection.is_active() {
+                        // 选择模式不跟树的单选混用。
+                        panel
+                            .tree
+                            .update(cx, |tree, cx| tree.set_selected_index(None, cx));
+                    } else {
+                        // 普通模式下右键把树单选移到这一行，左键原来的高亮随之取消。
+                        let index = panel
+                            .tree
+                            .read(cx)
+                            .index_of(&SharedString::from(path.clone()));
+                        panel
+                            .tree
+                            .update(cx, |tree, cx| tree.set_selected_index(index, cx));
+                    }
+                    panel.context_path = Some(path.clone());
                     let menu = panel.build_menu(path, is_folder, is_root, position, cx);
                     panel.set_menu(Some(menu), cx);
                 });
@@ -770,16 +879,48 @@ impl Render for ExplorerPanel {
         };
         let on_move: explorer::ExplorerMoveAction = {
             let app = self.app.clone();
+            let panel = cx.entity().downgrade();
             Rc::new(move |source, target, _window, cx| {
+                let new_path = Path::new(source)
+                    .file_name()
+                    .map(|name| Path::new(target).join(name).to_string_lossy().into_owned());
                 let _ = app.update(cx, |this, cx| this.move_path(source, target, cx));
+                // 移动失败时源路径还在，选中集合不要跟着改。
+                let moved = !Path::new(source).exists();
+                if moved && let Some(new_path) = new_path {
+                    let _ = panel.update(cx, |panel, cx| {
+                        panel.selection.rewrite(source, &new_path);
+                        cx.notify();
+                    });
+                }
+            })
+        };
+        let on_select: explorer::ExplorerSelectAction = {
+            let panel = cx.entity().downgrade();
+            Rc::new(move |path, _window, cx| {
+                let _ = panel.update(cx, |panel, cx| panel.select_path(path, cx));
+            })
+        };
+        let delete_selected: explorer::PanelCommand = {
+            let panel = cx.entity().downgrade();
+            Rc::new(move |window, cx| {
+                let _ = panel.update(cx, |panel, cx| panel.delete_selected(window, cx));
+            })
+        };
+        let cancel_selection: explorer::PanelCommand = {
+            let panel = cx.entity().downgrade();
+            Rc::new(move |_window, cx| {
+                let _ = panel.update(cx, |panel, cx| panel.cancel_selection(cx));
             })
         };
         let menu = self.menu.clone();
 
         let panel_id = PanelId::from(cx.entity().entity_id());
-        let drag = self.group.as_ref().and_then(|group| group.upgrade()).map(|group| {
-            DragPanel::new(panel_id, group.read(cx).node())
-        });
+        let drag = self
+            .group
+            .as_ref()
+            .and_then(|group| group.upgrade())
+            .map(|group| DragPanel::new(panel_id, group.read(cx).node()));
         let drag_start = {
             let app = self.app.clone();
             Some(Rc::new(move |cx: &mut App| {
@@ -787,30 +928,36 @@ impl Render for ExplorerPanel {
             }) as explorer::DragStartAction)
         };
 
-        let panel_element = div()
-            .size_full()
-            .p(px(ui_theme::PANEL_GAP / 2.0))
-            .child(explorer::render(
-                &self.tree,
-                None,
-                Palette::for_theme(cx),
-                ExplorerActions {
-                    open_file,
-                    add_folder,
-                    remove_root,
-                    toggle_folder,
-                    close_panel,
-                    new_file,
-                    new_folder,
-                    refresh,
-                    on_context_menu,
-                    on_move,
-                    is_empty: self.is_empty,
-                },
-                true,
-                drag,
-                drag_start,
-            ));
+        let panel_element =
+            div()
+                .size_full()
+                .p(px(ui_theme::PANEL_GAP / 2.0))
+                .child(explorer::render(
+                    &self.tree,
+                    None,
+                    Palette::for_theme(cx),
+                    ExplorerActions {
+                        open_file,
+                        add_folder,
+                        remove_root,
+                        toggle_folder,
+                        close_panel,
+                        new_file,
+                        new_folder,
+                        refresh,
+                        on_context_menu,
+                        on_move,
+                        selection: self.selection.clone(),
+                        context_path: self.context_path.clone(),
+                        on_select,
+                        delete_selected,
+                        cancel_selection,
+                        is_empty: self.is_empty,
+                    },
+                    true,
+                    drag,
+                    drag_start,
+                ));
 
         // 菜单放在带 overflow_hidden 的面板外面，靠近边缘时不会被裁掉。
         match menu {
@@ -1004,9 +1151,11 @@ impl Render for OutlinePanel {
         };
 
         let panel_id = PanelId::from(cx.entity().entity_id());
-        let drag = self.group.as_ref().and_then(|group| group.upgrade()).map(|group| {
-            DragPanel::new(panel_id, group.read(cx).node())
-        });
+        let drag = self
+            .group
+            .as_ref()
+            .and_then(|group| group.upgrade())
+            .map(|group| DragPanel::new(panel_id, group.read(cx).node()));
         let drag_start = {
             let app = self.app.clone();
             Some(Rc::new(move |cx: &mut App| {
@@ -1392,9 +1541,7 @@ impl Render for SearchPanel {
         let close_for_escape = close_panel.clone();
         let open_hit: search::OpenHitAction = Rc::new(
             move |path: &str, line: usize, window: &mut Window, cx: &mut App| {
-                let _ = app.update(cx, |this, cx| {
-                    this.open_search_hit(path, line, window, cx)
-                });
+                let _ = app.update(cx, |this, cx| this.open_search_hit(path, line, window, cx));
             },
         );
 
@@ -1438,9 +1585,11 @@ impl Render for SearchPanel {
             .into_any_element();
 
         let panel_id = PanelId::from(cx.entity().entity_id());
-        let drag = self.group.as_ref().and_then(|group| group.upgrade()).map(|group| {
-            DragPanel::new(panel_id, group.read(cx).node())
-        });
+        let drag = self
+            .group
+            .as_ref()
+            .and_then(|group| group.upgrade())
+            .map(|group| DragPanel::new(panel_id, group.read(cx).node()));
         let drag_start = {
             let app = self.app.clone();
             Some(Rc::new(move |cx: &mut App| {
@@ -1484,6 +1633,43 @@ impl Render for SearchPanel {
     }
 }
 
+/// 输出面板里的两个固定标签页。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputTab {
+    Output,
+    Terminal,
+}
+
+/// 面板内部标签：选中项用底色和文字颜色标出当前页面。
+fn output_tab_button(
+    id: &'static str,
+    label: &'static str,
+    selected: bool,
+    palette: Palette,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let text_color = if selected {
+        palette.tab_active_text
+    } else {
+        palette.tab_inactive_text
+    };
+    h_flex()
+        .id(id)
+        .h_full()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .px(px(12.0))
+        .rounded_t(px(6.0))
+        .cursor(CursorStyle::PointingHand)
+        .when(selected, |this| this.bg(rgb(palette.editor_bg)))
+        .when(!selected, |this| {
+            this.hover(move |this| this.bg(rgba(palette.hover)))
+        })
+        .on_click(on_click)
+        .child(div().text_xs().text_color(rgb(text_color)).child(label))
+}
+
 /// 输出面板。
 pub struct OutputPanel {
     app: WeakEntity<CodeWindow>,
@@ -1493,9 +1679,14 @@ pub struct OutputPanel {
     filter: Entity<InputState>,
     /// 只看错误/警告。
     only_errors: bool,
+    active_tab: OutputTab,
+    terminal: Entity<TerminalState>,
+    /// 终端是否有命令在跑；只在变化时重绘标题栏。
+    terminal_running: bool,
     focus: FocusHandle,
     _log_subscription: Subscription,
     _filter_subscription: Subscription,
+    _terminal_subscription: Subscription,
 }
 
 impl OutputPanel {
@@ -1503,6 +1694,7 @@ impl OutputPanel {
         app: WeakEntity<CodeWindow>,
         log: Entity<OutputLog>,
         font_size: f32,
+        terminal_cwd: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1512,16 +1704,40 @@ impl OutputPanel {
             panel.apply_filter(cx);
             cx.notify();
         });
+        let terminal = cx.new(|cx| TerminalState::new(terminal_cwd, window, cx));
+        let terminal_subscription = cx.observe(&terminal, |panel, terminal, cx| {
+            let running = terminal.read(cx).running();
+            if panel.terminal_running != running {
+                panel.terminal_running = running;
+                cx.notify();
+            }
+        });
         Self {
             app,
             log,
             font_size,
             filter,
             only_errors: false,
+            active_tab: OutputTab::Output,
+            terminal,
+            terminal_running: false,
             focus: cx.focus_handle(),
             _log_subscription: subscription,
             _filter_subscription: filter_subscription,
+            _terminal_subscription: terminal_subscription,
         }
+    }
+
+    fn switch_tab(&mut self, tab: OutputTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_tab == tab {
+            return;
+        }
+        self.active_tab = tab;
+        if tab == OutputTab::Terminal {
+            self.terminal
+                .update(cx, |terminal, cx| terminal.focus_input(window, cx));
+        }
+        cx.notify();
     }
 
     /// 把输入框与开关的状态推给日志模型。
@@ -1569,43 +1785,6 @@ impl DockPanel for OutputPanel {
         format!("输出 · {}", self.log.read(cx).channel())
     }
 
-    fn toolbar_buttons(
-        &mut self,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<Vec<Button>> {
-        let copy_log = self.log.clone();
-        let clear_log = self.log.clone();
-        let empty = self.log.read(cx).is_empty();
-        Some(vec![
-            Button::new("output-copy")
-                .ghost()
-                .xsmall()
-                .icon(IconName::Copy)
-                .disabled(empty)
-                .on_click(move |_, _, cx| {
-                    let text = copy_log.read(cx).copy_text();
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                }),
-            Button::new("output-clear")
-                .ghost()
-                .xsmall()
-                .icon(IconName::Delete)
-                .on_click(move |_, _, cx| {
-                    clear_log.update(cx, |log, cx| log.clear(cx));
-                }),
-            Button::new("output-close")
-                .ghost()
-                .xsmall()
-                .icon(IconName::ChevronDown)
-                .on_click(|_, _, cx| {
-                    SettingsStore::update(cx, |settings| {
-                        settings.appearance.show_output = false;
-                    });
-                }),
-        ])
-    }
-
     fn inner_padding(&self, _: &App) -> bool {
         false
     }
@@ -1625,24 +1804,20 @@ impl Focusable for OutputPanel {
 
 impl Render for OutputPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let log = self.log.read(cx);
-        let panel = cx.entity().downgrade();
-        let on_toggle_only_errors: output::FilterToggle = Rc::new(move |_, _, cx| {
-                let _ = panel.update(cx, |panel, cx| {
-                    panel.only_errors = !panel.only_errors;
-                    panel.apply_filter(cx);
-                    cx.notify();
-                });
-            });
-        let props = OutputPanelProps {
-            log,
-            entity: self.log.clone(),
-            palette: Palette::for_theme(cx),
-            height: None,
-            font_size: self.font_size,
-            filter_input: Some(self.filter.clone()),
-            only_errors: self.only_errors,
-            on_toggle_only_errors: Some(on_toggle_only_errors),
+        let palette = Palette::for_theme(cx);
+        let active_tab = self.active_tab;
+        let empty = self.log.read(cx).is_empty();
+        let has_selection = self.log.read(cx).has_selection();
+        let terminal_running = self.terminal_running;
+
+        let output_body = {
+            let log = self.log.read(cx);
+            output::render_body(OutputPanelProps {
+                log,
+                entity: self.log.clone(),
+                palette,
+                font_size: self.font_size,
+            })
         };
 
         let copy_log = self.log.clone();
@@ -1654,14 +1829,151 @@ impl Render for OutputPanel {
         let on_clear = move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
             clear_log.update(cx, |log, cx| log.clear(cx));
         };
+        let clear_terminal = self.terminal.clone();
+        let on_clear_terminal = move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+            clear_terminal.update(cx, |terminal, cx| terminal.clear(cx));
+        };
         let app = self.app.clone();
         let on_close = move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
             let _ = app.update(cx, |this, cx| this.close_output(cx));
         };
 
-        div()
-            .size_full()
-            .p(px(ui_theme::PANEL_GAP / 2.0))
-            .child(output::render(props, on_copy, on_clear, on_close, true))
+        let content = match active_tab {
+            OutputTab::Output => output_body,
+            OutputTab::Terminal => div()
+                .flex_1()
+                .min_h_0()
+                .child(self.terminal.clone())
+                .into_any_element(),
+        };
+
+        v_flex().size_full().p(px(ui_theme::PANEL_GAP / 2.0)).child(
+            v_flex()
+                .size_full()
+                .bg(rgb(palette.sidebar_bg))
+                .rounded(px(ui_theme::PANE_RADIUS))
+                .border_1()
+                .border_color(rgba(palette.border))
+                .overflow_hidden()
+                .child(
+                    h_flex()
+                        .h(px(ui_theme::PANEL_HEADER_HEIGHT))
+                        .flex_shrink_0()
+                        .items_center()
+                        .justify_between()
+                        .pr(px(8.0))
+                        .border_b_1()
+                        .border_color(rgba(palette.border))
+                        .child(
+                            h_flex()
+                                .h_full()
+                                .items_center()
+                                .gap(px(1.0))
+                                .child(output_tab_button(
+                                    "output-tab-output",
+                                    "输出",
+                                    active_tab == OutputTab::Output,
+                                    palette,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.switch_tab(OutputTab::Output, window, cx)
+                                    }),
+                                ))
+                                .child(output_tab_button(
+                                    "output-tab-terminal",
+                                    "终端",
+                                    active_tab == OutputTab::Terminal,
+                                    palette,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.switch_tab(OutputTab::Terminal, window, cx)
+                                    }),
+                                )),
+                        )
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_1()
+                                .when(active_tab == OutputTab::Output, |this| {
+                                    this.child(
+                                        div().w(px(150.0)).child(
+                                            Input::new(&self.filter)
+                                                .xsmall()
+                                                .focus_ring(false)
+                                                .appearance(false),
+                                        ),
+                                    )
+                                    .child(
+                                        Button::new("output-header-only-errors")
+                                            .ghost()
+                                            .xsmall()
+                                            .label("只看错误")
+                                            .selected(self.only_errors)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.only_errors = !this.only_errors;
+                                                this.apply_filter(cx);
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("output-header-copy")
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(IconName::Copy)
+                                            .label(if has_selection {
+                                                "复制选区"
+                                            } else {
+                                                "复制"
+                                            })
+                                            .disabled(empty)
+                                            .on_click(on_copy),
+                                    )
+                                    .child(
+                                        Button::new("output-header-clear")
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(IconName::Delete)
+                                            .label("清空")
+                                            .on_click(on_clear),
+                                    )
+                                })
+                                .when(active_tab == OutputTab::Terminal, |this| {
+                                    this.when(terminal_running, |this| {
+                                        this.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(palette.warning))
+                                                .child("运行中…"),
+                                        )
+                                    })
+                                    .child(
+                                        Button::new("terminal-header-clear")
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(IconName::Delete)
+                                            .label("清空")
+                                            .on_click(on_clear_terminal),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .id("output-header-close")
+                                        .flex_shrink_0()
+                                        .size(px(18.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(4.0))
+                                        .cursor(CursorStyle::PointingHand)
+                                        .hover(move |this| this.bg(rgba(palette.hover)))
+                                        .child(
+                                            Icon::new(IconName::ChevronDown)
+                                                .xsmall()
+                                                .text_color(rgb(palette.sidebar_text)),
+                                        )
+                                        .on_click(on_close),
+                                ),
+                        ),
+                )
+                .child(content),
+        )
     }
 }

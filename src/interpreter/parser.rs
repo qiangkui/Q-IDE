@@ -620,9 +620,7 @@ impl Parser {
                 let count = bounds.1 - bounds.0 + 1;
                 if count > MAX_RECORD_ARRAY_ELEMENTS {
                     return Err(ParseError::new(
-                        format!(
-                            "数组字段的元素数 {count} 超过上限（{MAX_RECORD_ARRAY_ELEMENTS}）"
-                        ),
+                        format!("数组字段的元素数 {count} 超过上限（{MAX_RECORD_ARRAY_ELEMENTS}）"),
                         self.line(),
                     ));
                 }
@@ -643,9 +641,7 @@ impl Parser {
                 // VB6 的定长字符串上限是 65535 个字符。
                 if len > MAX_FIXED_STRING_LEN {
                     return Err(ParseError::new(
-                        format!(
-                            "定长字符串长度 {len} 超过上限（{MAX_FIXED_STRING_LEN}）"
-                        ),
+                        format!("定长字符串长度 {len} 超过上限（{MAX_FIXED_STRING_LEN}）"),
                         self.line(),
                     ));
                 }
@@ -871,8 +867,9 @@ impl Parser {
             let member = self.expect_ident("枚举成员名")?;
             let value = if self.eat_op(Op::Eq) {
                 let expr = self.parse_expr()?;
-                eval_enum_constant(&expr, &self.enum_values)
-                    .ok_or_else(|| ParseError::new("枚举成员的值必须是整型常量表达式", self.line()))?
+                eval_enum_constant(&expr, &self.enum_values).ok_or_else(|| {
+                    ParseError::new("枚举成员的值必须是整型常量表达式", self.line())
+                })?
             } else {
                 next
             };
@@ -2271,7 +2268,8 @@ impl Parser {
                 break;
             }
             self.advance();
-            let right_bp = if op == BinOp::Power { bp } else { bp + 1 };
+            // VB6 的二元运算符（含 `^`）全部左结合：`2 ^ 3 ^ 2` 是 `(2 ^ 3) ^ 2`。
+            let right_bp = bp + 1;
             let right = self.parse_binary(right_bp)?;
             left = Expr::Binary {
                 op,
@@ -2324,6 +2322,10 @@ impl Parser {
             TokenKind::Date(value) => {
                 self.advance();
                 Expr::Literal(Value::Date(value))
+            }
+            TokenKind::Currency(value) => {
+                self.advance();
+                Expr::Literal(Value::Currency(value))
             }
             TokenKind::Str(text) => {
                 self.advance();

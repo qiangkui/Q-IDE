@@ -33,11 +33,11 @@ impl CodeWindow {
         let palette = Palette::for_theme(cx);
         // 选中态用偏白的高亮盖掉组件默认的“按下变暗”。
         let selected_bg = rgba(palette.activity_bar_selected);
-        let icon_color = ui_theme::resolve(&appearance.theme, cx)
-            .mode
-            .is_dark()
-            .then_some(palette.sidebar_text)
-            .unwrap_or(0x666666);
+        let icon_color = if ui_theme::resolve(&appearance.theme, cx).mode.is_dark() {
+            palette.sidebar_text
+        } else {
+            0x666666
+        };
         let icon_color = Hsla::from(rgb(icon_color));
         v_flex()
             .id("activity-bar")

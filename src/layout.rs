@@ -352,6 +352,11 @@ impl Layout {
                         layout.ai.font_size = size.clamp(8, 32);
                     }
                 }
+                "ai_agent_enabled" => layout.ai.agent_enabled = truthy(&value),
+                "ai_agent_allow_write" => layout.ai.agent_allow_write = truthy(&value),
+                "ai_agent_auto_confirm" => layout.ai.agent_auto_confirm = truthy(&value),
+                "ai_agent_allow_run" => layout.ai.agent_allow_run = truthy(&value),
+                "ai_agent_audit" => layout.ai.agent_audit = truthy(&value),
                 "roots" => declared_roots = value.parse::<usize>().ok(),
                 "root" => {
                     saw_root = true;
@@ -569,9 +574,8 @@ impl Layout {
             self.right_panel.map(PanelKind::as_str).unwrap_or_default()
         ));
         // 同时写出面板开关，方便阅读，也让旧版本仍能识别布局意图。
-        let show = |kind: PanelKind| {
-            self.left_panel == Some(kind) || self.right_panel == Some(kind)
-        };
+        let show =
+            |kind: PanelKind| self.left_panel == Some(kind) || self.right_panel == Some(kind);
         out.push_str(&format!(
             "show_explorer={}\n",
             flag(show(PanelKind::Explorer))
@@ -580,10 +584,7 @@ impl Layout {
             "show_outline={}\n",
             flag(show(PanelKind::Outline))
         ));
-        out.push_str(&format!(
-            "show_search={}\n",
-            flag(show(PanelKind::Search))
-        ));
+        out.push_str(&format!("show_search={}\n", flag(show(PanelKind::Search))));
         out.push_str(&format!("show_ai={}\n", flag(show(PanelKind::Ai))));
         out.push_str(&format!("show_output={}\n", flag(self.show_output)));
         out.push_str(&format!("show_status_bar={}\n", flag(self.show_status_bar)));
@@ -596,6 +597,23 @@ impl Layout {
             self.ai.round_limit.as_str()
         ));
         out.push_str(&format!("ai_font_size={}\n", self.ai.font_size));
+        out.push_str(&format!(
+            "ai_agent_enabled={}\n",
+            flag(self.ai.agent_enabled)
+        ));
+        out.push_str(&format!(
+            "ai_agent_allow_write={}\n",
+            flag(self.ai.agent_allow_write)
+        ));
+        out.push_str(&format!(
+            "ai_agent_auto_confirm={}\n",
+            flag(self.ai.agent_auto_confirm)
+        ));
+        out.push_str(&format!(
+            "ai_agent_allow_run={}\n",
+            flag(self.ai.agent_allow_run)
+        ));
+        out.push_str(&format!("ai_agent_audit={}\n", flag(self.ai.agent_audit)));
         out.push_str(&format!("roots={}\n", self.roots.len()));
         for root in &self.roots {
             out.push_str(&format!("root=dir:{}\n", escape(root)));
@@ -609,7 +627,10 @@ impl Layout {
                 .map(|line| line.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
-            out.push_str(&format!("breakpoint={}\n", escape(&format!("{path}\n{lines}"))));
+            out.push_str(&format!(
+                "breakpoint={}\n",
+                escape(&format!("{path}\n{lines}"))
+            ));
         }
         for (path, conditions) in &self.breakpoint_conditions {
             for (line, expression) in conditions {
@@ -636,7 +657,10 @@ impl Layout {
         }
         out.push_str(&format!("dock_state={}\n", escape(&self.dock_state)));
         out.push_str(&format!("editor_font_size={}\n", self.editor.font_size));
-        out.push_str(&format!("editor_soft_wrap={}\n", flag(self.editor.soft_wrap)));
+        out.push_str(&format!(
+            "editor_soft_wrap={}\n",
+            flag(self.editor.soft_wrap)
+        ));
         out.push_str(&format!(
             "editor_line_numbers={}\n",
             flag(self.editor.line_numbers)
@@ -646,7 +670,10 @@ impl Layout {
             "editor_auto_close={}\n",
             flag(self.editor.auto_close)
         ));
-        out.push_str(&format!("editor_auto_save={}\n", flag(self.editor.auto_save)));
+        out.push_str(&format!(
+            "editor_auto_save={}\n",
+            flag(self.editor.auto_save)
+        ));
         out.push_str(&format!(
             "editor_auto_save_interval={}\n",
             self.editor.auto_save_interval_secs
@@ -785,6 +812,7 @@ mod tests {
                 approval: AiApproval::Auto,
                 round_limit: AiRoundLimit::Twelve,
                 font_size: 16,
+                ..AiSettings::default()
             },
             window_bounds: Some((120.0, 90.0, 1280.0, 800.0)),
             settings_size: Some((900.0, 640.0)),
@@ -820,6 +848,11 @@ mod tests {
                 approval: AiApproval::Auto,
                 round_limit: AiRoundLimit::Twelve,
                 font_size: 15,
+                agent_enabled: false,
+                agent_allow_write: true,
+                agent_auto_confirm: true,
+                agent_allow_run: true,
+                agent_audit: false,
             },
             ..Layout::default()
         };
@@ -828,6 +861,11 @@ mod tests {
         assert!(layout.to_text().contains("ai_approval=auto"));
         assert!(layout.to_text().contains("ai_round_limit=12"));
         assert!(layout.to_text().contains("ai_font_size=15"));
+        assert!(layout.to_text().contains("ai_agent_enabled=0"));
+        assert!(layout.to_text().contains("ai_agent_allow_write=1"));
+        assert!(layout.to_text().contains("ai_agent_auto_confirm=1"));
+        assert!(layout.to_text().contains("ai_agent_allow_run=1"));
+        assert!(layout.to_text().contains("ai_agent_audit=0"));
 
         // 旧布局里没有 AI 键时使用默认值。
         let parsed = Layout::parse("explorer_width=300\n");
@@ -852,9 +890,7 @@ mod tests {
     fn legacy_show_flags_are_converted_to_left_and_right_slots() {
         // 旧文件把侧栏面板与 AI 都记成“显示”：一侧只留一个，AI 留在右侧，
         // 旧版停靠在右侧的侧栏面板让到左侧。
-        let parsed = Layout::parse(
-            "show_explorer=1\nshow_outline=1\nshow_ai=1\nside_dock=right\n",
-        );
+        let parsed = Layout::parse("show_explorer=1\nshow_outline=1\nshow_ai=1\nside_dock=right\n");
         assert_eq!(parsed.left_panel, Some(PanelKind::Explorer));
         assert_eq!(parsed.right_panel, Some(PanelKind::Ai));
 
@@ -954,10 +990,9 @@ mod tests {
     #[test]
     fn breakpoint_conditions_survive_a_round_trip() {
         let mut layout = Layout::default();
-        layout.breakpoints.push((
-            "C:\\脚本\\a = 1.vb".to_string(),
-            vec![3, 7],
-        ));
+        layout
+            .breakpoints
+            .push(("C:\\脚本\\a = 1.vb".to_string(), vec![3, 7]));
         layout.breakpoint_conditions.push((
             "C:\\脚本\\a = 1.vb".to_string(),
             vec![(7, "i > 3 And s <> \"\"".to_string())],
@@ -967,16 +1002,14 @@ mod tests {
         assert_eq!(parsed.breakpoint_conditions, layout.breakpoint_conditions);
 
         // 缺字段或空条件的行会被忽略。
-        let parsed = Layout::parse("breakpoint_condition=a.vb\n3\n\nbreakpoint_condition=a.vb\nx\n1\n");
+        let parsed =
+            Layout::parse("breakpoint_condition=a.vb\n3\n\nbreakpoint_condition=a.vb\nx\n1\n");
         assert!(parsed.breakpoint_conditions.is_empty());
     }
 
     #[test]
     fn conditions_follow_breakpoint_lines_after_edits() {
-        let conditions = HashMap::from([
-            (5, "i = 1".to_string()),
-            (9, "i = 2".to_string()),
-        ]);
+        let conditions = HashMap::from([(5, "i = 1".to_string()), (9, "i = 2".to_string())]);
 
         // 在上方插入一行：两个断点都往下挪一行，条件跟着走。
         let shifted = HashSet::from([6, 10]);
@@ -1076,10 +1109,8 @@ mod tests {
 
     #[test]
     fn legacy_user_dir_config_is_migrated_next_to_the_executable() {
-        let dir = std::env::temp_dir().join(format!(
-            "gpui-first-layout-migrate-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("gpui-first-layout-migrate-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let legacy = dir.join("appdata").join(FILE_NAME);
         let file = dir.join("exe").join(FILE_NAME);
@@ -1095,10 +1126,8 @@ mod tests {
 
     #[test]
     fn missing_config_and_no_legacy_falls_back_to_defaults() {
-        let dir = std::env::temp_dir().join(format!(
-            "gpui-first-layout-default-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("gpui-first-layout-default-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let file = dir.join("exe").join(FILE_NAME);
         let legacy = dir.join("appdata").join(FILE_NAME);

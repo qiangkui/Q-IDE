@@ -11,9 +11,9 @@
 //! - `session`：会话恢复、标签关闭、外部修改检测与布局保存；
 //! - `view`：菜单栏、活动栏、状态栏与整体渲染。
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,9 +28,11 @@ use gpui_kit::base::input::{GutterDecorationCollection, RangeDecorationCollectio
 use gpui_kit::component::button::*;
 use gpui_kit::component::dock::{
     DockArea, DockAreaState, DockEvent, DockLayout, DockPlacement, DockSkin, DragPanel,
-    InsertTarget, NodeId, PanelId, PanelStyle, PaneNode, PaneRef, panel_handle, register_panel,
+    InsertTarget, NodeId, PaneNode, PaneRef, PanelId, PanelStyle, panel_handle, register_panel,
 };
-use gpui_kit::component::input::{EditorState, Enter, Indent, Input, InputState, Outdent, SelectAll, ShowCompletions};
+use gpui_kit::component::input::{
+    EditorState, Enter, Indent, Input, InputState, Outdent, SelectAll, ShowCompletions,
+};
 use gpui_kit::component::tree::TreeState;
 use gpui_kit::component::*;
 use gpui_kit::prelude::{FluentBuilder as _, InteractiveElement as _};
@@ -39,11 +41,11 @@ use gpui_kit::*;
 use crate::ai::panel::AiPanel;
 use crate::brackets;
 use crate::commands;
-use crate::encoding;
 use crate::editing;
+use crate::encoding;
+use crate::explorer::{ExplorerModel, Root};
 use crate::interpreter::RunOptions;
 use crate::interpreter::debug::{self as vb_debug, DebugControl, DebugSnapshot};
-use crate::explorer::{ExplorerModel, Root};
 use crate::layout::{LAYOUT_VERSION, Layout, SESSION_LIMIT};
 use crate::menu::{self, MenuState};
 use crate::outline::{self, OutlineModel, WatchEntry, WatchState};
@@ -51,16 +53,17 @@ use crate::output::{OutputHandle, OutputLevel, OutputLog};
 use crate::panels::{
     EditorPanel, ExplorerPanel, OutlineDebugState, OutlinePanel, OutputPanel, SearchPanel,
 };
+use crate::search;
 use crate::settings::{
     AppSettings, AppearanceSettings, PanelKind, SettingsStore, SideSlot, ThemeChoice,
 };
-use crate::search;
 use crate::status_bar::{self, StatusInfo};
 use crate::theme::{self as ui_theme, Palette};
 use crate::title_bar;
 use crate::workspace::{self, OpenFile};
 use gpui_kit::component::dialog::{Cancel, DialogFooter};
 
+mod agent;
 mod ai;
 mod breakpoints;
 mod debug;
@@ -206,6 +209,8 @@ pub struct CodeWindow {
     editors: Vec<Entity<EditorState>>,
     /// 与 `editors` 一一对应，监听各标签内容变化；关闭标签时一并释放。
     editor_subscriptions: Vec<Subscription>,
+    /// 外部 agent 的本机端点（启动后写入端点文件）。
+    agent_endpoint: Option<crate::agent::Endpoint>,
     /// 与 `open_files` 一一对应，保存上次打开/保存时的内容，用来判断未保存修改。
     saved: Vec<SharedString>,
     active_file: Option<usize>,
@@ -350,6 +355,13 @@ impl CodeWindow {
         let current = settings.read(cx).clone();
 
         let explorer = ExplorerModel::new(roots_from_layout(&layout), layout.expanded.clone());
+        // 终端默认在当前项目的根目录启动；没打开文件夹时退回进程目录。
+        let terminal_cwd = explorer
+            .roots()
+            .first()
+            .map(|root| root.path().to_path_buf())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
         let tree = cx.new(|cx| TreeState::new(cx).items(explorer.items()));
         let output = cx.new(OutputLog::new);
         let empty_editor = cx.new(|cx| {
@@ -388,6 +400,7 @@ impl CodeWindow {
                 app_handle.clone(),
                 output.clone(),
                 current.output.font_size as f32,
+                terminal_cwd,
                 window,
                 cx,
             )
@@ -410,6 +423,7 @@ impl CodeWindow {
             ai_panel,
             output_panel,
             settings: settings.clone(),
+            agent_endpoint: None,
             open_files: Vec::new(),
             contents: Vec::new(),
             editors: Vec::new(),
@@ -499,12 +513,17 @@ impl CodeWindow {
         });
         // 面板被拖走后，某些 dock 可能只剩隐藏面板；空 dock 仍会占着宽度/高度。
         // 布局变化后延迟检查一次，把没有可见面板的 dock 收起或移除。
-        let dock_subscription =
-            cx.subscribe_in(&this.dock_area, window, |_this, _, event: &DockEvent, window, cx| {
+        let dock_subscription = cx.subscribe_in(
+            &this.dock_area,
+            window,
+            |_this, _, event: &DockEvent, window, cx| {
                 if matches!(event, DockEvent::LayoutChanged) {
-                    cx.defer_in(window, |this, window, cx| this.normalize_dock_docks(window, cx));
+                    cx.defer_in(window, |this, window, cx| {
+                        this.normalize_dock_docks(window, cx)
+                    });
                 }
-            });
+            },
+        );
         // 编辑内容变化时同步到当前标签，标签上的未保存圆点才能实时更新；
         // 顺带做一次语法检查，把错误画成编辑器里的波浪线。
         let editor_subscription = cx.observe_in(&this.editor, window, |this, editor, _, cx| {
@@ -527,14 +546,14 @@ impl CodeWindow {
         this._subscriptions.push(editor_subscription);
         this._subscriptions.push(settings_subscription);
         // 拖动/缩放窗口后记下新矩形，下一次每秒检查时写进布局文件。
-        let bounds_subscription =
-            cx.observe_window_bounds(window, |this, window, cx| {
-                this.remember_window_bounds(window, cx);
-            });
+        let bounds_subscription = cx.observe_window_bounds(window, |this, window, cx| {
+            this.remember_window_bounds(window, cx);
+        });
         this._subscriptions.push(bounds_subscription);
 
         this.sync_settings(window, cx);
         this.spawn_auto_save_timer(window, cx);
+        this.start_agent_server(window, cx);
         // 窗口关闭前检查未保存修改。
         let close_handle = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
@@ -600,6 +619,7 @@ impl CodeWindow {
         self.sync_output_panel(cx);
         self.apply_dock_visibility(window, cx);
         self.refresh_editor_language(cx);
+        self.sync_agent_endpoint(cx);
         // 主题与面板开关也属于布局，变化后顺手写盘。
         self.save_layout(cx);
         cx.notify();
@@ -685,9 +705,12 @@ fn reveal_error_line(
     if let Some(diagnostics) = editor.diagnostics_mut() {
         diagnostics.reset(&text);
         diagnostics.push(
-            Diagnostic::new(Position::new(row, 0)..Position::new(row, character), message)
-                .with_severity(DiagnosticSeverity::Error)
-                .with_source("vb"),
+            Diagnostic::new(
+                Position::new(row, 0)..Position::new(row, character),
+                message,
+            )
+            .with_severity(DiagnosticSeverity::Error)
+            .with_source("vb"),
         );
     }
     cx.notify();
