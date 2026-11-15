@@ -1,7 +1,7 @@
 //! 断点、断点条件与编辑器里的断点标记。
 
-use super::*;
 use super::dialogs::*;
+use super::*;
 
 impl CodeWindow {
     /// 在当前行切换断点（`F9`）。断点按文件分别记录。
@@ -74,7 +74,8 @@ impl CodeWindow {
             return;
         }
         let Some(index) = self.active_file else {
-            self.output().warning(cx, "没有打开的文件，无法设置条件断点");
+            self.output()
+                .warning(cx, "没有打开的文件，无法设置条件断点");
             return;
         };
         let line = self.cursor_line(cx);
@@ -94,8 +95,9 @@ impl CodeWindow {
             let field = input.clone();
             Rc::new(move |window, cx| {
                 let text = field.read(cx).value().to_string();
-                let _ = handle
-                    .update(cx, |this, cx| this.set_breakpoint_condition(line, &text, cx));
+                let _ = handle.update(cx, |this, cx| {
+                    this.set_breakpoint_condition(line, &text, cx)
+                });
                 window.close_dialog(cx);
             })
         };
@@ -122,7 +124,8 @@ impl CodeWindow {
         cx: &mut Context<Self>,
     ) {
         let Some(index) = self.active_file else {
-            self.output().warning(cx, "没有打开的文件，无法设置条件断点");
+            self.output()
+                .warning(cx, "没有打开的文件，无法设置条件断点");
             return;
         };
         let id = self.open_files[index].id.to_string();
@@ -156,10 +159,8 @@ impl CodeWindow {
         self.refresh_breakpoint_marks(cx);
         self.sync_outline_panel(cx);
         self.save_layout(cx);
-        self.output().command(
-            cx,
-            format!("> 条件断点：第 {line} 行，条件 `{condition}`"),
-        );
+        self.output()
+            .command(cx, format!("> 条件断点：第 {line} 行，条件 `{condition}`"));
         cx.notify();
     }
 
@@ -326,8 +327,8 @@ impl CodeWindow {
         self.refresh_breakpoint_marks(cx);
         self.sync_outline_panel(cx);
         self.save_layout(cx);
-        self.output().command(cx, format!("> 已清除 {total} 个断点"));
+        self.output()
+            .command(cx, format!("> 已清除 {total} 个断点"));
         cx.notify();
     }
-
 }

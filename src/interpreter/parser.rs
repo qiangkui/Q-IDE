@@ -15,6 +15,7 @@ pub fn parse(source: &str) -> Result<Program, ParseError> {
 /// 同 [`parse`]，但可以指定每个物理行的逻辑行号（`#Include` 展开用）。
 pub fn parse_mapped(source: &str, lines: &[usize]) -> Result<Program, ParseError> {
     let tokens = tokenize_mapped(source, lines)?;
+    let declared_types = scan_declared_types(&tokens);
     Parser {
         tokens,
         pos: 0,
@@ -22,12 +23,112 @@ pub fn parse_mapped(source: &str, lines: &[usize]) -> Result<Program, ParseError
         option_explicit: false,
         option_base: 0,
         option_compare_text: false,
-        record_types: Vec::new(),
-        enum_types: Vec::new(),
+        declared_types,
         enum_values: HashMap::new(),
-        class_types: Vec::new(),
     }
     .parse_program()
+}
+
+/// 模块级类型声明的名字（`Type` / `Enum` / `Class`）。
+///
+/// 正式解析前先扫一遍 token，`As 类型名` 与 `Implements 接口名` 就不受声明顺序限制：
+/// VB6 里类模块、标准模块各是一个文件，互相引用本来就没有先后要求，QIDE 的单文件写法
+/// 也应当允许「先写主流程、后写类定义」。
+#[derive(Default)]
+struct DeclaredTypes {
+    records: Vec<String>,
+    enums: Vec<String>,
+    classes: Vec<String>,
+}
+
+impl DeclaredTypes {
+    fn has_record(&self, name: &str) -> bool {
+        self.records.iter().any(|declared| declared == name)
+    }
+
+    fn has_enum(&self, name: &str) -> bool {
+        self.enums.iter().any(|declared| declared == name)
+    }
+
+    fn has_class(&self, name: &str) -> bool {
+        self.classes.iter().any(|declared| declared == name)
+    }
+}
+
+/// 预扫 `Type` / `Enum` / `Class` 的声明名（忽略写在过程里的普通标识符）。
+fn scan_declared_types(tokens: &[Token]) -> DeclaredTypes {
+    let mut declared = DeclaredTypes::default();
+    let mut at_statement_start = true;
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        if matches!(token.kind, TokenKind::Newline | TokenKind::Colon) {
+            at_statement_start = true;
+            index += 1;
+            continue;
+        }
+        if at_statement_start {
+            // `Public` / `Private` / `Global` / `Static` / `Friend` 之类修饰符。
+            let modifier = matches!(
+                token.kind,
+                TokenKind::Kw(Kw::Public | Kw::Private | Kw::Global | Kw::Static)
+            ) || matches!(&token.kind, TokenKind::Ident(word) if word == "friend");
+            if modifier {
+                index += 1;
+                continue;
+            }
+            at_statement_start = false;
+            let target = match token.kind {
+                TokenKind::Kw(Kw::Type) => Some(&mut declared.records),
+                TokenKind::Kw(Kw::Enum) => Some(&mut declared.enums),
+                TokenKind::Kw(Kw::Class) => Some(&mut declared.classes),
+                _ => None,
+            };
+            if let Some(target) = target
+                && let Some(TokenKind::Ident(name)) = tokens.get(index + 1).map(|next| &next.kind)
+            {
+                target.push(name.clone());
+            }
+        }
+        index += 1;
+    }
+    declared
+}
+
+/// `Type` 循环定义检查。
+///
+/// 有了前向引用后，`Type A` 里放 `B`、`Type B` 里又放 `A` 就能写出来；VB6 不允许，
+/// 运行时的嵌套深度保护也只会在建实例时报错，所以在这里直接报语法错误。
+fn check_type_cycles(types: &[TypeDef]) -> Result<(), ParseError> {
+    fn walk<'a>(
+        def: &'a TypeDef,
+        types: &'a [TypeDef],
+        path: &mut Vec<&'a str>,
+    ) -> Result<(), ParseError> {
+        if path.contains(&def.name.as_str()) {
+            return Err(ParseError::new(
+                format!("`Type {}` 不能直接或间接包含自身", def.display),
+                def.line,
+            ));
+        }
+        path.push(def.name.as_str());
+        for field in &def.fields {
+            let Some(name) = field.record.as_deref() else {
+                continue;
+            };
+            if let Some(nested) = types.iter().find(|other| other.name == name) {
+                walk(nested, types, path)?;
+            }
+        }
+        path.pop();
+        Ok(())
+    }
+
+    let mut path = Vec::new();
+    for def in types {
+        walk(def, types, &mut path)?;
+    }
+    Ok(())
 }
 
 /// 解析单个表达式（调试器「监视」用）。表达式后面不能再有其他内容。
@@ -40,10 +141,8 @@ pub fn parse_expression(source: &str) -> Result<Expr, ParseError> {
         option_explicit: false,
         option_base: 0,
         option_compare_text: false,
-        record_types: Vec::new(),
-        enum_types: Vec::new(),
+        declared_types: DeclaredTypes::default(),
         enum_values: HashMap::new(),
-        class_types: Vec::new(),
     };
     let expr = parser.parse_expr()?;
     parser.skip_newlines();
@@ -59,6 +158,10 @@ pub fn parse_expression(source: &str) -> Result<Expr, ParseError> {
 fn eval_enum_constant(expr: &Expr, members: &HashMap<String, i64>) -> Option<i64> {
     match expr {
         Expr::Literal(Value::Int(value)) => Some(*value),
+        Expr::TypedLiteral {
+            value: Value::Int(value),
+            ..
+        } => Some(*value),
         Expr::Var(name) => members.get(name).copied(),
         Expr::Unary { op, expr } => {
             let value = eval_enum_constant(expr, members)?;
@@ -138,14 +241,10 @@ struct Parser {
     option_base: i64,
     /// `Option Compare Text`：字符串比较忽略大小写。
     option_compare_text: bool,
-    /// 已解析的 `Type ... End Type`，供 `As 类型名` 查表。
-    record_types: Vec<TypeDef>,
-    /// 已解析的 `Enum` 名字：`Dim c As Color` 按 `Long` 处理。
-    enum_types: Vec<String>,
+    /// 全文的 `Type` / `Enum` / `Class` 声明名，供 `As 类型名` 与 `Implements` 查表。
+    declared_types: DeclaredTypes,
     /// 已解析枚举成员，供后续枚举常量表达式引用。
     enum_values: HashMap<String, i64>,
-    /// 已解析的 `Class` 名字：`Dim p As Point3D` 按对象处理。
-    class_types: Vec<String>,
 }
 
 impl Parser {
@@ -205,6 +304,16 @@ impl Parser {
 
     fn at_kw(&self, kw: Kw) -> bool {
         matches!(self.peek(), TokenKind::Kw(k) if *k == kw)
+    }
+
+    /// 成员名：`obj.` 之后一律按名字读，关键字也行
+    /// （VB6 里 `rs.Fields.Append`、`f.Type`、`d.Remove` 都是合法写法）。
+    fn expect_member_name(&mut self) -> Result<String, ParseError> {
+        if let TokenKind::Kw(keyword) = self.peek().clone() {
+            self.advance();
+            return Ok(keyword.text().to_string());
+        }
+        self.expect_ident("成员名")
     }
 
     fn at_ident(&self, name: &str) -> bool {
@@ -380,6 +489,7 @@ impl Parser {
         }
         program.option_explicit = self.option_explicit;
         program.option_compare_text = self.option_compare_text;
+        check_type_cycles(&program.types)?;
         Ok(program)
     }
 
@@ -470,16 +580,17 @@ impl Parser {
                 break;
             }
             if self.eat_kw(Kw::Implements) {
+                let interface_display = self.token().spelling().to_string();
                 let interface = self.expect_ident("接口类名")?;
-                if !self.class_types.iter().any(|name| name == &interface) {
+                if !self.declared_types.has_class(&interface) {
                     return Err(ParseError::new(
-                        format!("`Implements` 需要先定义接口类 `{interface}`"),
+                        format!("`Implements` 需要先定义接口类 `{interface_display}`"),
                         self.line(),
                     ));
                 }
                 if def.implements.contains(&interface) {
                     return Err(ParseError::new(
-                        format!("接口 `{interface}` 重复实现"),
+                        format!("接口 `{interface_display}` 重复实现"),
                         self.line(),
                     ));
                 }
@@ -575,7 +686,6 @@ impl Parser {
                 }
             }
         }
-        self.class_types.push(def.name.clone());
         Ok(def)
     }
 
@@ -665,7 +775,6 @@ impl Parser {
             fields,
             line,
         };
-        self.record_types.push(def.clone());
         Ok(def)
     }
 
@@ -752,6 +861,7 @@ impl Parser {
             params,
             body,
             is_function,
+            is_get: false,
             is_let: false,
             is_set: false,
             is_private: false,
@@ -802,6 +912,7 @@ impl Parser {
                 params,
                 body,
                 is_function: true,
+                is_get: true,
                 is_let: false,
                 is_set: false,
                 is_private: false,
@@ -831,6 +942,7 @@ impl Parser {
             params,
             body,
             is_function: false,
+            is_get: false,
             is_let: true,
             is_set,
             is_private: false,
@@ -849,7 +961,7 @@ impl Parser {
         let line = self.line();
         self.expect_kw(Kw::Enum, "需要 Enum")?;
         let display = self.token().spelling().to_string();
-        let name = self.expect_ident("枚举名")?;
+        self.expect_ident("枚举名")?;
         self.eat_line_end();
 
         let mut members = Vec::new();
@@ -881,7 +993,6 @@ impl Parser {
         if members.is_empty() {
             return Err(ParseError::new("`Enum` 至少需要一个成员", line));
         }
-        self.enum_types.push(name);
         Ok(EnumDef {
             display,
             members,
@@ -992,25 +1103,27 @@ impl Parser {
     /// 解析类型名；返回基础类型，若是 UDT 再带上类型名。
     fn parse_declared_type(&mut self) -> Result<(VbType, Option<String>), ParseError> {
         let line = self.line();
+        // 报错要用源码里的原始拼写（`Ident` 里存的是小写名）。
+        let display = self.token().spelling().to_string();
         let name = self.expect_ident("类型名")?;
         if let Some(ty) = VbType::parse(&name) {
             return Ok((ty, None));
         }
-        if self.record_types.iter().any(|def| def.name == name) {
+        if self.declared_types.has_record(&name) {
             return Ok((VbType::Variant, Some(name)));
         }
-        if self.enum_types.contains(&name) {
+        if self.declared_types.has_enum(&name) {
             return Ok((VbType::Long, None));
         }
         // `Class` 声明的类型按对象处理（`Set` + `New` 才能拿到实例）。
-        if self.class_types.contains(&name) {
+        if self.declared_types.has_class(&name) {
             return Ok((VbType::Object, None));
         }
         // `Collection` / `Dictionary` 没有独立的类型，按对象处理。
         if name == "collection" || name == "dictionary" {
             return Ok((VbType::Object, None));
         }
-        Err(ParseError::new(format!("未知类型 `{name}`"), line))
+        Err(ParseError::new(format!("未知类型 `{display}`"), line))
     }
 
     // ---------- 语句块 ----------
@@ -1103,6 +1216,19 @@ impl Parser {
                 ResumeTarget::Label(self.expect_ident("标签名")?)
             };
             return Ok(Stmt::Resume { target, line });
+        }
+        // `Error 5`：抛出带错误号的运行时错误，描述取 VB 的默认文案（与 `Err.Raise 5` 等价）。
+        // 带括号的 `Error(5)` 是内置函数，留给表达式解析。
+        if self.at_kw(Kw::Error) && !matches!(self.peek_at(1), TokenKind::Op(Op::LParen)) {
+            self.advance();
+            let number = self.parse_expr()?;
+            self.eat_line_end();
+            return Ok(Stmt::ErrRaise {
+                number,
+                source: None,
+                description: None,
+                line,
+            });
         }
 
         if self.at_op(Op::Dot) {
@@ -1331,7 +1457,7 @@ impl Parser {
             if self.at_op(Op::Dot) {
                 let mut path = Vec::new();
                 while self.eat_op(Op::Dot) {
-                    path.push(self.expect_ident("成员名")?);
+                    path.push(self.expect_member_name()?);
                 }
                 let indices = if self.at_op(Op::LParen) {
                     self.parse_paren_args()?
@@ -1341,7 +1467,7 @@ impl Parser {
                 if !indices.is_empty() {
                     let mut member_path = Vec::new();
                     while self.eat_op(Op::Dot) {
-                        member_path.push(self.expect_ident("成员名")?);
+                        member_path.push(self.expect_member_name()?);
                     }
                     self.expect_op(Op::Eq, "`Set` 需要 `=`")?;
                     let value = self.parse_expr()?;
@@ -1381,7 +1507,7 @@ impl Parser {
         self.parse_ident_statement(line)
     }
 
-    /// `On Error Resume Next` / `On Error GoTo 标签` / `On Error GoTo 0`。
+    /// `On Error Resume Next` / `On Error GoTo 标签` / `On Error GoTo 0` / `On Error GoTo -1`。
     fn parse_on_error(&mut self, line: usize) -> Result<Stmt, ParseError> {
         self.expect_kw(Kw::Error, "`On` 后需要 `Error`")?;
         if self.eat_kw(Kw::Resume) {
@@ -1398,6 +1524,19 @@ impl Parser {
                 mode: ErrorMode::Disabled,
                 line,
             });
+        }
+        // `On Error GoTo -1`：VB6 里和 `GoTo 0` 一样取消错误处理，另外还会清掉 `Err`。
+        // QIDE 的执行器对任何 `On Error` 语句都会清 `Err`（本机 VB6 实测），所以两种写法等价。
+        if let TokenKind::Op(Op::Minus) = self.peek() {
+            self.advance();
+            if let TokenKind::Int(1) = self.peek() {
+                self.advance();
+                return Ok(Stmt::OnError {
+                    mode: ErrorMode::Disabled,
+                    line,
+                });
+            }
+            return Err(ParseError::new("`On Error GoTo` 的负标签只支持 `-1`", line));
         }
         let label = self.expect_ident("标签名")?;
         Ok(Stmt::OnError {
@@ -1443,7 +1582,7 @@ impl Parser {
     fn parse_with_member(&mut self, line: usize) -> Result<Stmt, ParseError> {
         let mut path = Vec::new();
         while self.eat_op(Op::Dot) {
-            path.push(self.expect_ident("成员名")?);
+            path.push(self.expect_member_name()?);
         }
         if self.eat_op(Op::Eq) {
             let value = self.parse_expr()?;
@@ -1472,7 +1611,7 @@ impl Parser {
         let start = self.pos;
         let mut path = Vec::new();
         while self.eat_op(Op::Dot) {
-            path.push(self.expect_ident("成员名")?);
+            path.push(self.expect_member_name()?);
         }
         if path.is_empty() {
             self.pos = start;
@@ -1483,7 +1622,7 @@ impl Parser {
             let indices = self.parse_paren_args()?;
             let mut member_path = Vec::new();
             while self.eat_op(Op::Dot) {
-                member_path.push(self.expect_ident("成员名")?);
+                member_path.push(self.expect_member_name()?);
             }
             if !self.at_op(Op::Eq) {
                 // `obj.Method(1)` 这种成员调用：交回上层按调用处理。
@@ -1567,31 +1706,40 @@ impl Parser {
         {
             return Ok(stmt);
         }
-        // `c.Add x, key` / `obj.SomeMethod arg`：成员方法调用。
+        // `c.Add x, key` / `obj.Sub.Method arg`：成员方法调用（成员名可以是关键字）。
         if self.at_op(Op::Dot) {
             let start = self.pos;
-            self.advance();
-            if let TokenKind::Ident(method) = self.peek().clone() {
-                self.advance();
-                let mut args = Vec::new();
-                if !self.at_statement_end() {
-                    if self.at_op(Op::LParen) {
-                        args = self.parse_paren_args()?;
-                    } else {
-                        args.push(self.parse_expr()?);
-                        while self.eat_op(Op::Comma) {
-                            args.push(self.parse_expr()?);
-                        }
+            let mut path = Vec::new();
+            while self.eat_op(Op::Dot) {
+                match self.expect_member_name() {
+                    Ok(member) => path.push(member),
+                    Err(_) => {
+                        self.pos = start;
+                        return Err(ParseError::new("成员名后面需要实参或 `=`", self.line()));
                     }
                 }
-                return Ok(Stmt::CallMethod {
-                    object: name,
-                    method,
-                    args,
-                    line,
-                });
+                // `obj.Member(下标…).Other` 这种链式，交给下面的成员赋值/调用处理。
+                if !self.at_op(Op::Dot) {
+                    break;
+                }
             }
-            self.pos = start;
+            let mut args = Vec::new();
+            if !self.at_statement_end() {
+                if self.at_op(Op::LParen) {
+                    args = self.parse_paren_args()?;
+                } else {
+                    args.push(self.parse_expr()?);
+                    while self.eat_op(Op::Comma) {
+                        args.push(self.parse_expr()?);
+                    }
+                }
+            }
+            return Ok(Stmt::CallMethod {
+                object: name,
+                path,
+                args,
+                line,
+            });
         } // `a(0) = 1` / `a(0).X = 1` / `Mid(s, 2, 3) = "x"` / 普通调用
         if self.at_op(Op::LParen) {
             let args = self.parse_paren_args()?;
@@ -1679,6 +1827,8 @@ impl Parser {
     }
 
     fn parse_dim(&mut self, line: usize, static_: bool) -> Result<Stmt, ParseError> {
+        // `Dim WithEvents x As Object`：脚本级的 WithEvents 变量（VB6 里写在模块/类级别）。
+        let with_events = self.eat_kw(Kw::WithEvents);
         let mut items = Vec::new();
         loop {
             let (name, suffix) = self.expect_ident_typed("变量名")?;
@@ -1726,7 +1876,7 @@ impl Parser {
                 bounds,
                 initializer,
                 new_object,
-                with_events: false,
+                with_events,
             });
             if !self.eat_op(Op::Comma) {
                 break;
@@ -2312,12 +2462,33 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         let mut expr = match self.peek().clone() {
             TokenKind::Int(value) => {
+                // `123&` 是 Long、`45%` 是 Integer（VB6 实测），后缀只影响类型报告。
+                let ty = match self.token().suffix {
+                    Some('&') => Some(VbType::Long),
+                    Some('%') => Some(VbType::Integer),
+                    _ => None,
+                };
                 self.advance();
-                Expr::Literal(Value::Int(value))
+                match ty {
+                    Some(ty) => Expr::TypedLiteral {
+                        value: Value::Int(value),
+                        ty,
+                    },
+                    None => Expr::Literal(Value::Int(value)),
+                }
             }
             TokenKind::Float(value) => {
+                // `1.5!` 是 Single（VB6 实测），值仍是 64 位浮点。
+                let single = self.token().suffix == Some('!');
                 self.advance();
-                Expr::Literal(Value::Float(value))
+                if single {
+                    Expr::TypedLiteral {
+                        value: Value::Float(value),
+                        ty: VbType::Single,
+                    }
+                } else {
+                    Expr::Literal(Value::Float(value))
+                }
             }
             TokenKind::Date(value) => {
                 self.advance();
@@ -2410,7 +2581,7 @@ impl Parser {
                 // `With` 块里的相对成员：`.X`、`.A.B`。
                 let mut path = Vec::new();
                 while self.eat_op(Op::Dot) {
-                    path.push(self.expect_ident("成员名")?);
+                    path.push(self.expect_member_name()?);
                 }
                 Expr::WithMember { path }
             }
@@ -2424,7 +2595,7 @@ impl Parser {
 
         // `p.X`、`l.A.X`：记录成员访问（`p.Items(1)` 是数组字段的元素）。
         while self.eat_op(Op::Dot) {
-            let name = self.expect_ident("成员名")?;
+            let name = self.expect_member_name()?;
             let base = Box::new(expr);
             expr = if self.at_op(Op::LParen) {
                 let indices = self.parse_paren_args()?;

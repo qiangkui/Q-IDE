@@ -192,6 +192,24 @@ fn nested_include_definitions_are_in_scope() {
 }
 
 #[test]
+fn include_at_the_end_of_the_file_still_provides_types() {
+    let dir = TempDir::new("include-last");
+    dir.write(
+        "common.vb",
+        "Private Type Pt\n    X As Long\nEnd Type\nPrivate Class Box\n    Public Value As Long\nEnd Class\n",
+    );
+    let main = "Option Explicit\nDim p As Pt\np.X = 3\nDim b As Box\nSet b = New Box\nb.Value = 4\nDebug.Print p.X & \",\" & b.Value\n#Include \"common.vb\"\n";
+    let path = dir.write("main.vb", main);
+
+    assert_eq!(output(main, &path).expect("应当运行成功"), ["3,4"]);
+    assert!(
+        crate::lint::analyze_with_path(main, Some(&path))
+            .issues
+            .is_empty()
+    );
+}
+
+#[test]
 fn parse_error_in_included_file_points_to_the_directive() {
     let dir = TempDir::new("parse-error");
     dir.write("bad.vb", "Private Const X As Long =\n");

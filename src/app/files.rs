@@ -233,6 +233,40 @@ impl CodeWindow {
         self.output().command(cx, format!("> 已复制路径：{text}"));
     }
 
+    /// 开始拖动资源管理器条目：记下路径，拖出窗口后松开时复制到剪贴板。
+    pub(crate) fn begin_explorer_drag(&mut self, path: &str) {
+        self.drag_out.begin(path);
+    }
+
+    /// 拖动过程中指针位置变化；在窗口外松开（或松开后指针回到窗口内）时复制路径。
+    pub(crate) fn explorer_drag_moved(
+        &mut self,
+        inside: bool,
+        button_pressed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(path) = self.drag_out.moved(inside, button_pressed) {
+            self.copy_path_text(&path, cx);
+        }
+    }
+
+    /// 鼠标在窗口外松开：把正在拖的路径复制到剪贴板。
+    pub(crate) fn finish_explorer_drag_outside(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = self.drag_out.released_outside() {
+            self.copy_path_text(&path, cx);
+        }
+    }
+
+    /// 鼠标在窗口内松开：正常拖放结束，不复制。
+    pub(crate) fn finish_explorer_drag_inside(&mut self) {
+        self.drag_out.released_inside();
+    }
+
+    /// 新的一次鼠标按下：清掉可能残留的拖动状态。
+    pub(crate) fn reset_explorer_drag(&mut self) {
+        self.drag_out.cancel();
+    }
+
     /// 打开「重命名」对话框（标签菜单/文件菜单用，作用于当前标签）。
     pub(crate) fn rename_file_dialog(
         &mut self,
@@ -774,7 +808,7 @@ impl CodeWindow {
         Ok(())
     }
 
-    /// 另存为（`Ctrl+Shift+S`）：选一个路径，写入后把标签切到新文件。
+    /// 另存为（`Ctrl+Shift+S`）：选一个路径，再确认编码与换行符，写入后把标签切到新文件。
     pub(crate) fn save_file_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.save_active_content(cx);
         let Some(index) = self.active_file else {
@@ -792,19 +826,83 @@ impl CodeWindow {
 
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(path))) = receiver.await {
-                this.update_in(cx, |this, _window, cx| this.save_as_to(index, path, cx))
-                    .ok();
+                this.update_in(cx, |this, window, cx| {
+                    this.prompt_save_as_options(index, path, window, cx)
+                })
+                .ok();
             }
         })
         .detach();
     }
 
-    /// 把第 `index` 个标签的内容写到 `path`，并把标签改名。
-    pub(super) fn save_as_to(&mut self, index: usize, path: PathBuf, cx: &mut Context<Self>) {
+    /// 选好另存路径后确认编码与换行符，确认后写盘。
+    pub(super) fn prompt_save_as_options(
+        &mut self,
+        index: usize,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.save_active_content(cx);
+        let current = self
+            .open_files
+            .get(index)
+            .map_or(Default::default(), |file| file.encoding);
+        let options = cx.new(|_| SaveOptions::new(current, encoding::LineEnding::Keep));
+        let handle = cx.entity().downgrade();
+        let on_confirm: SaveAsConfirm = Rc::new(move |chosen, ending, window, cx| {
+            let path = path.clone();
+            let _ = handle.update(cx, |this, cx| {
+                this.save_as_to(index, path, chosen, ending, window, cx)
+            });
+        });
+        show_save_as_dialog(window, cx, options, on_confirm);
+    }
+
+    /// 把第 `index` 个标签的内容按指定编码与换行符写到 `path`，并把标签改名。
+    pub(super) fn save_as_to(
+        &mut self,
+        index: usize,
+        path: PathBuf,
+        chosen: encoding::FileEncoding,
+        ending: encoding::LineEnding,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if index >= self.open_files.len() {
+            return;
+        }
         let name = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
+
+        // 换行符先落到编辑器内容上，后续保存才不会又变回原来的写法。
+        let normalized = self
+            .contents
+            .get(index)
+            .map(|content| encoding::normalize_newlines(content, ending));
+        if let Some(normalized) = normalized {
+            let unchanged = self
+                .contents
+                .get(index)
+                .is_some_and(|current| current.as_ref() == normalized);
+            if !unchanged {
+                let normalized: SharedString = normalized.into();
+                if let Some(slot) = self.contents.get_mut(index) {
+                    *slot = normalized.clone();
+                }
+                if let Some(editor) = self.editors.get(index).cloned() {
+                    editor.update(cx, |editor, cx| {
+                        editor.set_value(normalized.to_string(), window, cx)
+                    });
+                }
+            }
+        }
+        if let Some(file) = self.open_files.get_mut(index) {
+            file.encoding = chosen;
+        }
+
         if let Err(error) = self.write_content(index, &path) {
             let output = self.output();
             output.error(cx, format!("保存 {name} 失败：{error}"));
@@ -829,8 +927,68 @@ impl CodeWindow {
             self.save_layout(cx);
         }
         let output = self.output();
-        output.success(cx, format!("已另存为 {name}"));
+        output.success(cx, format!("已另存为 {name}（{}）", chosen.label()));
         cx.notify();
+    }
+
+    /// 状态栏编码菜单选中一项：按该编码重新从磁盘读取当前文件。
+    ///
+    /// 有未保存修改时先确认（确认框自身不会再叠别的对话框）。
+    pub(crate) fn change_encoding_to(
+        &mut self,
+        chosen: encoding::FileEncoding,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.active_file else {
+            self.output().warning(cx, "没有打开的文件，无法切换编码");
+            return;
+        };
+        self.save_active_content(cx);
+        let path = PathBuf::from(self.open_files[index].id.to_string());
+        if !path.is_file() {
+            self.output()
+                .warning(cx, "文件还没有保存到磁盘，无法按新编码重新读取");
+            return;
+        }
+        if self.open_files[index].encoding == chosen {
+            return;
+        }
+        if self.file_is_dirty(index) {
+            let handle = cx.entity().downgrade();
+            let on_confirm: DialogCallback = Rc::new(move |window, cx| {
+                let _ = handle.update(cx, |this, cx| {
+                    this.apply_encoding_change(index, chosen, window, cx)
+                });
+            });
+            show_confirm_dialog(
+                window,
+                cx,
+                "切换编码",
+                "当前文件有未保存的修改，切换编码会从磁盘重新读取，未保存的修改会丢失。"
+                    .to_string(),
+                "继续切换",
+                on_confirm,
+            );
+            return;
+        }
+        self.apply_encoding_change(index, chosen, window, cx);
+    }
+
+    fn apply_encoding_change(
+        &mut self,
+        index: usize,
+        chosen: encoding::FileEncoding,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(file) = self.open_files.get(index) else {
+            return;
+        };
+        let name = file.name.to_string();
+        self.reload_with_encoding(index, chosen, window, cx);
+        self.output()
+            .command(cx, format!("> {name} 已按 {} 重新读取", chosen.label()));
     }
 
     /// 弹出系统文件夹选择框，把选中的文件夹加入资源管理器。

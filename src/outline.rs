@@ -300,10 +300,12 @@ pub(crate) fn group_by_scope(symbols: &[OutlineSymbol]) -> Vec<(&str, Vec<&Outli
 }
 
 fn procedure_symbol(procedure: &Procedure, class: Option<&str>) -> OutlineSymbol {
-    let kind = if procedure.is_let {
-        "Property Let"
+    let kind = if procedure.is_get {
+        "Property Get"
     } else if procedure.is_set {
         "Property Set"
+    } else if procedure.is_let {
+        "Property Let"
     } else if procedure.is_function {
         "Function"
     } else {
@@ -477,8 +479,17 @@ fn scan_incomplete_source(source: &str) -> OutlineModel {
         }
         if let Some(rest) = strip_word(statement, "property") {
             let rest = rest.trim_start();
-            let (_, rest) = split_word(rest).unwrap_or(("", rest));
-            enter_named_scope(&mut scopes, &mut model.procedures, rest, "Property", line_number);
+            let (accessor, rest) = split_word(rest).unwrap_or(("", rest));
+            let kind = if accessor.eq_ignore_ascii_case("get") {
+                "Property Get"
+            } else if accessor.eq_ignore_ascii_case("let") {
+                "Property Let"
+            } else if accessor.eq_ignore_ascii_case("set") {
+                "Property Set"
+            } else {
+                "Property"
+            };
+            enter_named_scope(&mut scopes, &mut model.procedures, rest, kind, line_number);
             continue;
         }
         if let Some(rest) = strip_word(statement, "class") {

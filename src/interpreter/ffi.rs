@@ -740,7 +740,7 @@ fn read_into_record(
                 for index in 0..*count {
                     let key = lower.saturating_add(index as i32);
                     let value = read_scalar(buffer, offset + index * scalar_size(*ty), *ty)?;
-                    array.borrow_mut().set(&[key], value)?;
+                    array.borrow_mut().set(&[key], value, None)?;
                 }
             }
             FieldKind::Records {
@@ -1445,6 +1445,11 @@ mod platform {
         pub fn CloseHandle(handle: *mut c_void) -> i32;
     }
 
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        pub fn MessageBeep(kind: u32) -> i32;
+    }
+
     /// `STARTUPINFOW`（字段顺序与平台结构体一致）。
     #[repr(C)]
     #[derive(Default)]
@@ -1643,6 +1648,16 @@ pub fn sleep_ms(milliseconds: u32) {
 }
 
 /// 系统启动以来的毫秒数。
+/// `Beep`????????????`MessageBeep(0)`??
+pub fn beep() {
+    #[cfg(windows)]
+    {
+        unsafe {
+            platform::MessageBeep(0);
+        }
+    }
+}
+
 pub fn tick_count() -> u32 {
     #[cfg(windows)]
     {

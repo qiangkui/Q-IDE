@@ -491,6 +491,55 @@ impl CodeWindow {
         cx.notify();
     }
 
+    /// 按指定编码重新从磁盘读取（状态栏「切换编码」用）。
+    ///
+    /// 与 [`Self::reload_from_disk`] 的区别是这里不重新探测编码：用户选了什么就按什么解码。
+    pub(super) fn reload_with_encoding(
+        &mut self,
+        index: usize,
+        chosen: encoding::FileEncoding,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if index >= self.open_files.len() {
+            return;
+        }
+        let path = PathBuf::from(self.open_files[index].id.to_string());
+        let Ok(bytes) = std::fs::read(&path) else {
+            let name = self.open_files[index].name.to_string();
+            self.output()
+                .error(cx, format!("无法读取 {name}，编码没有改变"));
+            return;
+        };
+        let content: SharedString = encoding::decode_with(&bytes, chosen).into();
+        if let Some(file) = self.open_files.get_mut(index) {
+            file.encoding = chosen;
+        }
+        if let Some(slot) = self.disk_stamps.get_mut(index) {
+            *slot = workspace::disk_stamp(&path);
+        }
+        if let Some(slot) = self.contents.get_mut(index) {
+            *slot = content.clone();
+        }
+        if let Some(slot) = self.saved.get_mut(index) {
+            *slot = content.clone();
+        }
+        if let Some(editor) = self.editors.get(index).cloned() {
+            editor.update(cx, |editor, cx| {
+                editor.set_value(content.to_string(), window, cx)
+            });
+        }
+        if self.active_file == Some(index) {
+            self.reset_editor_caches();
+            self.refresh_outline(cx);
+            self.refresh_diagnostics(cx);
+            self.refresh_breakpoint_marks(cx);
+            self.refresh_editor_language(cx);
+        }
+        self.sync_editor_panel(cx);
+        cx.notify();
+    }
+
     /// 有未保存修改时问用户：保留我的内容，还是用磁盘上的版本覆盖。
     pub(super) fn prompt_external_reload(
         &mut self,

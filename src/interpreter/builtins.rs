@@ -4,7 +4,9 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::interpreter::ffi;
-use crate::interpreter::value::{Value, VbType, parse_number, round_half_even};
+use crate::interpreter::value::{
+    Value, VbArray, VbType, parse_number, parse_radix_text, round_half_even,
+};
 
 /// 内置函数执行环境。
 pub struct Ctx<'a> {
@@ -30,6 +32,13 @@ pub struct Ctx<'a> {
     pub failure: Option<i64>,
     /// `StrPtr` 返回的 UTF-16 缓冲区；必须活到脚本结束，指针才一直有效。
     pub strings: &'a mut Vec<Vec<u16>>,
+    /// 第一个实参的**静态类型**（只有 `Hex` / `Oct` 需要：输出宽度跟着参数类型走）。
+    pub arg_type: Option<VbType>,
+    /// 全部实参的静态类型（`Array(...)` 记元素类型、`IIf`/`Choose`/`Switch` 记结果类型都要用）。
+    pub arg_types: &'a [Option<VbType>],
+    /// 返回实参本身的内置函数（`IIf`/`Choose`/`Switch`）把选中项的内容类型记在这里，
+    /// 供 `VarType` / `TypeName` 回答（`Value` 本身不带窄类型）。
+    pub result_narrow: Option<VbType>,
 }
 
 /// 把脚本里的路径变成实际路径：绝对路径原样返回，相对路径按脚本当前目录解析。
@@ -66,6 +75,7 @@ const BUILTINS: &[&str] = &[
     "shell",
     "command",
     "len",
+    "lenb",
     "mid",
     "left",
     "right",
@@ -80,6 +90,18 @@ const BUILTINS: &[&str] = &[
     "chr",
     "asc",
     "val",
+    "rgb",
+    "qbcolor",
+    "beep",
+    "formatnumber",
+    "formatcurrency",
+    "formatpercent",
+    "formatdatetime",
+    "getsetting",
+    "savesetting",
+    "deletesetting",
+    "getallsettings",
+    "loadpicture",
     "str",
     "cstr",
     "cint",
@@ -130,6 +152,7 @@ const BUILTINS: &[&str] = &[
     "timeserial",
     "dateadd",
     "datediff",
+    "datepart",
     "year",
     "month",
     "day",
@@ -179,71 +202,93 @@ pub fn names() -> &'static [&'static str] {
     BUILTINS
 }
 
-/// VB 错误号对应的说明文字（`Error()` 与 `Err.Raise` 的默认描述）。
+/// VB 错误号对应的说明文字（`Error()` 与 `Err.Raise` / `Error n` 的默认描述）。
+///
+/// 文案来自本机 VB6 p-code 实测的 `Error$(n)`（**运行时**表），与 VB6 IDE 编译对话框用的
+/// RT_STRING 文案不同（例如 3 号运行时是「不执行 GoSub 而返回」，IDE 是「无 GoSub 返回」）；
+/// 未知错误号返回 VB6 的兜底文案「定义的应用程序或对象错误」。
 pub fn error_text(number: i64) -> String {
     if number == 0 {
         return String::new();
     }
     let text = match number {
-        3 => "无 GoSub 返回",
+        3 => "不执行 GoSub 而返回",
         5 => "无效的过程调用或参数",
         6 => "溢出",
-        7 => "内存溢出",
+        7 => "超出内存",
         9 => "下标越界",
-        10 => "该数组被固定或暂时锁定",
+        10 => "该数组被固定或临时锁定",
         11 => "除数为零",
         13 => "类型不匹配",
-        14 => "字符串空间溢出",
+        14 => "超出字符串空间",
         16 => "表达式太复杂",
-        17 => "不能执行所需的操作",
-        18 => "出现用户中断",
+        17 => "不能执行请求的操作",
+        18 => "发生用户中断",
         20 => "无错误恢复",
         28 => "堆栈空间溢出",
-        35 => "子程序或函数未定义",
-        47 => "DLL 应用程序客户太多",
+        35 => "Sub 或 Function 未定义",
+        47 => "太多 DLL 应用程序客户",
         48 => "加载 DLL 错误",
         49 => "DLL 调用约定错误",
         51 => "内部错误",
-        52 => "错误的文件名或号码",
+        52 => "错误文件名或数",
         53 => "文件未找到",
-        54 => "文件模式错误",
-        55 => "文件已打开",
+        54 => "错误文件模式",
+        55 => "文件已经打开",
         57 => "设备 I/O 错误",
-        58 => "文件已存在",
-        59 => "记录长度错误",
-        61 => "磁盘已满",
+        58 => "文件已经存在",
+        59 => "错误记录长度",
+        61 => "磁盘满",
         62 => "输入超出文件尾",
-        63 => "记录号错误",
-        67 => "文件太多",
+        63 => "错误记录号",
+        67 => "太多文件",
         68 => "设备不可用",
         70 => "拒绝的权限",
         71 => "磁盘未准备好",
-        74 => "不能以不同的驱动器改名",
+        74 => "不能用不同驱动器重命名",
         75 => "路径/文件访问错误",
-        76 => "路径未找到",
-        91 => "对象变量或 With 块变量未设置",
+        76 => "未找到路径",
+        91 => "未设置对象变量或 With block 变量",
         92 => "For 循环未初始化",
-        93 => "无效的模式串",
-        94 => "无效使用 Null",
-        95 => "应用程序定义或对象定义错误",
-        96 => "由于对象已经激活了事件接受器支持的最多个事件，因此不能激活对象的事件",
-        97 => "不能调用对象的友元函数，该对象不是所定义类的一个实例。",
-        98 => "一个属性或方法调用不能包含对一个私有对象的引用，无论是作为参数还是返回值",
+        93 => "无效格式字符串",
+        94 => "使用 Null 无效",
+        95 => "定义的应用程序或对象错误",
+        96 => "无法吸收对象的事件，因为引发的事件已经达到它的对象接收器所支持的最大数目。",
+        97 => "在不是定义类实例的对象中不能调用友元函数",
+        98 => "属性或方法调用不能包括对私有对象的引用，无论是作为参数或者作为返回值。",
         424 => "需要对象",
-        429 => "ActiveX 部件无法创建对象",
+        429 => "ActiveX 部件不能创建对象",
         438 => "对象不支持该属性或方法",
-        449 => "参数不可选",
-        450 => "参数个数错误或属性赋值无效",
-        451 => "对象不是集合",
-        _ => "应用程序定义或对象定义的错误",
+        446 => "对象不支持命名参数",
+        449 => "参数不是可选的",
+        450 => "错误的参数数或无效属性分配",
+        // VB6 自己的 451 资源串是坏的（`属性使得未定义过程Property let …`），这里按含义写。
+        451 => "属性 Let 过程未定义，或属性 Get 过程没有返回对象",
+        452 => "无效的序号",
+        453 => "未找到指定的 DLL 函数",
+        454 => "未找到代码源",
+        455 => "代码源锁定错误",
+        457 => "该键已同该集合中的一个元素关联。",
+        458 => "变量使用了 Visual Basic 不支持的 Automation 类型",
+        459 => "对象或类不支持事件设置",
+        460 => "无效剪贴板格式",
+        461 => "未找到方法或数据成员",
+        462 => "远程服务器不存在或不可用",
+        463 => "在本地机器上未注册类",
+        _ => "定义的应用程序或对象错误",
     };
     text.to_string()
 }
 
-/// `VarType` 的返回值（VB 的 `vb*` 常量）。数组是 `vbArray + 元素类型码`。
+/// `VarType` 的返回值（VB 的 `vb*` 常量），只按**值的动态类型**判断。数组是 `vbArray + 元素类型码`。
 ///
-/// 注意：QIDE 的整数统一用 `i64` 承载、整数字面量按 `Long` 处理，所以 `VarType(1)` 是 3（Long），
-/// 而 VB6 的整数字面量是 Integer、会返回 2。声明为 `As Integer` 的变量同样只能报 3。
+/// 变量的**声明**类型在 [`crate::interpreter::runtime`] 的调用分派里优先使用：
+/// `Dim n As Integer` 的 `VarType(n)` 是 2。但值本身不带窄类型信息，所以字面量与表达式
+/// （`VarType(1)`、`VarType(i * 2)`）仍按 `Long` 报 3，`Variant` 里装的整数也一样。
+pub(crate) fn vartype_code_of(value: &Value) -> i64 {
+    vartype_code(Some(value))
+}
+
 fn vartype_code(value: Option<&Value>) -> i64 {
     let Some(value) = value else {
         return 0;
@@ -257,17 +302,41 @@ fn vartype_code(value: Option<&Value>) -> i64 {
         Value::Date(_) => 7,
         Value::Str(_) => 8,
         Value::Bool(_) => 11,
-        Value::Array(array) => 8192 + element_vartype(array.borrow().element_type()),
+        Value::Array(array) => 8192 + vartype_of(array.borrow().element_type()),
         Value::FuncPtr(_) => 3,
         Value::Record(_)
         | Value::Class(_)
         | Value::ComObject(_)
         | Value::Collection(_)
-        | Value::Dictionary(_) => 9,
+        | Value::Dictionary(_)
+        | Value::Picture(_) => 9,
     }
 }
 
-fn element_vartype(ty: VbType) -> i64 {
+/// `Hex` / `Oct` 的文本：宽度跟着参数的静态类型走。
+///
+/// 本机 VB6 实测：`Hex(-1)` 是 16 位的 `FFFF`（`-1` 是 Integer）、`Hex(-1&)` 是 32 位的 `FFFFFFFF`、
+/// `Hex(-32768)` 是 `FFFF8000`（`32768` 已是 Long，取负后仍是 Long）、正数一律不补零。
+fn radix_text(value: i64, ty: Option<VbType>, radix: u32) -> String {
+    if ty == Some(VbType::Integer) {
+        let narrow = value as i16;
+        return match radix {
+            8 => format!("{:o}", narrow as u16),
+            _ => format!("{:X}", narrow as u16),
+        };
+    }
+    let wide = value as i32 as u32;
+    match radix {
+        8 => format!("{wide:o}"),
+        _ => format!("{wide:X}"),
+    }
+}
+
+/// 声明类型对应的 `VarType` 类型码。
+///
+/// 数组拼 8192 时用它，`VarType(变量)` 也用它——值本身不带窄类型信息，
+/// 只能靠变量的声明类型区分 Integer / Byte / Single。
+pub(crate) fn vartype_of(ty: VbType) -> i64 {
     match ty {
         VbType::Byte => 17,
         VbType::Integer => 2,
@@ -364,6 +433,19 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
             .map(Value::to_display)
             .ok_or_else(|| format!("`{name}` 缺少第 {} 个参数", index + 1))
     };
+    // VB 的 `Null` 怎么处理看形参声明：`As String` / `As Long` 这类**非 `Variant`** 形参收到 `Null`
+    // 报错误号 94（「无效使用 Null」），`Variant` 形参则把 `Null` 原样传回去。
+    // 本机 VB6 实测：`Asc(Null)`=94、`Split(Null, ",")`=94、`Chr(Null)`=94、`Val(Null)`=94，
+    // 而 `Trim(Null)`、`LCase(Null)`、`Right(Null, 1)`、`String(3, Null)` 都返回 `Null`。
+    let strict = |index: usize| -> Result<(), String> {
+        match args.get(index) {
+            Some(Value::Null) => Err("无效使用 Null".into()),
+            _ => Ok(()),
+        }
+    };
+    let propagated = |index: usize| -> Option<Value> {
+        matches!(args.get(index), Some(Value::Null)).then_some(Value::Null)
+    };
     let number = |index: usize| -> Result<i64, String> {
         args.get(index)
             .ok_or_else(|| format!("`{name}` 缺少第 {} 个参数", index + 1))?
@@ -416,19 +498,43 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
             // VB 的 windowstyle：0 隐藏、1 常规、2 最小化、3 最大化。
             Value::Int(ffi::shell(&command, style as i32)?)
         }
-        "len" => match args.first().and_then(|value| value.as_record().ok()) {
-            Some(record) => {
-                let name = record.borrow().type_name().to_ascii_lowercase();
-                match (ctx.record_size)(&name) {
-                    Some(size) => Value::Int(size as i64),
-                    None => return Err(format!("`Len` 不认识类型 `{name}`")),
+        "len" | "lenb" => {
+            // `Len`/`LenB` 的形参是 `Variant`：`Len(Null)` 与 `LenB(Null)` 都返回 `Null`（本机 VB6 实测）。
+            if let Some(null) = propagated(0) {
+                return Ok(null);
+            }
+            if matches!(args.first(), Some(Value::Array(_))) {
+                ctx.failure = Some(13);
+                return Err("`Len` 不能用于数组".into());
+            }
+            match args.first().and_then(|value| value.as_record().ok()) {
+                Some(record) => {
+                    let name = record.borrow().type_name().to_ascii_lowercase();
+                    match (ctx.record_size)(&name) {
+                        Some(size) => Value::Int(size as i64),
+                        None => return Err(format!("`Len` 不认识类型 `{name}`")),
+                    }
+                }
+                // VB 的字符串是 UTF-16，`LenB` 是 `Len` 的两倍（本机 VB6 实测 `LenB("abc")`=6）。
+                None => {
+                    let chars = text(0)?.chars().count() as i64;
+                    Value::Int(if name == "lenb" { chars * 2 } else { chars })
                 }
             }
-            None => Value::Int(text(0)?.chars().count() as i64),
-        },
+        }
         "mid" => {
+            if let Some(null) = propagated(0) {
+                return Ok(null);
+            }
+            strict(1)?;
+            strict(2)?;
             let source: Vec<char> = text(0)?.chars().collect();
-            let start = number(1)?.max(1) as usize;
+            let start = number(1)?;
+            if start < 1 {
+                ctx.failure = Some(5);
+                return Err("`Mid` 的起点必须大于 0".into());
+            }
+            let start = start as usize;
             let length = match args.get(2) {
                 Some(value) => value.as_int()?.max(0) as usize,
                 None => usize::MAX,
@@ -438,35 +544,90 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
             Value::Str(source[begin..end].iter().collect())
         }
         "left" => {
+            if let Some(null) = propagated(0) {
+                return Ok(null);
+            }
+            strict(1)?;
             let source: Vec<char> = text(0)?.chars().collect();
-            let count = number(1)?.max(0) as usize;
+            let count = number(1)?;
+            if count < 0 {
+                ctx.failure = Some(5);
+                return Err("`Left` 的长度不能是负数".into());
+            }
+            let count = count as usize;
             Value::Str(source[..count.min(source.len())].iter().collect())
         }
         "right" => {
+            if let Some(null) = propagated(0) {
+                return Ok(null);
+            }
+            strict(1)?;
             let source: Vec<char> = text(0)?.chars().collect();
-            let count = number(1)?.max(0) as usize;
+            let count = number(1)?;
+            if count < 0 {
+                ctx.failure = Some(5);
+                return Err("`Right` 的长度不能是负数".into());
+            }
+            let count = count as usize;
             let begin = source.len().saturating_sub(count);
             Value::Str(source[begin..].iter().collect())
         }
-        "ucase" => Value::Str(text(0)?.to_uppercase()),
-        "lcase" => Value::Str(text(0)?.to_lowercase()),
-        "trim" => Value::Str(text(0)?.trim().to_string()),
-        "ltrim" => Value::Str(text(0)?.trim_start().to_string()),
-        "rtrim" => Value::Str(text(0)?.trim_end().to_string()),
+        "ucase" => match propagated(0) {
+            Some(null) => null,
+            None => Value::Str(text(0)?.to_uppercase()),
+        },
+        "lcase" => match propagated(0) {
+            Some(null) => null,
+            None => Value::Str(text(0)?.to_lowercase()),
+        },
+        "trim" => match propagated(0) {
+            Some(null) => null,
+            None => Value::Str(text(0)?.trim().to_string()),
+        },
+        "ltrim" => match propagated(0) {
+            Some(null) => null,
+            None => Value::Str(text(0)?.trim_start().to_string()),
+        },
+        "rtrim" => match propagated(0) {
+            Some(null) => null,
+            None => Value::Str(text(0)?.trim_end().to_string()),
+        },
         "instr" => {
             // `InStr([start], string1, string2, [compare])`：VB 的 compare 是 0=二进制、1=文本、
             // 2=数据库（按二进制处理）。省略时按二进制比较。
+            // `Null` 的处理按形参走：字符串形参是 `Variant` 所以传播 `Null`，
+            // 起点是 `As Long` 所以报 13（本机 VB6 实测 `InStr(Null, "a")`=Null、`InStr("abc", "b", Null)`=13）。
             let (start, haystack, needle, ignore_case) = match args.len() {
                 0 | 1 => return Err("`instr` 需要至少两个参数".into()),
-                2 => (1usize, text(0)?, text(1)?, false),
-                3 => (number(0)?.max(1) as usize, text(1)?, text(2)?, false),
-                _ => (
-                    number(0)?.max(1) as usize,
-                    text(1)?,
-                    text(2)?,
-                    compare_is_text(args.get(3))?,
-                ),
+                2 => {
+                    if let Some(null) = propagated(0).or_else(|| propagated(1)) {
+                        return Ok(null);
+                    }
+                    (1i64, text(0)?, text(1)?, false)
+                }
+                3 => {
+                    // 三参形式是 `InStr(start, string1, string2)`：先转起点，再判字符串的 `Null`。
+                    strict(0)?;
+                    let start = number(0)?;
+                    if propagated(1).is_some() || propagated(2).is_some() {
+                        return Ok(Value::Null);
+                    }
+                    (start, text(1)?, text(2)?, false)
+                }
+                _ => {
+                    strict(0)?;
+                    let start = number(0)?;
+                    if propagated(1).is_some() || propagated(2).is_some() {
+                        return Ok(Value::Null);
+                    }
+                    (start, text(1)?, text(2)?, compare_is_text(args.get(3))?)
+                }
             };
+            if start < 1 {
+                ctx.failure = Some(5);
+                return Err("`InStr` 的起点必须大于 0".into());
+            }
+            let start = start as usize;
             let chars: Vec<char> = haystack.chars().collect();
             let needle: Vec<char> = needle.chars().collect();
             // VB：子串为空时返回起点；起点越过末尾时返回 0。
@@ -487,6 +648,9 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
         "instrrev" => {
             // `InStrRev(string1, string2, [start], [compare])`：从 `start`（默认 -1 = 末尾）
             // 往左找，返回**起始位置**在 `start` 之前的最后一个匹配。
+            // 形参都是非 `Variant`，收到 `Null` 报 94（本机 VB6 实测 `InStrRev(Null, "a")`=94）。
+            strict(0)?;
+            strict(1)?;
             let haystack = text(0)?;
             let needle = text(1)?;
             let chars: Vec<char> = haystack.chars().collect();
@@ -496,6 +660,10 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
                 None => -1,
             };
             let ignore_case = compare_is_text(args.get(3))?;
+            if start == 0 {
+                ctx.failure = Some(5);
+                return Err("`InStrRev` 的起点不能是 0".into());
+            }
             let start = if start < 0 {
                 chars.len()
             } else {
@@ -511,6 +679,10 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
         }
         "replace" => {
             // `Replace(expression, find, replace, [start], [count], [compare])`。
+            // 三个字符串形参都是非 `Variant`：任一为 `Null` 报 94（VB6 实测）。
+            strict(0)?;
+            strict(1)?;
+            strict(2)?;
             let source = text(0)?;
             let find = text(1)?;
             let replacement = text(2)?;
@@ -533,18 +705,151 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
             ))
         }
         "chr" => {
+            strict(0)?;
             let code = number(0)? as u32;
             Value::Str(char::from_u32(code).unwrap_or('\u{fffd}').to_string())
         }
-        "asc" => Value::Int(text(0)?.chars().next().map(|c| c as i64).unwrap_or(0)),
-        "val" => Value::Float(leading_number(&text(0)?).unwrap_or(0.0)),
+        "asc" => {
+            strict(0)?;
+            match text(0)?.chars().next() {
+                Some(first) => Value::Int(first as i64),
+                None => {
+                    ctx.failure = Some(5);
+                    return Err("`Asc` 的参数不能是空字符串".into());
+                }
+            }
+        }
+        "val" => {
+            strict(0)?;
+            Value::Float(leading_number(&text(0)?).unwrap_or(0.0))
+        }
+        // `RGB(r, g, b)`：分量超过 255 按 255 处理、负数报错误号 5（本机 VB6 实测）。
+        "rgb" => {
+            let mut color = 0i64;
+            for (index, weight) in [1i64, 256, 65536].into_iter().enumerate() {
+                let channel = number(index)?;
+                if channel < 0 {
+                    ctx.failure = Some(5);
+                    return Err("`RGB` 的颜色分量不能是负数".into());
+                }
+                color += channel.min(255) * weight;
+            }
+            Value::Int(color)
+        }
+        "qbcolor" => {
+            let index = number(0)?;
+            if !(0..=15).contains(&index) {
+                ctx.failure = Some(5);
+                return Err(format!("`QBColor` 的颜色号 {index} 超出 0..15"));
+            }
+            Value::Int(QB_COLORS[index as usize])
+        }
+        // `Beep` 在 VB6 里是语句（`Stmt::Call` 会走到这里），响一声系统提示音。
+        "beep" => {
+            ffi::beep();
+            Value::Empty
+        }
+        "formatnumber" | "formatcurrency" | "formatpercent" => {
+            Value::Str(format_amount(name, &args, ctx)?)
+        }
+        "formatdatetime" => {
+            let serial = args
+                .first()
+                .map(Value::as_float)
+                .transpose()?
+                .unwrap_or_else(now_serial);
+            let named = args.get(1).map(Value::as_int).transpose()?.unwrap_or(0);
+            Value::Str(format_date_named(serial, named, ctx)?)
+        }
+        "getsetting" => {
+            let default = match args.get(3) {
+                Some(value) => value.to_display(),
+                None => String::new(),
+            };
+            Value::Str(get_setting(&text(0)?, &text(1)?, &text(2)?).unwrap_or(default))
+        }
+        "savesetting" => {
+            let (app, section, key, value) = (text(0)?, text(1)?, text(2)?, text(3)?);
+            save_setting(&app, &section, &key, &value);
+            Value::Empty
+        }
+        "deletesetting" => {
+            let app = text(0)?;
+            let section = if args.len() > 1 { Some(text(1)?) } else { None };
+            let key = if args.len() > 2 { Some(text(2)?) } else { None };
+            delete_setting(&app, section.as_deref(), key.as_deref());
+            Value::Empty
+        }
+        // 本机 VB6 实测：返回 0 基二维 `String` 数组（`VarType` 8200、`TypeName` 是 `String()`），
+        // 列 0 是键名、列 1 是值，顺序是**写入顺序**；一节里没有键时返回 `Empty`（不是空数组）。
+        // 本机 VB6 实测：文件不存在报 53、内容不是图片报 481；`LoadPicture("")` / `LoadPicture()`
+        // 返回一个**空图片对象**（不是 `Nothing`，`TypeName` 仍是 `Picture`）。
+        "loadpicture" => {
+            let path = match args.first() {
+                Some(value) => value.to_display(),
+                None => String::new(),
+            };
+            if path.is_empty() {
+                return Ok(Value::Picture(std::rc::Rc::new(
+                    crate::interpreter::value::PictureValue {
+                        path: String::new(),
+                        bytes: Vec::new(),
+                    },
+                )));
+            }
+            let full = resolved(ctx.cwd, &path);
+            let bytes = match std::fs::read(&full) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    ctx.failure = Some(53);
+                    return Err(format!("加载图片失败：找不到文件 `{path}`"));
+                }
+            };
+            if !looks_like_picture(&bytes) {
+                ctx.failure = Some(481);
+                return Err(format!("`{path}` 不是有效的图片文件"));
+            }
+            Value::Picture(std::rc::Rc::new(crate::interpreter::value::PictureValue {
+                path,
+                bytes,
+            }))
+        }
+        "getallsettings" => {
+            let app = text(0)?;
+            let section = text(1)?;
+            if app.is_empty() || section.is_empty() {
+                return Err("`GetAllSettings` 需要应用名和节名".into());
+            }
+            match settings_in_section(&app, &section) {
+                entries if entries.is_empty() => Value::Empty,
+                entries => Value::Array(std::rc::Rc::new(std::cell::RefCell::new(settings_array(
+                    &entries,
+                )))),
+            }
+        }
         "str" => match args.first() {
             None => Value::Str(String::new()),
             // `Str(Null)` 在 VB 里传播 `Null`。
             Some(Value::Null) => Value::Null,
             Some(value) => Value::Str(str_value(value)),
         },
-        "cstr" => Value::Str(text(0)?),
+        "cstr" => match args.first() {
+            // VB6 实测：`CStr(Null)` 报 94（「使用 Null 无效」）、`CStr(数组)` 报 13（类型不匹配），
+            // 没有默认属性的对象报 450（`CStr(对象)`）。
+            Some(Value::Null) => {
+                ctx.failure = Some(94);
+                return Err("无效使用 Null".into());
+            }
+            Some(Value::Array(_)) => {
+                ctx.failure = Some(13);
+                return Err("`CStr` 不能用于数组".into());
+            }
+            Some(Value::ComObject(_)) => {
+                ctx.failure = Some(450);
+                return Err("对象没有可用的默认属性，不能转换为字符串".into());
+            }
+            _ => Value::Str(text(0)?),
+        },
         "cint" => Value::Int(convert_integer(
             args.first(),
             i16::MIN.into(),
@@ -557,12 +862,19 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
             i32::MAX.into(),
             ctx,
         )?),
-        "cdbl" => Value::Float(
-            args.first()
+        "cdbl" => {
+            let value = args
+                .first()
                 .map(|v| v.as_float())
                 .transpose()?
-                .unwrap_or(0.0),
-        ),
+                .unwrap_or(0.0);
+            // `CDbl("1e400")` 超出 Double 范围时报错误号 6（本机 VB6 实测）。
+            if !value.is_finite() {
+                ctx.failure = Some(6);
+                return Err("溢出：结果超出 Double 范围".into());
+            }
+            Value::Float(value)
+        }
         "csng" => {
             let value = args
                 .first()
@@ -622,7 +934,10 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
                 Value::Null
             } else {
                 match args.get(index as usize) {
-                    Some(value) => value.clone(),
+                    Some(value) => {
+                        ctx.result_narrow = ctx.arg_types.get(index as usize).copied().flatten();
+                        value.clone()
+                    }
                     None => Value::Null,
                 }
             }
@@ -633,9 +948,10 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
                 return Err("参数个数错误".into());
             }
             let mut chosen = Value::Null;
-            for pair in args.chunks(2) {
+            for (index, pair) in args.chunks(2).enumerate() {
                 if pair[0].to_bool()? {
                     chosen = pair[1].clone();
+                    ctx.result_narrow = ctx.arg_types.get(index * 2 + 1).copied().flatten();
                     break;
                 }
             }
@@ -663,20 +979,9 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
             }
             _ => Value::Int(number(0)?.abs()),
         },
-        "int" => Value::Int(
-            args.first()
-                .map(|v| v.as_float())
-                .transpose()?
-                .unwrap_or(0.0)
-                .floor() as i64,
-        ),
-        "fix" => Value::Int(
-            args.first()
-                .map(|v| v.as_float())
-                .transpose()?
-                .unwrap_or(0.0)
-                .trunc() as i64,
-        ),
+        // `Int` / `Fix` 返回参数的**同一种类型**（VB6 实测 `VarType(Int(1.5))` 是 5、`Int(1E+20)` 原样给 1E+20）。
+        "int" => int_or_fix(args.first(), true)?,
+        "fix" => int_or_fix(args.first(), false)?,
         "sgn" => {
             let value = args
                 .first()
@@ -691,27 +996,44 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
                 0
             })
         }
-        "sqr" => Value::Float(
-            args.first()
+        // `Sqr` 负数、`Log` 非正数都报错误号 5，`Exp` 溢出报错误号 6（本机 VB6 实测）。
+        "sqr" => {
+            let value = args
+                .first()
+                .map(|v| v.as_float())
+                .transpose()?
+                .unwrap_or(0.0);
+            if value < 0.0 {
+                ctx.failure = Some(5);
+                return Err("`Sqr` 的参数不能是负数".into());
+            }
+            Value::Float(value.sqrt())
+        }
+        "exp" => {
+            let value = args
+                .first()
                 .map(|v| v.as_float())
                 .transpose()?
                 .unwrap_or(0.0)
-                .sqrt(),
-        ),
-        "exp" => Value::Float(
-            args.first()
+                .exp();
+            if !value.is_finite() {
+                ctx.failure = Some(6);
+                return Err("`Exp` 的结果超出范围".into());
+            }
+            Value::Float(value)
+        }
+        "log" => {
+            let value = args
+                .first()
                 .map(|v| v.as_float())
                 .transpose()?
-                .unwrap_or(0.0)
-                .exp(),
-        ),
-        "log" => Value::Float(
-            args.first()
-                .map(|v| v.as_float())
-                .transpose()?
-                .unwrap_or(0.0)
-                .ln(),
-        ),
+                .unwrap_or(0.0);
+            if value <= 0.0 {
+                ctx.failure = Some(5);
+                return Err("`Log` 的参数必须大于 0".into());
+            }
+            Value::Float(value.ln())
+        }
         "round" => {
             let value = args
                 .first()
@@ -735,12 +1057,34 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
             *ctx.rng = state;
             Value::Float((state % 1_000_003) as f64 / 1_000_003.0)
         }
-        "hex" => Value::Str(format!("{:X}", number(0)? as u32)),
-        "oct" => Value::Str(format!("{:o}", number(0)? as u32)),
-        "space" => Value::Str(limited_repeat(number(0)?, ' ', ctx)?),
-        "string" => {
+        "hex" => Value::Str(radix_text(number(0)?, ctx.arg_type, 16)),
+        "oct" => Value::Str(radix_text(number(0)?, ctx.arg_type, 8)),
+        "space" => {
+            strict(0)?;
             let count = number(0)?;
-            let ch = text(1)?.chars().next().unwrap_or(' ');
+            if count < 0 {
+                ctx.failure = Some(5);
+                return Err("`Space` 的参数不能是负数".into());
+            }
+            Value::Str(limited_repeat(count, ' ', ctx)?)
+        }
+        "string" => {
+            strict(0)?;
+            // 第二个形参是 `Variant`：`String(3, Null)` 返回 `Null`（VB6 实测）。
+            if let Some(null) = propagated(1) {
+                return Ok(null);
+            }
+            let count = number(0)?;
+            if count < 0 {
+                ctx.failure = Some(5);
+                return Err("`String` 的参数不能是负数".into());
+            }
+            // `String(3, 65)` 是 `"AAA"`：第二个参数是数值时按字符代码处理（VB6 实测）。
+            let ch = match args.get(1) {
+                Some(Value::Str(text)) => text.chars().next().unwrap_or(' '),
+                Some(value) => char::from_u32((value.as_int()? as u32) & 0xFF).unwrap_or(' '),
+                None => ' ',
+            };
             Value::Str(limited_repeat(count, ch, ctx)?)
         }
         "timer" => {
@@ -769,11 +1113,10 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
                 .map(|v| v.to_bool())
                 .transpose()?
                 .unwrap_or(false);
-            if condition {
-                args.get(1).cloned().unwrap_or(Value::Empty)
-            } else {
-                args.get(2).cloned().unwrap_or(Value::Empty)
-            }
+            // 结果就是其中一个实参，类型跟着它走（VB6 实测 `IIf(True, i, s)` 是 2、`IIf(False, i, s)` 是 4）。
+            let index = if condition { 1 } else { 2 };
+            ctx.result_narrow = ctx.arg_types.get(index).copied().flatten();
+            args.get(index).cloned().unwrap_or(Value::Empty)
         }
         "format" => {
             let value = args.first().cloned().unwrap_or(Value::Empty);
@@ -781,6 +1124,7 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
             Value::Str(format_value(&value, &spec)?)
         }
         "split" => {
+            strict(0)?;
             let source = text(0)?;
             let delimiter = args
                 .get(1)
@@ -793,6 +1137,11 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
             Value::array(split_parts(&source, &delimiter, limit))
         }
         "join" => {
+            // `Join(Null, ",")` 在 VB6 里报 13（类型不匹配：`Null` 不是数组），不是 94。
+            if matches!(args.first(), Some(Value::Null)) {
+                ctx.failure = Some(13);
+                return Err("`Join` 需要一个数组".into());
+            }
             let array = args
                 .first()
                 .ok_or_else(|| "`join` 缺少第 1 个参数".to_string())?
@@ -816,7 +1165,17 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
             };
             Value::Str(text)
         }
-        "array" => Value::array(args),
+        "array" => {
+            if ctx.arg_types.is_empty() {
+                Value::array(args)
+            } else {
+                let items = args
+                    .into_iter()
+                    .zip(ctx.arg_types.iter().copied())
+                    .collect();
+                Value::array_with_types(items)
+            }
+        }
         "isarray" => Value::Bool(args.first().is_some_and(Value::is_array)),
         "isnumeric" => Value::Bool(args.first().is_some_and(Value::is_numeric_like)),
         "typename" => Value::Str(args.first().map(Value::type_name).unwrap_or_default()),
@@ -829,10 +1188,12 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
             Value::Int(pointer)
         }
         "lbound" | "ubound" => {
+            // 本机 VB6 实测：参数不是数组（含空 `Variant`）时报错误号 13。
             let array = args
                 .first()
                 .ok_or_else(|| format!("`{name}` 缺少第 1 个参数"))?
-                .as_array()?;
+                .as_array()
+                .inspect_err(|_| ctx.failure = Some(13))?;
             let dimension = match args.get(1) {
                 Some(value) => value.as_int()?.max(1) as usize,
                 None => 1,
@@ -854,7 +1215,10 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
         "now" => Value::Date(now_serial()),
         "date" => Value::Date(now_serial().floor()),
         "time" => Value::Date(now_serial().fract()),
-        "dateserial" => Value::Date(serial_from_ymd(number(0)?, number(1)?, number(2)?)?),
+        "dateserial" => {
+            let year = two_digit_year(number(0)?);
+            Value::Date(serial_from_normalized(year, number(1)?, number(2)?))
+        }
         "timeserial" => {
             let seconds = number(0)? * 3600 + number(1)? * 60 + number(2)?;
             Value::Date(seconds as f64 / 86_400.0)
@@ -873,6 +1237,13 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
             let first = args.get(1).map(Value::as_float).transpose()?.unwrap_or(0.0);
             let second = args.get(2).map(Value::as_float).transpose()?.unwrap_or(0.0);
             Value::Int(date_diff(&interval, first, second)?)
+        }
+        "datepart" => {
+            let interval = text(0)?.to_ascii_lowercase();
+            let serial = args.get(1).map(Value::as_float).transpose()?.unwrap_or(0.0);
+            let first_day = args.get(2).map(Value::as_int).transpose()?.unwrap_or(1);
+            let first_week = args.get(3).map(Value::as_int).transpose()?.unwrap_or(1);
+            Value::Int(date_part(&interval, serial, first_day, first_week)?)
         }
         "year" | "month" | "day" | "hour" | "minute" | "second" => {
             let serial = args
@@ -963,21 +1334,30 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
         "isobject" => Value::Bool(args.first().is_some_and(Value::is_object)),
         "isdate" => Value::Bool(args.first().is_some_and(is_date)),
         // ---------- 字符串补充 ----------
-        "strreverse" => Value::Str(text(0)?.chars().rev().collect()),
+        "strreverse" => {
+            strict(0)?;
+            Value::Str(text(0)?.chars().rev().collect())
+        }
         "strcomp" => str_comp_value(&args, ctx.compare_text)?,
         "filter" => filter_value(&args, ctx.compare_text)?,
-        "ascw" => Value::Int(
-            text(0)?
-                .chars()
-                .next()
-                .map(|ch| i64::from(ch as u32 as u16 as i16))
-                .unwrap_or(0),
-        ),
-        "chrw" => Value::Str(
-            char::from_u32((number(0)? as u32) & 0xFFFF)
-                .unwrap_or('\u{FFFD}')
-                .to_string(),
-        ),
+        "ascw" => {
+            strict(0)?;
+            match text(0)?.chars().next() {
+                Some(ch) => Value::Int(i64::from(ch as u32 as u16 as i16)),
+                None => {
+                    ctx.failure = Some(5);
+                    return Err("`AscW` 的参数不能是空字符串".into());
+                }
+            }
+        }
+        "chrw" => {
+            strict(0)?;
+            Value::Str(
+                char::from_u32((number(0)? as u32) & 0xFFFF)
+                    .unwrap_or('\u{FFFD}')
+                    .to_string(),
+            )
+        }
         // ---------- 日期补充 ----------
         "weekday" => {
             let serial = args
@@ -995,17 +1375,18 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
                 .map(Value::to_bool)
                 .transpose()?
                 .unwrap_or(false);
-            let first_day = args.get(2).map(Value::as_int).transpose()?.unwrap_or(1);
+            // `WeekdayName` 的 `firstdayofweek` 默认取系统设置：本机 VB6（中文区域）是星期一，
+            // 所以 `WeekdayName(1)` 是「星期一」而不是「星期日」。
+            let first_day = args.get(2).map(Value::as_int).transpose()?.unwrap_or(0);
             if !(1..=7).contains(&weekday) {
                 return Err(format!("`WeekdayName` 的星期 {weekday} 超出 1..7"));
             }
-            let first = if first_day == 0 { 1 } else { first_day };
+            let first = if first_day == 0 { 2 } else { first_day };
             let index = ((first - 1) + (weekday - 1)).rem_euclid(7) as usize;
-            let name = WEEKDAY_NAMES[index];
             Value::Str(if abbreviate {
-                name[..3].to_string()
+                WEEKDAY_ABBREVIATIONS[index].to_string()
             } else {
-                name.to_string()
+                WEEKDAY_NAMES[index].to_string()
             })
         }
         "monthname" => {
@@ -1018,11 +1399,10 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
             if !(1..=12).contains(&month) {
                 return Err(format!("`MonthName` 的月份 {month} 超出 1..12"));
             }
-            let name = MONTH_NAMES[(month - 1) as usize];
             Value::Str(if abbreviate {
-                name[..3].to_string()
+                format!("{month}月")
             } else {
-                name.to_string()
+                MONTH_NAMES[(month - 1) as usize].to_string()
             })
         }
         "datevalue" => {
@@ -1082,23 +1462,59 @@ fn limited_repeat(count: i64, fill: char, ctx: &mut Ctx) -> Result<String, Strin
 /// `Str(number)`：正数带一个前导空格（VB 的写法），布尔值照常给 `True` / `False`。
 fn str_value(value: &Value) -> String {
     match value {
-        Value::Int(_) | Value::Float(_) | Value::Currency(_) => {
-            let text = value.to_display();
-            // VB 的 `Str` 和 `CStr` 有一处差别：|x| < 1 时不写整数部分的 0（`Str(0.5)` 是 `" .5"`）。
-            let text = if matches!(value, Value::Float(_) | Value::Currency(_)) {
-                strip_leading_zero(&text)
-            } else {
-                text
-            };
-            if text.starts_with('-') {
-                text
-            } else {
-                format!(" {text}")
-            }
-        }
+        Value::Int(_) => str_number_text(value.to_display(), false),
+        Value::Float(_) | Value::Currency(_) => str_number_text(value.to_display(), true),
         // `Empty` 按数值 0 处理，与 VB 的 `Str(Empty)` 一致。
         Value::Empty => " 0".to_string(),
         other => other.to_display(),
+    }
+}
+
+/// `Int` / `Fix`：返回参数的同一种类型（`Int(1.5)` 仍是 Double、`Int(5)` 仍是 Integer）。
+///
+/// VB6 实测：`VarType(Int(1.5))` 是 5（Double）、`Int(1E+20)` 原样给 1E+20，
+/// 所以不能一律转成整数（那样超大值会被截断成 `i64::MAX`）。
+fn int_or_fix(value: Option<&Value>, floor: bool) -> Result<Value, String> {
+    let Some(value) = value else {
+        return Ok(Value::Float(0.0));
+    };
+    let apply = |number: f64| {
+        if floor {
+            number.floor()
+        } else {
+            number.trunc()
+        }
+    };
+    Ok(match value {
+        Value::Int(number) => Value::Int(*number),
+        Value::Float(number) => Value::Float(apply(*number)),
+        Value::Date(number) => Value::Date(apply(*number)),
+        Value::Currency(scaled) => {
+            Value::Currency(apply(*scaled as f64 / 10_000.0) as i64 * 10_000)
+        }
+        Value::Bool(_) | Value::Str(_) | Value::Empty => Value::Float(apply(value.as_float()?)),
+        other => {
+            return Err(format!(
+                "`Int` / `Fix` 不支持 {} 类型的参数",
+                other.type_name()
+            ));
+        }
+    })
+}
+
+/// `Str` 的数字写法：`|x| < 1` 时不写整数部分的 0（`Str(0.5)` 是 `" .5"`），正数前面加空格。
+///
+/// `strip_zero` 只对浮点/货币打开（`Str(0)` 仍是 `" 0"`）。
+pub(crate) fn str_number_text(text: String, strip_zero: bool) -> String {
+    let text = if strip_zero {
+        strip_leading_zero(&text)
+    } else {
+        text
+    };
+    if text.starts_with('-') {
+        text
+    } else {
+        format!(" {text}")
     }
 }
 
@@ -1123,6 +1539,11 @@ fn convert_integer(
     let Some(value) = value else {
         return Ok(0);
     };
+    // `CInt(Null)` / `CLng(Null)` 报 94（「无效使用 Null」），不是类型不匹配（本机 VB6 实测）。
+    if matches!(value, Value::Null) {
+        ctx.failure = Some(94);
+        return Err("无效使用 Null".into());
+    }
     let number = value.as_float().map_err(|message| {
         ctx.failure = Some(13);
         format!("类型不匹配：{message}")
@@ -1139,29 +1560,417 @@ fn convert_integer(
     Ok(rounded as i64)
 }
 
-const WEEKDAY_NAMES: [&str; 7] = [
-    "Sunday",
-    "Monday",
-    "Tuesday",
-    "Wednesday",
-    "Thursday",
-    "Friday",
-    "Saturday",
+/// `QBColor` 的 16 个经典颜色（Long，`r + g*256 + b*65536`；本机 VB6 实测 0/1/7/15）。
+const QB_COLORS: [i64; 16] = [
+    0x000000, 0x800000, 0x008000, 0x808000, 0x000080, 0x800080, 0x008080, 0xC0C0C0, 0x808080,
+    0xFF0000, 0x00FF00, 0xFFFF00, 0x0000FF, 0xFF00FF, 0x00FFFF, 0xFFFFFF,
 ];
 
+/// VB 标准常量（VB6 里来自 VBA 库）：名字一律小写，比较不分大小写。
+///
+/// 只收脚本里常用的那些：布尔/默认值、控制字符、比较方式、日期格式、一周第一天与首周规则、
+/// `MsgBox` 的标志与返回值、`VarType` 的类型码。
+const VB_CONSTANTS: &[(&str, i64)] = &[
+    ("vbtrue", -1),
+    ("vbfalse", 0),
+    ("vbusdefault", -2),
+    ("vbobjecterror", -2147221504),
+    ("vbbinarycompare", 0),
+    ("vbtextcompare", 1),
+    ("vbdatabasecompare", 2),
+    ("vbgeneraldate", 0),
+    ("vblongdate", 1),
+    ("vbshortdate", 2),
+    ("vblongtime", 3),
+    ("vbshorttime", 4),
+    ("vbusesystem", 0),
+    ("vbsunday", 1),
+    ("vbmonday", 2),
+    ("vbtuesday", 3),
+    ("vbwednesday", 4),
+    ("vbthursday", 5),
+    ("vbfriday", 6),
+    ("vbsaturday", 7),
+    ("vbsystemdayofweek", 0),
+    ("vbfirstjan1", 1),
+    ("vbfirstfourdays", 2),
+    ("vbfirstfullweek", 3),
+    ("vbokonly", 0),
+    ("vbokcancel", 1),
+    ("vbabortretryignore", 2),
+    ("vbyesnocancel", 3),
+    ("vbyesno", 4),
+    ("vbretrycancel", 5),
+    ("vbcritical", 16),
+    ("vbquestion", 32),
+    ("vbexclamation", 48),
+    ("vbinformation", 64),
+    ("vbdefaultbutton1", 0),
+    ("vbdefaultbutton2", 256),
+    ("vbdefaultbutton3", 512),
+    ("vbdefaultbutton4", 768),
+    ("vbapplicationmodal", 0),
+    ("vbsystemmodal", 4096),
+    ("vbok", 1),
+    ("vbcancel", 2),
+    ("vbabort", 3),
+    ("vbretry", 4),
+    ("vbignore", 5),
+    ("vbyes", 6),
+    ("vbno", 7),
+    ("vbempty", 0),
+    ("vbnull", 1),
+    ("vbinteger", 2),
+    ("vblong", 3),
+    ("vbsingle", 4),
+    ("vbdouble", 5),
+    ("vbcurrency", 6),
+    ("vbdate", 7),
+    ("vbstring", 8),
+    ("vbobject", 9),
+    ("vberror", 10),
+    ("vbboolean", 11),
+    ("vbvariant", 12),
+    ("vbdataobject", 13),
+    ("vbdecimal", 14),
+    ("vbbyte", 17),
+    ("vblonglong", 20),
+    ("vbuserdefinedtype", 36),
+    ("vbarray", 8192),
+    ("vbmethod", 1),
+    ("vbget", 2),
+    ("vblet", 4),
+    ("vbset", 8),
+];
+
+/// 字符串型 VB 常量（控制字符）。
+const VB_STRING_CONSTANTS: &[(&str, &str)] = &[
+    ("vbcr", "\r"),
+    ("vblf", "\n"),
+    ("vbcrlf", "\r\n"),
+    ("vbtab", "\t"),
+    ("vbnullchar", "\0"),
+    ("vbnullstring", ""),
+    ("vbback", "\u{8}"),
+    ("vbformfeed", "\u{c}"),
+    ("vbverticaltab", "\u{b}"),
+];
+
+/// 查一个 VB 标准常量（名字不分大小写），没查到时返回 `None`。
+pub fn vb_constant(name: &str) -> Option<Value> {
+    let key = name.to_ascii_lowercase();
+    if let Some((_, number)) = VB_CONSTANTS.iter().find(|(name, _)| *name == key) {
+        return Some(Value::Int(*number));
+    }
+    VB_STRING_CONSTANTS
+        .iter()
+        .find(|(name, _)| *name == key)
+        .map(|(_, text)| Value::Str((*text).to_string()))
+}
+
+/// VB 标准常量的类型（本机 VB6 实测：`VarType(vbTrue)` 是 3（Long）、`VarType(vbCrLf)` 是 8）。
+pub fn vb_constant_type(name: &str) -> Option<VbType> {
+    let key = name.to_ascii_lowercase();
+    if VB_STRING_CONSTANTS.iter().any(|(name, _)| *name == key) {
+        return Some(VbType::Str);
+    }
+    VB_CONSTANTS
+        .iter()
+        .any(|(name, _)| *name == key)
+        .then_some(VbType::Long)
+}
+
+/// `FormatNumber` / `FormatCurrency` / `FormatPercent`：写法取本机 VB6（中文区域）实测。
+///
+/// 参数：`(表达式, [小数位=2], [显示前导零=vbTrue], [负数加括号=vbFalse], [千位分隔=vbTrue])`，
+/// 可选参数传 `vbUseDefault`(-2) 等同于省略。
+fn format_amount(name: &str, args: &[Value], ctx: &mut Ctx) -> Result<String, String> {
+    let number = args
+        .first()
+        .map(Value::as_float)
+        .transpose()?
+        .unwrap_or(0.0);
+    let flag = |position: usize, default: bool| -> Result<bool, String> {
+        match args.get(position) {
+            Some(value) => {
+                let flag = value.as_int()?;
+                Ok(if flag == -2 { default } else { flag != 0 })
+            }
+            None => Ok(default),
+        }
+    };
+    let digits = match args.get(1) {
+        Some(value) => value.as_int()?,
+        None => 2,
+    };
+    let digits = if digits == -2 { 2 } else { digits };
+    if digits < 0 {
+        ctx.failure = Some(5);
+        return Err("小数位数不能是负数".into());
+    }
+    let leading = flag(2, true)?;
+    let parens = flag(3, false)?;
+    let group = flag(4, true)?;
+    let digits = digits.min(15) as usize;
+    let mut spec = String::new();
+    if name == "formatcurrency" {
+        spec.push('￥');
+    }
+    spec.push_str(match (group, leading) {
+        (true, true) => "#,##0",
+        (true, false) => "#,##",
+        (false, true) => "0",
+        (false, false) => "#",
+    });
+    if digits > 0 {
+        spec.push('.');
+        spec.push_str(&"0".repeat(digits));
+    }
+    if name == "formatpercent" {
+        spec.push('%');
+    }
+    // 负数加括号：`FormatNumber(-1234.5, 2, , vbTrue)` 是 `(1,234.50)`。
+    let spec = if parens {
+        format!("{spec};({spec})")
+    } else {
+        spec
+    };
+    format_number(number, &spec)
+}
+
+/// `FormatDateTime(date, [命名格式])`：0 = 一般、1 = 长日期、2 = 短日期、3 = 长时间、4 = 短时间。
+fn format_date_named(serial: f64, named: i64, ctx: &mut Ctx) -> Result<String, String> {
+    match named {
+        0 => Ok(format_date_display(serial)),
+        1 => Ok(format_date(serial, "yyyy年m月d日")),
+        2 => Ok(format_date(serial, "yyyy/m/d")),
+        3 => {
+            let (_, _, _, hour, minute, second) = parts_from_serial(serial);
+            Ok(format!("{hour:02}:{minute:02}:{second:02}"))
+        }
+        4 => {
+            let (_, _, _, hour, minute, _) = parts_from_serial(serial);
+            Ok(format!("{hour:02}:{minute:02}"))
+        }
+        other => {
+            ctx.failure = Some(5);
+            Err(format!("`FormatDateTime` 的命名格式 {other} 超出 0..4"))
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 脚本设置（SaveSetting 等）
+
+/// `SaveSetting` / `GetSetting` / `DeleteSetting` 的存储文件。
+///
+/// VB6 写注册表 `HKCU\Software\VB and VBA Program Settings`；QIDE 不碰注册表，
+/// 写 `%APPDATA%\gpui-first\vb-settings.txt`（每行 `应用 节 键 值`，用制表符分隔、反斜杠转义）。
+fn settings_path() -> std::path::PathBuf {
+    let base = std::env::var_os("APPDATA")
+        .or_else(|| std::env::var_os("LOCALAPPDATA"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("gpui-first").join("vb-settings.txt")
+}
+
+/// 转义/还原设置文件里的字段（`\`、制表符、换行）。
+fn escape_setting(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\n', "\\n")
+        .replace('\r', "")
+}
+
+fn unescape_setting(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => output.push('\t'),
+            Some('n') => output.push('\n'),
+            Some(other) => output.push(other),
+            None => output.push('\\'),
+        }
+    }
+    output
+}
+
+/// 设置文件是「读整份 → 改 → 写回整份」，多个线程同时写会互相丢数据（脚本线程与单元测试都会碰它），
+/// 所以读改写整段串行化。
+static SETTINGS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 读改写设置文件的互斥体； poisoned 时也照常使用（数据只是文件，不会内存不安全）。
+fn lock_settings() -> std::sync::MutexGuard<'static, ()> {
+    SETTINGS_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+/// 读出全部设置项（读不到文件就是空）。
+fn read_settings() -> Vec<(String, String, String, String)> {
+    let Ok(text) = std::fs::read_to_string(settings_path()) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 3 {
+                return None;
+            }
+            Some((
+                unescape_setting(parts[0]),
+                unescape_setting(parts[1]),
+                unescape_setting(parts[2]),
+                unescape_setting(parts.get(3).copied().unwrap_or("")),
+            ))
+        })
+        .collect()
+}
+
+fn write_settings(entries: &[(String, String, String, String)]) {
+    let text: String = entries
+        .iter()
+        .map(|(app, section, key, value)| {
+            format!(
+                "{}\t{}\t{}\t{}\n",
+                escape_setting(app),
+                escape_setting(section),
+                escape_setting(key),
+                escape_setting(value)
+            )
+        })
+        .collect();
+    let path = settings_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, text);
+}
+
+/// 键名比较不分大小写（与 VB6 的注册表语义一致）。
+fn same_setting(
+    entry: &(String, String, String, String),
+    app: &str,
+    section: &str,
+    key: &str,
+) -> bool {
+    entry.0.eq_ignore_ascii_case(app)
+        && entry.1.eq_ignore_ascii_case(section)
+        && entry.2.eq_ignore_ascii_case(key)
+}
+
+fn get_setting(app: &str, section: &str, key: &str) -> Option<String> {
+    read_settings()
+        .into_iter()
+        .find(|entry| same_setting(entry, app, section, key))
+        .map(|entry| entry.3)
+}
+
+fn save_setting(app: &str, section: &str, key: &str, value: &str) {
+    let _guard = lock_settings();
+    let mut entries = read_settings();
+    match entries
+        .iter_mut()
+        .find(|entry| same_setting(entry, app, section, key))
+    {
+        Some(entry) => entry.3 = value.to_string(),
+        None => entries.push((
+            app.to_string(),
+            section.to_string(),
+            key.to_string(),
+            value.to_string(),
+        )),
+    }
+    write_settings(&entries);
+}
+
+/// `LoadPicture` 支持的文件头：BMP / PNG / JPEG / GIF / ICO / WMF / EMF。
+///
+/// QIDE 不解码图像，只按幻数判断「像不像图片」——VB6 对内容无效的文件报错误号 481。
+fn looks_like_picture(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"BM")
+        || bytes.starts_with(b"\x89PNG")
+        || bytes.starts_with(&[0xFF, 0xD8, 0xFF])
+        || bytes.starts_with(b"GIF8")
+        || bytes.starts_with(&[0x00, 0x00, 0x01, 0x00])
+        || bytes.starts_with(&[0xD7, 0xCD, 0xC6, 0x9A])
+        || bytes.starts_with(&[0x01, 0x00, 0x00, 0x00, 0x6C, 0x00, 0x00, 0x00])
+}
+
+/// `GetAllSettings`：某一节里的全部键值对，保持写入顺序。
+fn settings_in_section(app: &str, section: &str) -> Vec<(String, String)> {
+    read_settings()
+        .into_iter()
+        .filter(|entry| entry.0.eq_ignore_ascii_case(app) && entry.1.eq_ignore_ascii_case(section))
+        .map(|entry| (entry.2, entry.3))
+        .collect()
+}
+
+/// `GetAllSettings` 的返回值：0 基 `(行, 列)` 二维 `String` 数组。
+fn settings_array(entries: &[(String, String)]) -> VbArray {
+    let mut array = VbArray::new(vec![(0, entries.len()), (0, 2)], VbType::Str, true);
+    for (row, (key, value)) in entries.iter().enumerate() {
+        let row = row as i32;
+        let _ = array.set(&[row, 0], Value::Str(key.clone()), None);
+        let _ = array.set(&[row, 1], Value::Str(value.clone()), None);
+    }
+    array
+}
+
+/// `DeleteSetting 应用[, 节[, 键]]`：省略越靠后的参数，删除范围越大。
+fn delete_setting(app: &str, section: Option<&str>, key: Option<&str>) {
+    let _guard = lock_settings();
+    let mut entries = read_settings();
+    entries.retain(|entry| {
+        if !entry.0.eq_ignore_ascii_case(app) {
+            return true;
+        }
+        if let Some(section) = section
+            && !entry.1.eq_ignore_ascii_case(section)
+        {
+            return true;
+        }
+        if let Some(key) = key
+            && !entry.2.eq_ignore_ascii_case(key)
+        {
+            return true;
+        }
+        false
+    });
+    write_settings(&entries);
+}
+
+/// 星期名（索引 0 = 星期日）：本机 VB6（中文区域）实测是中文全称 + `周X` 缩写。
+const WEEKDAY_NAMES: [&str; 7] = [
+    "星期日",
+    "星期一",
+    "星期二",
+    "星期三",
+    "星期四",
+    "星期五",
+    "星期六",
+];
+
+const WEEKDAY_ABBREVIATIONS: [&str; 7] = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+
+/// 月份名（索引 0 = 一月）：全称 `一月`…`十二月`，缩写 `1月`…`12月`。
 const MONTH_NAMES: [&str; 12] = [
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
+    "一月",
+    "二月",
+    "三月",
+    "四月",
+    "五月",
+    "六月",
+    "七月",
+    "八月",
+    "九月",
+    "十月",
+    "十一月",
+    "十二月",
 ];
 
 /// I/O 错误 → VB 错误号：文件不存在 53、路径不存在 76、权限 70、已存在 58，其余 75。
@@ -1429,7 +2238,11 @@ fn weekday_of(serial: f64, first_day: i64) -> i64 {
     ((sunday_based - first).rem_euclid(7)) + 1
 }
 
-/// 识别 `2024-01-31`、`2024/1/31`、`1/31/2024`、`2024年1月31日` 这类日期文本。
+/// 识别 `2024-01-31`、`2024/1/31`、`1/31/2024`、`24-2-29`、`2024年1月31日` 这类日期文本。
+///
+/// 三个数字段依次按「年-月-日」「月-日-年」「日-月-年」尝试，取第一个合法组合
+/// （本机 VB6 实测：`CDate("24-2-29")` 是 2024-02-29、`DateValue("3/4/2024")` 是 2024-03-04、
+/// `DateValue("13/11/2024")` 是 2024-11-13）；年份不超过两位时按 1930/2000 规则展开。
 pub fn parse_date_text(text: &str) -> Option<f64> {
     let cleaned = text.trim().replace(['年', '月'], "-").replace('日', "");
     let parts: Vec<i64> = cleaned
@@ -1440,14 +2253,14 @@ pub fn parse_date_text(text: &str) -> Option<f64> {
     if parts.len() != 3 {
         return None;
     }
-    let (year, month, day) = if parts[0] > 31 {
-        (parts[0], parts[1], parts[2])
-    } else if parts[2] > 31 {
-        (parts[2], parts[0], parts[1])
-    } else {
-        return None;
-    };
-    serial_from_ymd(year, month, day).ok()
+    let candidates = [
+        (two_digit_year(parts[0]), parts[1], parts[2]),
+        (parts[2], parts[0], parts[1]),
+        (parts[2], parts[1], parts[0]),
+    ];
+    candidates
+        .into_iter()
+        .find_map(|(year, month, day)| serial_from_ymd(year, month, day).ok())
 }
 
 pub fn parse_date_value(text: &str) -> Option<f64> {
@@ -1489,7 +2302,7 @@ fn is_date(value: &Value) -> bool {
 /// 取字符串开头的数字部分（`Val` 的语义）。
 ///
 /// 支持前导空白、正负号，以及 VB 的 `&H`（十六进制）、`&O` / `&`（八进制）前缀；
-/// 遇到第一个不能解释的字符就停下（`Val("12abc")` 是 12）。
+/// 遇到第一个不能解释的字符就停下（`Val("12abc")` 是 12、`Val("1.2.3")` 是 1.2）。
 fn leading_number(text: &str) -> Option<f64> {
     let trimmed = text.trim_start();
     let (negative, body) = match trimmed.as_bytes().first() {
@@ -1497,20 +2310,12 @@ fn leading_number(text: &str) -> Option<f64> {
         Some(b'+') => (false, &trimmed[1..]),
         _ => (false, trimmed),
     };
-    if let Some(rest) = body.strip_prefix('&') {
-        let (radix, digits) = match rest.as_bytes().first() {
-            Some(b'h' | b'H') => (16u32, &rest[1..]),
-            Some(b'o' | b'O') => (8, &rest[1..]),
-            _ => (8, rest),
-        };
-        let mut value = 0f64;
-        for ch in digits.chars() {
-            let Some(digit) = ch.to_digit(radix) else {
-                break;
-            };
-            value = value * f64::from(radix) + f64::from(digit);
-        }
+    // 符号后面还可以有空格（VB6 实测 `Val("  -  1")` 是 -1）。
+    let body = body.trim_start();
+    if body.starts_with('&') {
+        // 取补码规则与进制字面量一致（`Val("&HFFFF")` 是 -1、`Val("&HFFFF&")` 是 65535）；
         // `&H` 后面没有合法数字时 VB 也返回 0。
+        let value = parse_radix_text(body).map_or(0.0, |(value, _)| value as f64);
         return Some(if negative { -value } else { value });
     }
     let mut end = 0usize;
@@ -1521,7 +2326,14 @@ fn leading_number(text: &str) -> Option<f64> {
         match ch {
             '0'..='9' => seen_digit = true,
             '.' if !seen_dot && !seen_exponent => seen_dot = true,
-            'e' | 'E' if seen_digit && !seen_exponent => seen_exponent = true,
+            // `Val("1e")`、`Val("1E+")` 都只取前面的 1：指数后面没有数字就不算指数。
+            // `D` 也是 VB 的指数标记（`Val("1D5")` 是 100000）。
+            'e' | 'E' | 'd' | 'D'
+                if seen_digit && !seen_exponent && exponent_follows(&body[index + 1..]) =>
+            {
+                seen_exponent = true;
+            }
+            '+' | '-' if seen_exponent => {}
             _ => break,
         }
         end = index + ch.len_utf8();
@@ -1530,8 +2342,15 @@ fn leading_number(text: &str) -> Option<f64> {
         // `Val("-")`、`Val("abc")` 都是 0。
         return None;
     }
-    let value = parse_number(&body[..end])?;
+    let text = body[..end].replace(['d', 'D'], "e");
+    let value = parse_number(&text)?;
     Some(if negative { -value } else { value })
+}
+
+/// 指数标记后面是否真的有数字（`Val("1e")` 的 `e` 不算指数）。
+fn exponent_follows(rest: &str) -> bool {
+    let rest = rest.strip_prefix(['+', '-']).unwrap_or(rest);
+    rest.as_bytes().first().is_some_and(u8::is_ascii_digit)
 }
 
 // ---------------------------------------------------------------- 日期时间
@@ -1593,6 +2412,23 @@ fn serial_from_ymd(year: i64, month: i64, day: i64) -> Result<f64, String> {
         return Err(format!("日期 {day} 超出 {year}-{month} 的范围 1..{last}"));
     }
     Ok((days_from_civil(year, month, day) - ole_epoch_days()) as f64)
+}
+
+/// `DateSerial` 的两位数年份规则：0–29 → 2000–2029，30–99 → 1930–1999（VB6 实测）。
+fn two_digit_year(year: i64) -> i64 {
+    match year {
+        0..=29 => year + 2000,
+        30..=99 => year + 1900,
+        _ => year,
+    }
+}
+
+/// `DateSerial` 允许月、日溢出（VB6 实测 `DateSerial(2024, 2, 30)` 是 2024-03-01）。
+fn serial_from_normalized(year: i64, month: i64, day: i64) -> f64 {
+    let index = year * 12 + (month - 1);
+    let normal_year = index.div_euclid(12);
+    let normal_month = index.rem_euclid(12) + 1;
+    (days_from_civil(normal_year, normal_month, 1) + day - 1 - ole_epoch_days()) as f64
 }
 
 fn serial_from_parts(
@@ -1662,8 +2498,9 @@ fn date_add(interval: &str, amount: i64, serial: f64) -> Result<f64, String> {
         "yyyy" => add_months(serial, amount * 12),
         "q" => add_months(serial, amount * 3),
         "m" => add_months(serial, amount),
+        // `y`（一年中的第几天）与 `w`（星期几）在 VB6 里都按「天」加减，`ww` 才是按周。
+        "y" | "d" | "w" => serial + amount as f64,
         "ww" => serial + amount as f64 * 7.0,
-        "d" => serial + amount as f64,
         "h" => serial + amount as f64 / 24.0,
         "n" => serial + amount as f64 / 1440.0,
         "s" => serial + amount as f64 / 86_400.0,
@@ -1685,9 +2522,12 @@ fn date_diff(interval: &str, first: f64, second: f64) -> Result<i64, String> {
     let (year2, month2, _, _, _, _) = parts_from_serial(second);
     Ok(match interval {
         "yyyy" => year2 - year1,
+        // 季度差按「绝对季度序号」相减：`DateDiff("q", #2024-03-31#, #2024-04-01#)` 是 1。
+        "q" => (year2 * 4 + (month2 - 1) / 3) - (year1 * 4 + (month1 - 1) / 3),
         "m" => (year2 - year1) * 12 + (month2 - month1),
-        "d" => (second.floor() - first.floor()) as i64,
-        "ww" => (second.floor() - first.floor()) as i64 / 7,
+        // `y`（一年中的第几天）按天算；`w`（星期几）在 `DateDiff` 里与 `ww` 一样按周算（VB6 实测）。
+        "y" | "d" => (second.floor() - first.floor()) as i64,
+        "w" | "ww" => (second.floor() - first.floor()) as i64 / 7,
         "h" => ((second - first) * 24.0) as i64,
         "n" => ((second - first) * 1440.0) as i64,
         "s" => ((second - first) * 86_400.0) as i64,
@@ -1695,17 +2535,129 @@ fn date_diff(interval: &str, first: f64, second: f64) -> Result<i64, String> {
     })
 }
 
-fn is_date_format(spec: &str) -> bool {
-    spec.chars()
-        .any(|ch| matches!(ch.to_ascii_lowercase(), 'y' | 'd' | 'h' | 'n' | 's'))
+/// `DatePart` 取日期的一部分；`first_day`/`first_week` 对应 VB 的
+/// `vbDayOfWeek`（1 = 星期日）与 `vbFirstWeekOfYear`（1 = 含 1 月 1 日的那一周）。
+fn date_part(interval: &str, serial: f64, first_day: i64, first_week: i64) -> Result<i64, String> {
+    let (year, month, day, hour, minute, second) = parts_from_serial(serial);
+    Ok(match interval {
+        "yyyy" => year,
+        "q" => (month - 1) / 3 + 1,
+        "m" => month,
+        "y" => serial.floor() as i64 - serial_from_ymd(year, 1, 1)? as i64 + 1,
+        "d" => day,
+        "w" => weekday_of(serial, first_day),
+        "ww" => week_of_year(serial, first_day, first_week),
+        "h" => hour,
+        "n" => minute,
+        "s" => second,
+        other => return Err(format!("`DatePart` 不支持间隔 `{other}`")),
+    })
 }
 
-/// `Format(date, "yyyy-mm-dd hh:nn:ss")` 的日期格式子集。
+/// 某一年第 1 周第一天的日期（自 1970-01-01 起的天数）。
+///
+/// `first_week`：0/1 = 含 1 月 1 日的那一周，2 = 新年里至少有 4 天的那一周，
+/// 3 = 新年里完整的第一周。
+fn week_one_start(year: i64, first_day: i64, first_week: i64) -> i64 {
+    let jan1 = days_from_civil(year, 1, 1);
+    // 1970-01-01 是星期四：`(days + 4) % 7 + 1` 给出「星期日是 1」的星期号。
+    let weekday = (jan1 + 4).rem_euclid(7) + 1;
+    let first = if first_day == 0 { 1 } else { first_day };
+    let offset = (weekday - first).rem_euclid(7);
+    let offset = match first_week {
+        2 if 7 - offset < 4 => offset - 7,
+        3 if offset > 0 => offset - 7,
+        _ => offset,
+    };
+    jan1 - offset
+}
+
+/// 一年有几周（相邻两年第 1 周起点相差几周）。
+fn weeks_in_year(year: i64, first_day: i64, first_week: i64) -> i64 {
+    (week_one_start(year + 1, first_day, first_week) - week_one_start(year, first_day, first_week))
+        / 7
+}
+
+/// 一年中的第几周。跨年时先退到上一年，`vbFirstFourDays` 还要把超出的周并到下一年的第 1 周
+/// （本机 VB6 实测：`ww` 的年末表现按 `DatePart` 的参数变化，见 `docs/脚本语言.md`）。
+fn week_of_year(serial: f64, first_day: i64, first_week: i64) -> i64 {
+    let days = serial.floor() as i64 + ole_epoch_days();
+    let (mut year, _, _, _, _, _) = parts_from_serial(serial);
+    let mut week = (days - week_one_start(year, first_day, first_week)).div_euclid(7) + 1;
+    if week < 1 {
+        year -= 1;
+        week = (days - week_one_start(year, first_day, first_week)).div_euclid(7) + 1;
+    }
+    if first_week == 2 {
+        let total = weeks_in_year(year, first_day, first_week);
+        if week > total {
+            week -= total;
+        }
+    }
+    week
+}
+
+fn is_date_format(spec: &str) -> bool {
+    spec.chars().any(|ch| {
+        matches!(
+            ch.to_ascii_lowercase(),
+            'y' | 'm' | 'd' | 'h' | 'n' | 's' | 'w' | 'q' | 'a'
+        )
+    })
+}
+
+/// 英文字母的星期/月份名（`Format` 的 `ddd`/`dddd`/`mmm`/`mmmm` 用英文，见本机 VB6 实测）。
+const ENGLISH_WEEKDAY_NAMES: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
+
+const ENGLISH_WEEKDAY_ABBREVIATIONS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+const ENGLISH_MONTH_NAMES: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+const ENGLISH_MONTH_ABBREVIATIONS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// `Format(date, "yyyy-mm-dd hh:nn:ss")` 的日期格式子集，占位符规则逐条来自本机 VB6 实测。
+///
+/// - `y` = 一年中的第几天、`yy` = 两位年、`yyyy` = 四位年；
+/// - `m`/`mm` = 月，但**紧跟在 `h`/`hh` 之后时是分钟**；`mmm`/`mmmm` = 英文月份与全称；
+/// - `d`/`dd` = 日，`ddd`/`dddd` = 英文星期缩写/全称，`aaa`/`aaaa` = 中文星期缩写/全称；
+/// - `h`/`hh` = 小时（出现 `AM/PM` 时按 12 小时制）、`n`/`nn` = 分钟、`s`/`ss` = 秒；
+/// - `w` = 星期号（星期日为 1）、`ww` = 一年中的第几周、`q` = 季度；
+/// - `AM/PM`、`am/pm`、`A/P`、`a/p` 输出对应大小写的英文标记；
+/// - `"…"` 与 `\x` 是字面量转义。
 fn format_date(serial: f64, spec: &str) -> String {
     let (year, month, day, hour, minute, second) = parts_from_serial(serial);
+    let weekday = weekday_of(serial, 1) as usize;
+    let day_of_year = serial.floor() as i64 + ole_epoch_days() - days_from_civil(year, 1, 1) + 1;
+    let lowered = spec.to_ascii_lowercase();
+    let twelve_hour = lowered.contains("am/pm") || lowered.contains("a/p");
     let chars: Vec<char> = spec.chars().collect();
     let mut output = String::new();
     let mut index = 0usize;
+    // 上一个占位符：`m` 紧跟 `h` 才算分钟。
+    let mut previous = '\0';
     while index < chars.len() {
         let ch = chars[index];
         if ch == '"' {
@@ -1724,64 +2676,94 @@ fn format_date(serial: f64, spec: &str) -> String {
             index += 2;
             continue;
         }
+        let rest: String = chars[index..]
+            .iter()
+            .collect::<String>()
+            .to_ascii_lowercase();
+        // `AM/PM` / `A/P`：输出哪种大小写跟着占位符写法走（`hh am/pm` 给 `pm`）。
+        let marker = if rest.starts_with("am/pm") {
+            Some((5usize, if hour < 12 { "AM" } else { "PM" }))
+        } else if rest.starts_with("a/p") {
+            Some((3usize, if hour < 12 { "A" } else { "P" }))
+        } else {
+            None
+        };
+        if let Some((length, text)) = marker {
+            if ch.is_lowercase() {
+                output.push_str(&text.to_lowercase());
+            } else {
+                output.push_str(text);
+            }
+            index += length;
+            previous = 'a';
+            continue;
+        }
         let lower = ch.to_ascii_lowercase();
         let run = chars[index..]
             .iter()
             .take_while(|next| next.to_ascii_lowercase() == lower)
             .count();
-        let value = match lower {
-            'y' => Some(if run >= 4 {
-                format!("{year:04}")
-            } else {
-                format!("{:02}", year.rem_euclid(100))
-            }),
-            'm' => Some(if run >= 2 {
-                format!("{month:02}")
-            } else {
-                format!("{month}")
-            }),
-            'd' => Some(if run >= 2 {
-                format!("{day:02}")
-            } else {
-                format!("{day}")
-            }),
-            'h' => Some(if run >= 2 {
-                format!("{hour:02}")
-            } else {
-                format!("{hour}")
-            }),
-            'n' => Some(if run >= 2 {
-                format!("{minute:02}")
-            } else {
-                format!("{minute}")
-            }),
-            's' => Some(if run >= 2 {
-                format!("{second:02}")
-            } else {
-                format!("{second}")
-            }),
-            _ => None,
-        };
-        match value {
-            Some(text) => {
-                output.push_str(&text);
-                index += run;
+        let hour12 = if hour % 12 == 0 { 12 } else { hour % 12 };
+        let text = match lower {
+            'y' if run == 1 => day_of_year.to_string(),
+            'y' if run == 2 => format!("{:02}", year.rem_euclid(100)),
+            'y' => format!("{year:04}"),
+            'm' if previous == 'h' => {
+                if run >= 2 {
+                    format!("{minute:02}")
+                } else {
+                    minute.to_string()
+                }
             }
-            None => {
+            'm' if run >= 4 => ENGLISH_MONTH_NAMES[(month - 1) as usize].to_string(),
+            'm' if run == 3 => ENGLISH_MONTH_ABBREVIATIONS[(month - 1) as usize].to_string(),
+            'm' if run == 2 => format!("{month:02}"),
+            'm' => month.to_string(),
+            'd' if run >= 4 => ENGLISH_WEEKDAY_NAMES[weekday - 1].to_string(),
+            'd' if run == 3 => ENGLISH_WEEKDAY_ABBREVIATIONS[weekday - 1].to_string(),
+            'd' if run == 2 => format!("{day:02}"),
+            'd' => day.to_string(),
+            'a' if run >= 4 => WEEKDAY_NAMES[weekday - 1].to_string(),
+            'a' if run == 3 => WEEKDAY_ABBREVIATIONS[weekday - 1].to_string(),
+            'h' => {
+                let value = if twelve_hour { hour12 } else { hour };
+                if run >= 2 {
+                    format!("{value:02}")
+                } else {
+                    value.to_string()
+                }
+            }
+            'n' if run >= 2 => format!("{minute:02}"),
+            'n' => minute.to_string(),
+            's' if run >= 2 => format!("{second:02}"),
+            's' => second.to_string(),
+            'w' if run >= 2 => week_of_year(serial, 1, 1).to_string(),
+            'w' => weekday.to_string(),
+            'q' => ((month - 1) / 3 + 1).to_string(),
+            _ => {
                 output.push(ch);
                 index += 1;
+                continue;
             }
-        }
+        };
+        output.push_str(&text);
+        index += run;
+        previous = lower;
     }
     output
 }
 
+/// `Date` 值转文本（VB6 的 `General Date`，中文区域实测）：
+/// 有日期有时间的写 `2024/2/29 13:05:06`，只有日期的写 `2024/2/29`，
+/// 序列 0（1899-12-30）只写时间 `0:00:00`。月、日、时不补零，分隔符是 `/`。
 pub fn format_date_display(serial: f64) -> String {
     let (_, _, _, hour, minute, second) = parts_from_serial(serial);
-    if hour == 0 && minute == 0 && second == 0 {
-        format_date(serial, "yyyy-mm-dd")
-    } else {
-        format_date(serial, "yyyy-mm-dd hh:nn:ss")
+    let has_date = serial.floor() != 0.0;
+    let has_time = hour != 0 || minute != 0 || second != 0;
+    match (has_date, has_time) {
+        (true, true) => format_date(serial, "yyyy/m/d h:nn:ss"),
+        (true, false) => format_date(serial, "yyyy/m/d"),
+        (false, _) => format_date(serial, "h:nn:ss"),
     }
 }
 
@@ -1807,13 +2789,24 @@ fn split_parts(source: &str, delimiter: &str, limit: usize) -> Vec<Value> {
 
 /// `Format`：支持数值格式（`0`/`#`/`.`/`,`/`%`、`E+00`、`;` 分段）与大小写格式（`>`/`<`）。
 fn format_value(value: &Value, spec: &str) -> Result<String, String> {
+    // 本机 VB6 实测 `Format(Null, "0")` 是空字符串（不报错）。
+    if matches!(value, Value::Null) {
+        return Ok(String::new());
+    }
     if spec.is_empty() {
         return Ok(value.to_display());
     }
     if let Some(text) = named_format(value, spec)? {
         return Ok(text);
     }
+    if let Some(text) = named_date_format(value, spec)? {
+        return Ok(text);
+    }
     if !spec.contains('0') && !spec.contains('#') {
+        // `@`（右对齐补空格）与 `&`（不补齐）是文本占位符：`Format(1, "@@@")` 是 `"  1"`。
+        if spec.contains('@') || spec.contains('&') {
+            return Ok(format_text(value, spec));
+        }
         if is_date_format(spec) {
             return Ok(format_date(value.as_float()?, spec));
         }
@@ -1833,6 +2826,18 @@ fn format_value(value: &Value, spec: &str) -> Result<String, String> {
     format_number(number, spec)
 }
 
+/// `@` / `&` 文本占位符：文本按占位符个数左补空格（VB6 实测 `Format("abc", "@@@@@")` 是 `"  abc"`、
+/// `Format(1234.5, "@@@@@@")` 是 `"1234.5"`，超长时不截断）。
+fn format_text(value: &Value, spec: &str) -> String {
+    let width = spec.chars().filter(|ch| matches!(ch, '@' | '&')).count();
+    let text = value.to_display();
+    let length = text.chars().count();
+    if length >= width {
+        return text;
+    }
+    format!("{}{text}", " ".repeat(width - length))
+}
+
 /// 按数值格式（可含 `;` 分段）格式化一个数。
 fn format_number(number: f64, spec: &str) -> Result<String, String> {
     let sections: Vec<&str> = spec.split(';').collect();
@@ -1848,15 +2853,64 @@ fn format_number(number: f64, spec: &str) -> Result<String, String> {
     };
 
     let mut text = format_section(number.abs(), section)?;
-    if negative_sign && number < 0.0 {
+    // 四舍五入到 -0.00 时 VB6 不带负号（实测 `Format(-0.004, "0.00")` 是 `0.00`）。
+    let all_zero = !text.chars().any(|c| c.is_ascii_digit() && c != '0');
+    if negative_sign && number < 0.0 && !all_zero {
         text.insert(0, '-');
     }
     Ok(text)
 }
 
+/// `Format` 的命名日期 / 时间格式（大小写不敏感），返回 `None` 表示不是这类格式。
+///
+/// 输出固定、不读系统区域设置，取本机 VB6（中文区域）实测的写法：`Short Date` 是
+/// `2024/2/29`、`Medium Date` 是 `24-02-29`、`Long Date` 是 `2024年2月29日`、
+/// `Medium Time` 是 12 小时制 + 上午/下午。
+fn named_date_format(value: &Value, spec: &str) -> Result<Option<String>, String> {
+    const NAMES: &[&str] = &[
+        "general date",
+        "long date",
+        "medium date",
+        "short date",
+        "long time",
+        "medium time",
+        "short time",
+    ];
+    let key = spec.trim().to_ascii_lowercase();
+    if !NAMES.contains(&key.as_str()) {
+        return Ok(None);
+    }
+    let serial = value.coerce(VbType::Date)?.as_float().map_err(|message| {
+        format!(
+            "`Format` 需要日期，但得到 \"{}\"：{message}",
+            value.to_display()
+        )
+    })?;
+    let (year, month, day, hour, minute, second) = parts_from_serial(serial);
+    let text = match key.as_str() {
+        "general date" => format_date_display(serial),
+        "long date" => format!("{year}年{month}月{day}日"),
+        "medium date" => format!("{:02}-{:02}-{:02}", year.rem_euclid(100), month, day),
+        "short date" => format_date(serial, "yyyy/m/d"),
+        "long time" => format!("{hour:02}:{minute:02}:{second:02}"),
+        "medium time" => {
+            let (hour12, half) = match hour {
+                0 => (12, "上午"),
+                1..=11 => (hour, "上午"),
+                12 => (12, "下午"),
+                _ => (hour - 12, "下午"),
+            };
+            format!("{hour12:02}:{minute:02} {half}")
+        }
+        _ => format!("{hour:02}:{minute:02}"),
+    };
+    Ok(Some(text))
+}
+
 /// `Format` 的命名格式（大小写不敏感），返回 `None` 表示不是命名格式。
 ///
-/// 命名格式不读系统区域设置：`Currency` 固定用 `$`，千位分隔符固定用 `,`。
+/// 命名格式不读系统区域设置：`Currency` 固定用 `￥`（本机 VB6 中文系统实测是 `￥1.50`），
+/// 千位分隔符固定用 `,`。
 fn named_format(value: &Value, spec: &str) -> Result<Option<String>, String> {
     let key = spec.trim().to_ascii_lowercase();
     let number = |spec: &str| -> Result<Option<String>, String> {
@@ -1871,7 +2925,7 @@ fn named_format(value: &Value, spec: &str) -> Result<Option<String>, String> {
         "standard" => number("#,##0.00"),
         "percent" => number("0.00%"),
         "scientific" => number("0.00E+00"),
-        "currency" => number("$#,##0.00"),
+        "currency" => number("￥#,##0.00"),
         "yes/no" => Ok(Some(choice_text(value, "No", "Yes")?)),
         "true/false" => Ok(Some(choice_text(value, "False", "True")?)),
         "on/off" => Ok(Some(choice_text(value, "Off", "On")?)),
@@ -1898,12 +2952,7 @@ fn compare_is_text(value: Option<&Value>) -> Result<bool, String> {
     }
 }
 
-fn chars_match_at(
-    haystack: &[char],
-    needle: &[char],
-    index: usize,
-    ignore_case: bool,
-) -> bool {
+fn chars_match_at(haystack: &[char], needle: &[char], index: usize, ignore_case: bool) -> bool {
     if index + needle.len() > haystack.len() {
         return false;
     }
@@ -1977,10 +3026,14 @@ fn format_section(value: f64, section: &str) -> Result<String, String> {
     };
 
     let prefix = unquote(&chars[..first].iter().collect::<String>());
-    let suffix = unquote(&chars[last + 1..].iter().collect::<String>());
-    if suffix.starts_with(',') {
-        return Err("`Format` 暂不支持千位缩放（末尾逗号）".into());
+    // 占位符后面的每个逗号表示「除以 1000」（`Format(1234567, "0,")` 是 `1235`）。
+    let mut scale = 0u32;
+    let mut suffix_chars = &chars[last + 1..];
+    while suffix_chars.first() == Some(&',') {
+        scale += 1;
+        suffix_chars = &suffix_chars[1..];
     }
+    let suffix = unquote(&suffix_chars.iter().collect::<String>());
 
     let core: String = chars[first..=last].iter().collect();
     let (mantissa, exponent) = match core.find(['E', 'e']) {
@@ -2000,6 +3053,12 @@ fn format_section(value: f64, section: &str) -> Result<String, String> {
 
     let value = if prefix.contains('%') || suffix.contains('%') {
         value * 100.0
+    } else {
+        value
+    };
+    // 末尾逗号是千位缩放（每个逗号除以 1000），在百分比之后、取整之前应用。
+    let value = if scale > 0 {
+        value / 1000f64.powi(scale as i32)
     } else {
         value
     };
@@ -2038,14 +3097,8 @@ fn render_fixed(value: f64, int_format: &str, frac_format: &str) -> (String, Str
     let min_int = int_format.chars().filter(|ch| *ch == '0').count();
     let grouped = int_format.contains(',');
 
-    let factor = 10f64.powi(decimals as i32);
     // 与 VB6 一致：`Format` 逢五进位，而 `Round` 是银行家舍入。
-    let rounded = (value * factor).round() / factor;
-    let text = format!("{rounded:.decimals$}");
-    let (int_text, frac_text) = match text.split_once('.') {
-        Some((int, frac)) => (int.to_string(), frac.to_string()),
-        None => (text.clone(), String::new()),
-    };
+    let (int_text, frac_text) = round_decimal(value, decimals);
 
     let mut integer = int_text.trim_start_matches('0').to_string();
     while integer.chars().count() < min_int {
@@ -2060,6 +3113,56 @@ fn render_fixed(value: f64, int_format: &str, frac_format: &str) -> (String, Str
         fraction.pop();
     }
     (integer, fraction)
+}
+
+/// 非负数四舍五入到 `decimals` 位小数，返回 (整数部分, 恰好 `decimals` 位的小数部分)。
+///
+/// 取舍在**最短往返十进制表示**上做：VB6 的 `Format(1.005, "0.00")` 是 `1.01`，
+/// 而 f64 里的 1.005 略小于十进制的 1.005（直接乘 100 取整会得到 1.00）。
+fn round_decimal(value: f64, decimals: usize) -> (String, String) {
+    if !value.is_finite() {
+        return match format!("{value:.decimals$}").split_once('.') {
+            Some((int, frac)) => (int.to_string(), frac.to_string()),
+            None => (value.to_string(), String::new()),
+        };
+    }
+    // Rust 的 `Display` 给的是最短往返表示，且不用指数写法。
+    let text = format!("{value}");
+    let (int_text, frac_text) = match text.split_once('.') {
+        Some((int, frac)) => (int, frac),
+        None => (text.as_str(), ""),
+    };
+    let mut point = int_text.chars().count();
+    let mut digits: Vec<u8> = int_text
+        .bytes()
+        .chain(frac_text.bytes())
+        .map(|byte| byte - b'0')
+        .collect();
+    if frac_text.len() > decimals {
+        let round_up = digits[point + decimals] >= 5;
+        digits.truncate(point + decimals);
+        if round_up {
+            let mut index = digits.len();
+            loop {
+                if index == 0 {
+                    digits.insert(0, 1);
+                    point += 1;
+                    break;
+                }
+                index -= 1;
+                if digits[index] == 9 {
+                    digits[index] = 0;
+                } else {
+                    digits[index] += 1;
+                    break;
+                }
+            }
+        }
+    } else {
+        digits.resize(point + decimals, 0);
+    }
+    let text_of = |slice: &[u8]| slice.iter().map(|digit| (b'0' + digit) as char).collect();
+    (text_of(&digits[..point]), text_of(&digits[point..]))
 }
 
 /// 科学计数法格式里 `E`/`e` 后面的写法：`E+00` 表示总带符号、至少两位指数。

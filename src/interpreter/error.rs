@@ -50,7 +50,7 @@ impl RuntimeError {
     }
 
     /// 把值转换类错误转成运行时错误，并按 VB 约定补上错误号：
-    /// 溢出 6、类型不匹配 13、无效使用 `Null` 94，其余为 5。
+    /// 溢出 6、类型不匹配 13、无效使用 `Null` 94、对象转字符串 450，其余为 5。
     pub fn from_coerce(message: impl Into<String>, line: usize) -> Self {
         let message = message.into();
         let number = if message.contains("溢出") {
@@ -59,6 +59,8 @@ impl RuntimeError {
             13
         } else if message.contains("Null 不能") || message.contains("无效使用 Null") {
             94
+        } else if message.contains("没有可用的默认属性") {
+            450
         } else {
             5
         };

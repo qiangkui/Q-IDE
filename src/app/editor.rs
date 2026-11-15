@@ -1,7 +1,7 @@
 //! 编辑区相关：导航、命令面板、补全/诊断刷新与文本编辑动作。
 
-use super::*;
 use super::dialogs::*;
+use super::*;
 
 impl CodeWindow {
     /// 转到定义（`F12`）：光标处的名字在当前脚本里的声明位置。
@@ -254,9 +254,8 @@ impl CodeWindow {
             return;
         }
 
-        let input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("命令名，例如 保存 / 运行 / 主题")
-        });
+        let input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("命令名，例如 保存 / 运行 / 主题"));
         let handle = cx.entity().downgrade();
         let apply: DialogCallback = {
             let field = input.clone();
@@ -292,8 +291,10 @@ impl CodeWindow {
     ) {
         let Some(command) = commands::best_command(text) else {
             let query = text.trim();
-            self.output()
-                .warning(cx, format!("找不到命令 `{query}`，按 Ctrl+Shift+P 重新输入"));
+            self.output().warning(
+                cx,
+                format!("找不到命令 `{query}`，按 Ctrl+Shift+P 重新输入"),
+            );
             return;
         };
         let shortcut = if command.shortcut.is_empty() {
@@ -368,6 +369,7 @@ impl CodeWindow {
             "run.to-cursor" => self.run_to_cursor(cx),
             "debug.toggle-breakpoint" => self.toggle_breakpoint(cx),
             "debug.clear-breakpoints" => self.clear_all_breakpoints(cx),
+            "help.shortcuts" => self.show_shortcuts_dialog(window, cx),
             _ => {}
         }
     }
@@ -506,8 +508,7 @@ impl CodeWindow {
         let completion = self
             .active_file_language()
             .eq_ignore_ascii_case(crate::syntax::VB_LANGUAGE);
-        if self.applied_language.as_ref() == Some(&language)
-            && self.completion_active == completion
+        if self.applied_language.as_ref() == Some(&language) && self.completion_active == completion
         {
             return;
         }
@@ -520,8 +521,7 @@ impl CodeWindow {
                 editor.set_highlighter(language.clone(), cx);
             }
             if completion_changed {
-                editor.lsp_mut().completion_provider =
-                    completion.then(crate::completion::provider);
+                editor.lsp_mut().completion_provider = completion.then(crate::completion::provider);
             }
         });
         self.applied_language = Some(language);
@@ -590,14 +590,24 @@ impl CodeWindow {
         cx: &mut Context<Self>,
     ) -> Entity<EditorState> {
         let settings = self.settings.read(cx).editor.clone();
+        // VB6 用 4 空格一级缩进，和仓库里的 VB 脚本一致；其它语言沿用组件默认（2 空格）。
+        let is_vb = language.eq_ignore_ascii_case(crate::syntax::VB_LANGUAGE);
         let editor = cx.new(|cx| {
-            EditorState::new(window, cx)
+            let state = EditorState::new(window, cx)
                 .language(language)
                 .soft_wrap(settings.soft_wrap)
                 .line_number(settings.line_numbers)
                 .folding(settings.folding)
                 .auto_close(settings.auto_close)
-                .default_value(content)
+                .default_value(content);
+            if is_vb {
+                state.tab_size(TabSize {
+                    tab_size: 4,
+                    hard_tabs: false,
+                })
+            } else {
+                state
+            }
         });
         editor.update(cx, |editor, cx| {
             editor.set_highlighter_factory(crate::syntax::highlighter_factory(), cx);
@@ -623,13 +633,65 @@ impl CodeWindow {
             this.refresh_diagnostics(cx);
             this.sync_breakpoints_from_marks(cx);
         });
+        let enter_subscription = cx.subscribe_in(
+            &editor,
+            window,
+            |this, editor, event: &InputEvent, window, cx| {
+                this.dedent_after_block_end(editor, event, window, cx);
+            },
+        );
         self.editors.push(editor.clone());
         self.editor_subscriptions.push(subscription);
+        self.editor_subscriptions.push(enter_subscription);
         self.breakpoint_marks.push(None);
         self.paused_line_marks.push(None);
         self.bracket_marks.push(None);
         self.bracket_pairs.push(BracketHighlight::Unset);
         editor
+    }
+
+    /// 在 `End Sub` / `Next` 这类块结束行的行尾回车后补一次反缩进。
+    ///
+    /// 编辑器自带的「减少缩进」规则只拿光标**之后**的文本去匹配，行尾回车时光标后面是空的，
+    /// 新行会沿用该行自己的缩进；VB6 会给到外层缩进。这里在 `PressEnter` 之后看一眼：
+    /// 新行只有空白、且上一行是块结束行，就用 `OutdentInline`（与 `Shift+Tab` 同一条路径）减一级，
+    /// 撤销记录仍是一条。
+    fn dedent_after_block_end(
+        &mut self,
+        editor: &Entity<EditorState>,
+        event: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(event, InputEvent::PressEnter { .. }) || !self.is_active_editor(editor) {
+            return;
+        }
+        if !self
+            .active_file_language()
+            .eq_ignore_ascii_case(crate::syntax::VB_LANGUAGE)
+        {
+            return;
+        }
+        let (text, cursor) = {
+            let state = editor.read(cx);
+            let text = state.value();
+            let cursor = state.cursor().min(text.len());
+            (text, cursor)
+        };
+        let before = &text[..cursor];
+        let line_start = before.rfind('\n').map_or(0, |index| index + 1);
+        let indent = &before[line_start..];
+        if indent.is_empty() || !indent.chars().all(|c| c == ' ' || c == '\t') {
+            return;
+        }
+        let previous_end = line_start.saturating_sub(1);
+        let previous_start = text[..previous_end]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        if !crate::indent::closes_block(&text[previous_start..previous_end]) {
+            return;
+        }
+        window.dispatch_action(Box::new(OutdentInline), cx);
     }
 
     /// 编辑框内容变化时把它同步到当前标签；内容真的变了才重绘（用于未保存圆点）。
@@ -719,11 +781,7 @@ impl CodeWindow {
     }
 
     /// 切换当前行（或选区覆盖的整行）的行注释（`Ctrl+/`）。
-    pub(crate) fn toggle_active_comment(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn toggle_active_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_file.is_none() {
             return;
         }

@@ -80,8 +80,12 @@ pub fn analyze(program: &Program) -> Vec<Issue> {
 /// `Implements` 的成员一致性检查。
 ///
 /// 接口类的每个公开成员都要求在实现类里存在 `接口名_成员名`（VB6 的约定），
-/// 反向也要求实现类里不存在接口没有的 `接口名_xxx`。这条检查与 `Option
-/// Explicit` 无关：VB6 无论有没有该选项都会在编译期报错。
+/// 反向也要求实现类里不存在接口没有的 `接口名_xxx`。成员的签名也必须与接口一致：
+/// 过程形式（`Sub` / `Function` / `Property Get|Let|Set`）、参数个数、每个参数的
+/// 类型、传递方式、数组形式、可选性与默认值、返回类型都要相同；参数名可以不同。
+/// 以上规则按本机 VB6 实测（不一致时 VB6 报「过程声明与同名事件或过程的描述不匹配」）。
+///
+/// 这条检查与 `Option Explicit` 无关：VB6 无论有没有该选项都会在编译期报错。
 fn check_implements(program: &Program) -> Vec<Issue> {
     let mut issues = Vec::new();
     for class in &program.classes {
@@ -113,13 +117,11 @@ fn check_implements(program: &Program) -> Vec<Issue> {
                     });
                     continue;
                 };
-                // `Function` 与 `Property Get` 在解释器里是同一种过程，不区分。
-                if implementation.is_let != member.is_let || implementation.is_set != member.is_set
-                {
+                if let Some(reason) = signature_mismatch(member, implementation) {
                     issues.push(Issue {
                         line: implementation.line,
                         message: format!(
-                            "`{expected}` 的声明形式与接口 `{interface}` 的成员 `{}` 不一致",
+                            "`{expected}` 的签名与接口 `{interface}` 的成员 `{}` 不一致：{reason}",
                             member.name
                         ),
                     });
@@ -141,6 +143,148 @@ fn check_implements(program: &Program) -> Vec<Issue> {
         }
     }
     issues
+}
+
+/// 过程的形式。接口实现要求两侧形式相同（`Function` 不能顶替 `Property Get`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcedureKind {
+    Sub,
+    Function,
+    Get,
+    Let,
+    Set,
+}
+
+fn procedure_kind(procedure: &Procedure) -> ProcedureKind {
+    if procedure.is_set {
+        ProcedureKind::Set
+    } else if procedure.is_let {
+        ProcedureKind::Let
+    } else if procedure.is_function {
+        if procedure.is_get {
+            ProcedureKind::Get
+        } else {
+            ProcedureKind::Function
+        }
+    } else {
+        ProcedureKind::Sub
+    }
+}
+
+fn kind_name(kind: ProcedureKind) -> &'static str {
+    match kind {
+        ProcedureKind::Sub => "Sub",
+        ProcedureKind::Function => "Function",
+        ProcedureKind::Get => "Property Get",
+        ProcedureKind::Let => "Property Let",
+        ProcedureKind::Set => "Property Set",
+    }
+}
+
+/// 比较接口成员与实现成员的签名；一致返回 `None`，否则返回可直接拼进诊断的原因。
+fn signature_mismatch(interface: &Procedure, implementation: &Procedure) -> Option<String> {
+    let expected_kind = procedure_kind(interface);
+    let actual_kind = procedure_kind(implementation);
+    if expected_kind != actual_kind {
+        return Some(format!(
+            "声明形式应为 `{}`，实际是 `{}`",
+            kind_name(expected_kind),
+            kind_name(actual_kind)
+        ));
+    }
+    if interface.params.len() != implementation.params.len() {
+        return Some(format!(
+            "参数个数应为 {} 个，实际是 {} 个",
+            interface.params.len(),
+            implementation.params.len()
+        ));
+    }
+    for (index, (expected, actual)) in interface
+        .params
+        .iter()
+        .zip(&implementation.params)
+        .enumerate()
+    {
+        let position = index + 1;
+        // 同一个参数可能有多处不一致，只报最先发现的一处，避免刷屏。
+        let category = if expected.param_array != actual.param_array {
+            Some("ParamArray 形式")
+        } else if expected.is_array != actual.is_array {
+            Some("数组形式")
+        } else if expected.by_ref != actual.by_ref {
+            Some("传递方式")
+        } else if expected.ty != actual.ty || !record_names_equal(&expected.record, &actual.record)
+        {
+            Some("类型")
+        } else if expected.optional != actual.optional {
+            Some("可选性")
+        } else if !defaults_equal(expected.default.as_ref(), actual.default.as_ref()) {
+            Some("默认值")
+        } else {
+            None
+        };
+        if let Some(category) = category {
+            return Some(format!(
+                "第 {position} 个参数{category}不一致（接口 `{}`，实现 `{}`）",
+                parameter_display(expected),
+                parameter_display(actual)
+            ));
+        }
+    }
+    if matches!(expected_kind, ProcedureKind::Function | ProcedureKind::Get)
+        && interface.ret != implementation.ret
+    {
+        return Some(format!(
+            "返回类型应为 `{}`，实际是 `{}`",
+            interface.ret.name(),
+            implementation.ret.name()
+        ));
+    }
+    None
+}
+
+fn parameter_type_name(param: &Param) -> String {
+    match &param.record {
+        Some(record) => record.clone(),
+        None => param.ty.name().to_string(),
+    }
+}
+
+/// 参数在诊断里的显示形式，例如 `ByVal w As Long`、`ByRef xs() As Long`。
+fn parameter_display(param: &Param) -> String {
+    let mut text = String::new();
+    let mode = if param.by_ref { "ByRef " } else { "ByVal " };
+    text.push_str(mode);
+    if param.param_array {
+        text.push_str("ParamArray ");
+    }
+    text.push_str(&param.name);
+    if param.is_array {
+        text.push_str("()");
+    }
+    text.push_str(" As ");
+    text.push_str(&parameter_type_name(param));
+    if param.optional {
+        text.push_str("（可选）");
+    }
+    text
+}
+
+fn record_names_equal(left: &Option<String>, right: &Option<String>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// 默认值按语法树比较：`= 5` 与 `= 6` 算不同（本机 VB6 实测也拒绝）。
+fn defaults_equal(left: Option<&Expr>, right: Option<&Expr>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => format!("{left:?}") == format!("{right:?}"),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 struct Checker {
@@ -521,7 +665,10 @@ impl Checker {
 
     fn check_expr(&mut self, expr: &Expr, names: &HashSet<String>, line: usize) {
         match expr {
-            Expr::Literal(_) | Expr::NewObject(_) | Expr::AddressOf(_) => {}
+            Expr::Literal(_)
+            | Expr::TypedLiteral { .. }
+            | Expr::NewObject(_)
+            | Expr::AddressOf(_) => {}
             Expr::ArrayLiteral(items) => {
                 for item in items {
                     self.check_expr(item, names, line);

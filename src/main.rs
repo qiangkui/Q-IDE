@@ -33,6 +33,7 @@ mod editing;
 mod editor_pane;
 mod encoding;
 mod explorer;
+mod indent;
 mod interpreter;
 mod layout;
 mod lint;
@@ -44,6 +45,7 @@ mod panels;
 mod search;
 mod secret_store;
 mod settings;
+mod shortcuts;
 mod startup;
 mod status_bar;
 mod syntax;
@@ -70,6 +72,9 @@ mod custom_theme_tests;
 
 #[cfg(test)]
 mod explorer_tests;
+
+#[cfg(test)]
+mod indent_tests;
 
 #[cfg(test)]
 mod settings_tests;
@@ -130,6 +135,9 @@ mod brackets_tests;
 
 #[cfg(test)]
 mod shortcut_tests;
+
+#[cfg(test)]
+mod shortcuts_tests;
 
 #[cfg(test)]
 mod startup_tests;

@@ -11,8 +11,6 @@ pub struct StatusInfo<'a> {
     pub file_name: Option<&'a str>,
     /// 当前生效的语法分析器，例如 `Rust` / `纯文本`。
     pub language: &'a str,
-    /// 当前文件的编码，例如 `UTF-8` / `GBK`；没有打开文件时为 `None`。
-    pub encoding: Option<&'a str>,
     pub line_count: usize,
     pub char_count: usize,
     /// 光标位置（1 基行、列）；没有打开文件时为 `None`。
@@ -28,6 +26,7 @@ pub fn render(
     palette: Palette,
     info: StatusInfo<'_>,
     on_toggle_output: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    encoding_menu: Option<AnyElement>,
 ) -> AnyElement {
     let file_name = info.file_name.unwrap_or("未打开文件").to_string();
 
@@ -47,13 +46,8 @@ pub fn render(
                 .child(format!("语法：{}", info.language)),
         );
 
-    if let Some(encoding) = info.encoding {
-        left = left.child(
-            div()
-                .text_xs()
-                .text_color(rgb(palette.muted_text))
-                .child(format!("编码：{encoding}")),
-        );
+    if let Some(encoding_menu) = encoding_menu {
+        left = left.child(encoding_menu);
     }
 
     if info.file_name.is_some() {

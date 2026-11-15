@@ -40,12 +40,76 @@ pub type ExplorerMenuAction = Rc<dyn Fn(String, bool, bool, Point<Pixels>, &mut 
 pub type ExplorerMoveAction = Rc<dyn Fn(&str, &str, &mut Window, &mut App)>;
 /// 点击条目左侧圆点，或选择模式下点击条目：进入选择模式并选中，或切换选中状态。
 pub type ExplorerSelectAction = Rc<dyn Fn(&str, &mut Window, &mut App)>;
+/// `Ctrl+点击` / `Shift+点击` 条目：切换选中，或把上一次点击到这一行的范围一起选中。
+pub type ExplorerModifierSelectAction = Rc<dyn Fn(&str, bool, &mut Window, &mut App)>;
+/// 普通左键点条目：只记下 `Shift+点击` 的范围起点，不做别的（打开文件/展开目录由各自的回调负责）。
+pub type ExplorerRowClickAction = Rc<dyn Fn(&str, &mut App)>;
+/// 开始拖动条目：把正在拖的路径告诉主窗口（用于「拖出窗口复制路径」）。
+pub type ExplorerDragBeginAction = Rc<dyn Fn(&str, &mut App)>;
 
 /// 拖动资源管理器条目时携带的数据。
 #[derive(Clone)]
 pub struct ExplorerDrag {
     pub path: String,
     pub is_dir: bool,
+}
+
+/// 「把条目拖出窗口 = 复制路径」的状态。
+///
+/// Windows 下 gpui 不支持把内部拖动交给系统（`gpui-pre` 的 Windows 后端没有 `IDropSource`），
+/// 所以自己记录正在拖的路径：指针离开窗口后松开鼠标就把路径写进剪贴板。
+/// 窗口外松手的 `mouse up` 不一定会送进来，因此「离开过窗口、之后带着没按下的鼠标返回」
+/// 也算一次外部松开（[`Self::moved`] 会补上）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DragOutState {
+    path: Option<String>,
+    /// 这次拖动期间指针是否离开过窗口。
+    left_window: bool,
+}
+
+impl DragOutState {
+    /// 开始拖动某个条目。
+    pub fn begin(&mut self, path: &str) {
+        self.path = Some(path.to_string());
+        self.left_window = false;
+    }
+
+    pub fn is_dragging(&self) -> bool {
+        self.path.is_some()
+    }
+
+    /// 指针移动；返回需要在窗口外松开时复制的路径。
+    ///
+    /// `inside` 是当前指针是否还在窗口内，`button_pressed` 是左键是否仍按下。
+    pub fn moved(&mut self, inside: bool, button_pressed: bool) -> Option<String> {
+        self.path.as_ref()?;
+        if !inside {
+            self.left_window = true;
+            return None;
+        }
+        if !button_pressed && self.left_window {
+            // 松手事件没有送进来（在别的窗口上松开），回到窗口内时才补上。
+            return self.released_outside();
+        }
+        None
+    }
+
+    /// 在窗口内松开：正常拖放，不复制。
+    pub fn released_inside(&mut self) {
+        self.cancel();
+    }
+
+    /// 在窗口外松开：返回要复制到剪贴板的路径。
+    pub fn released_outside(&mut self) -> Option<String> {
+        self.left_window = false;
+        self.path.take()
+    }
+
+    /// 丢弃状态（新的一次按下鼠标、或拖动被取消时）。
+    pub fn cancel(&mut self) {
+        self.path = None;
+        self.left_window = false;
+    }
 }
 
 /// 拖动时的跟随预览。
@@ -151,6 +215,8 @@ impl Root {
 pub struct ExplorerSelection {
     active: bool,
     paths: HashSet<String>,
+    /// 上一次点的条目：`Shift+点击` 从这里开始算范围。
+    anchor: Option<String>,
 }
 
 impl ExplorerSelection {
@@ -174,8 +240,14 @@ impl ExplorerSelection {
         self.paths.iter()
     }
 
+    /// 范围选择的起点（`Shift+点击` 用）。
+    pub fn anchor(&self) -> Option<&str> {
+        self.anchor.as_deref()
+    }
+
     /// 点圆点：未进入选择模式时进入并选中该项，已在选择模式时切换该项。
     pub fn click(&mut self, path: &str) {
+        self.anchor = Some(path.to_string());
         if self.active {
             self.toggle(path);
         } else {
@@ -185,18 +257,36 @@ impl ExplorerSelection {
     }
 
     /// 选择模式下点条目：选中/取消选中；全部取消后退出选择模式。
+    ///
+    /// 普通模式下按 `Ctrl+点击` 也会走这里：第一次按下就进入选择模式。
     pub fn toggle(&mut self, path: &str) {
-        if !self.paths.remove(path) {
+        self.anchor = Some(path.to_string());
+        if self.paths.remove(path) {
+            if self.paths.is_empty() {
+                self.active = false;
+            }
+        } else {
             self.paths.insert(path.to_string());
+            self.active = true;
         }
-        if self.paths.is_empty() {
-            self.active = false;
-        }
+    }
+
+    /// 记下范围起点（普通点击也调用它：`Shift+点击` 的范围从上一次点过的条目算起）。
+    pub fn set_anchor(&mut self, path: &str) {
+        self.anchor = Some(path.to_string());
+    }
+
+    /// `Shift+点击`：把给定的一批路径设为当前选中（范围由调用方按可见顺序算好）。
+    pub fn set_paths(&mut self, paths: impl IntoIterator<Item = String>, anchor: &str) {
+        self.paths = paths.into_iter().collect();
+        self.active = !self.paths.is_empty();
+        self.anchor = Some(anchor.to_string());
     }
 
     pub fn clear(&mut self) {
         self.paths.clear();
         self.active = false;
+        self.anchor = None;
     }
 
     /// 条目被移动或重命名后，把选中的旧路径改写成新路径。
@@ -370,12 +460,18 @@ pub struct ExplorerActions {
     pub on_context_menu: ExplorerMenuAction,
     /// 把条目拖到目录上（移动）。
     pub on_move: ExplorerMoveAction,
+    /// 开始拖动条目。
+    pub on_item_drag: ExplorerDragBeginAction,
     /// 当前多选状态。
     pub selection: ExplorerSelection,
     /// 右键菜单当前指向的条目：菜单打开期间高亮它。
     pub context_path: Option<String>,
     /// 点圆点或在选择模式下点条目。
     pub on_select: ExplorerSelectAction,
+    /// `Ctrl+点击` / `Shift+点击` 条目（参数：路径、是否 `Shift`）。
+    pub on_modifier_select: ExplorerModifierSelectAction,
+    /// 普通左键点条目：记下范围起点。
+    pub on_row_click: ExplorerRowClickAction,
     /// 删除选中的条目（选择模式下标题栏按钮）。
     pub delete_selected: PanelCommand,
     /// 退出选择模式。
@@ -433,9 +529,12 @@ pub fn render(
         refresh,
         on_context_menu,
         on_move,
+        on_item_drag,
         selection,
         context_path,
         on_select,
+        on_modifier_select,
+        on_row_click,
         delete_selected,
         cancel_selection,
         is_empty,
@@ -697,12 +796,15 @@ pub fn render(
             // 拖动条目：数据里带上路径，拖到目录或标签栏上时用。
             let drag_path = id.clone();
             let drag_label = entry.item().label.clone();
+            let drag_begin = on_item_drag.clone();
             let item = item.on_drag(
                 ExplorerDrag {
                     path: drag_path,
                     is_dir: is_folder,
                 },
                 move |drag: &ExplorerDrag, _, _, cx| {
+                    // 拖动真正开始（越过阈值）时才知道路径，借此支持「拖出窗口复制路径」。
+                    drag_begin(&drag.path, cx);
                     let label = if drag.is_dir {
                         format!("{}/", drag_label)
                     } else {
@@ -746,14 +848,29 @@ pub fn render(
 
             // 左键：普通模式下文件夹展开/收起、文件打开；
             // 选择模式下只切换选中状态，不打开任何东西；根目录不可选中。
+            // `Ctrl+点击`（或 `Cmd`）与 `Shift+点击` 在任何模式下都走多选：前者切换、后者选一段范围。
+            let modifier_select = on_modifier_select.clone();
+            let modifier_id = id.clone();
+            let modifier_click = move |event: &ClickEvent, window: &mut Window, cx: &mut App| {
+                let modifiers = event.modifiers();
+                if !(modifiers.control || modifiers.platform || modifiers.shift) {
+                    return false;
+                }
+                cx.stop_propagation();
+                modifier_select(&modifier_id, modifiers.shift, window, cx);
+                true
+            };
             if selection_active {
                 if is_root {
                     // 根目录不能选中，也不要让树的默认点击去展开它。
-                    item.on_click(|_, _, cx| cx.stop_propagation())
+                    item.on_click(move |_, _, cx| cx.stop_propagation())
                 } else {
                     let select = on_select.clone();
                     let path = id.clone();
-                    item.on_click(move |_, window, cx| {
+                    item.on_click(move |event, window, cx| {
+                        if modifier_click(event, window, cx) {
+                            return;
+                        }
                         cx.stop_propagation();
                         select(&path, window, cx);
                     })
@@ -761,14 +878,27 @@ pub fn render(
             } else if is_folder {
                 let toggle_folder = toggle_folder.clone();
                 let folder_id = id.clone();
-                item.on_click(move |_, window, cx| {
+                let row_click = on_row_click.clone();
+                item.on_click(move |event, window, cx| {
+                    if modifier_click(event, window, cx) {
+                        return;
+                    }
                     cx.stop_propagation();
+                    // 记下范围起点：之后 `Shift+点击` 从这一行算起。
+                    row_click(&folder_id, cx);
                     toggle_folder(&folder_id, window, cx);
                 })
             } else {
                 let open_file = open_file.clone();
                 let file_id = id.clone();
-                item.on_click(move |_, window, cx| open_file(&file_id, window, cx))
+                let row_click = on_row_click.clone();
+                item.on_click(move |event, window, cx| {
+                    if modifier_click(event, window, cx) {
+                        return;
+                    }
+                    row_click(&file_id, cx);
+                    open_file(&file_id, window, cx);
+                })
             }
         })
         .into_any_element()

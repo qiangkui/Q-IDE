@@ -20,6 +20,15 @@ pub enum FileEncoding {
 }
 
 impl FileEncoding {
+    /// 界面上的选择顺序（状态栏「切换编码」与另存为对话框共用）。
+    pub const ALL: &'static [Self] = &[
+        Self::Utf8,
+        Self::Utf8Bom,
+        Self::Utf16Le,
+        Self::Utf16Be,
+        Self::Gbk,
+    ];
+
     /// 界面上展示的名字。
     pub fn label(self) -> &'static str {
         match self {
@@ -29,6 +38,47 @@ impl FileEncoding {
             Self::Utf16Be => "UTF-16 BE",
             Self::Gbk => "GBK",
         }
+    }
+}
+
+/// 保存时使用的换行符。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LineEnding {
+    /// 保持文本里已有的换行（正常保存都用它）。
+    #[default]
+    Keep,
+    /// `\r\n`。
+    Crlf,
+    /// `\n`。
+    Lf,
+}
+
+impl LineEnding {
+    /// 另存为对话框里的选项顺序。
+    pub const ALL: &'static [Self] = &[Self::Keep, Self::Crlf, Self::Lf];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Keep => "保持原样",
+            Self::Crlf => "CRLF（Windows）",
+            Self::Lf => "LF（Unix）",
+        }
+    }
+}
+
+/// 把文本里的换行统一成指定形式；`Keep` 原样返回。
+///
+/// 先把 `\r\n` 与单独的 `\r` 都归一成 `\n`，再按目标换行符展开，
+/// 所以混合换行的文件也能一次改干净。
+pub fn normalize_newlines(text: &str, ending: LineEnding) -> String {
+    if ending == LineEnding::Keep {
+        return text.to_string();
+    }
+    let unified = text.replace("\r\n", "\n").replace('\r', "\n");
+    match ending {
+        LineEnding::Keep => unified,
+        LineEnding::Crlf => unified.replace('\n', "\r\n"),
+        LineEnding::Lf => unified,
     }
 }
 
@@ -76,6 +126,32 @@ pub fn decode(bytes: &[u8]) -> DecodedText {
                 text: text.into_owned(),
                 encoding: FileEncoding::Gbk,
             }
+        }
+    }
+}
+
+/// 按用户指定的编码解码（状态栏「切换编码」用）。
+///
+/// 与 [`decode`] 不同，这里不探测：选了什么就按什么读，`Utf8` / `GBK` 也会先去掉
+/// 可能存在的同类 BOM，避免把 BOM 当成正文。
+pub fn decode_with(bytes: &[u8], encoding: FileEncoding) -> String {
+    match encoding {
+        FileEncoding::Utf8 | FileEncoding::Utf8Bom => {
+            String::from_utf8_lossy(bytes.strip_prefix(UTF8_BOM).unwrap_or(bytes)).into_owned()
+        }
+        FileEncoding::Utf16Le => {
+            let (text, ..) =
+                encoding_rs::UTF_16LE.decode(bytes.strip_prefix(UTF16_LE_BOM).unwrap_or(bytes));
+            text.into_owned()
+        }
+        FileEncoding::Utf16Be => {
+            let (text, ..) =
+                encoding_rs::UTF_16BE.decode(bytes.strip_prefix(UTF16_BE_BOM).unwrap_or(bytes));
+            text.into_owned()
+        }
+        FileEncoding::Gbk => {
+            let (text, ..) = encoding_rs::GBK.decode(bytes);
+            text.into_owned()
         }
     }
 }

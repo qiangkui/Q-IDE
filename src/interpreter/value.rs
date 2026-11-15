@@ -93,6 +93,9 @@ pub struct VbArray {
     items: Vec<Rc<RefCell<Value>>>,
     /// 元素声明类型，写入时按它转换。
     ty: VbType,
+    /// `Variant` 元素的**内容类型**（`arr(0) = CByte(1)` 之后 `VarType(arr(0))` 是 17、
+    /// `For Each` 的循环变量也拿到 17）；元素声明类型不是 `Variant` 时为空。
+    narrow: Vec<Option<VbType>>,
     /// `ReDim` 创建（`Erase` 时释放）；`Dim a(10)` 是静态数组。
     dynamic: bool,
     /// 元素是 UDT 时：类型名 + 初始化模板（`ReDim`/`Erase` 用它重新造元素）。
@@ -107,6 +110,24 @@ impl VbArray {
             dims: vec![(0, count)],
             items: items.into_iter().map(new_cell).collect(),
             ty: VbType::Variant,
+            narrow: vec![None; count],
+            dynamic: true,
+            record: None,
+        }
+    }
+
+    /// `Array(CByte(1), 2)`：元素类型来自各实参的静态类型（`For Each` / `VarType` 要用）。
+    pub fn from_typed_values(items: Vec<(Value, Option<VbType>)>) -> Self {
+        let count = items.len();
+        let narrow = items.iter().map(|(_, ty)| *ty).collect();
+        Self {
+            dims: vec![(0, count)],
+            items: items
+                .into_iter()
+                .map(|(value, _)| new_cell(value))
+                .collect(),
+            ty: VbType::Variant,
+            narrow,
             dynamic: true,
             record: None,
         }
@@ -146,6 +167,11 @@ impl VbArray {
             dims,
             items: (0..total).map(|_| new_cell(fill.copy_value())).collect(),
             ty,
+            narrow: if ty == VbType::Variant {
+                vec![None; total]
+            } else {
+                Vec::new()
+            },
             dynamic,
             record,
         }
@@ -163,12 +189,25 @@ impl VbArray {
         &self.dims
     }
 
-    /// 元素快照，用于 `Join` / `For Each` 这类线性遍历。
-    pub fn values(&self) -> Vec<Value> {
+    /// 元素快照 + 每个元素的内容类型（`Variant` 数组的 `For Each` 用）。
+    pub fn values_with_types(&self) -> Vec<(Value, Option<VbType>)> {
         self.items
             .iter()
-            .map(|cell| cell.borrow().clone())
+            .enumerate()
+            .map(|(index, cell)| {
+                let narrow = self.narrow.get(index).copied().flatten();
+                (cell.borrow().clone(), narrow)
+            })
             .collect()
+    }
+
+    /// 某个下标的元素内容类型（`VarType(arr(0))` 用；非 `Variant` 数组返回 `None`）。
+    pub fn narrow_at(&self, indices: &[i32]) -> Option<VbType> {
+        if self.narrow.is_empty() {
+            return None;
+        }
+        let offset = self.offset(indices).ok()?;
+        self.narrow.get(offset).copied().flatten()
     }
 
     /// 元素存储单元（共享 `Rc`，不复制值），供只需要读一遍的调用方遍历。
@@ -233,13 +272,23 @@ impl VbArray {
         Ok(self.items[offset].borrow().clone())
     }
 
-    pub fn set(&mut self, indices: &[i32], value: Value) -> Result<(), String> {
+    pub fn set(
+        &mut self,
+        indices: &[i32],
+        value: Value,
+        narrow: Option<VbType>,
+    ) -> Result<(), String> {
         if let Some((type_name, _)) = &self.record
             && !value.is_record()
         {
             return Err(format!("该数组的元素必须是 `{type_name}` 记录"));
         }
         let offset = self.offset(indices)?;
+        if !self.narrow.is_empty()
+            && let Some(slot) = self.narrow.get_mut(offset)
+        {
+            *slot = narrow;
+        }
         if fits_directly(self.ty, &value) {
             *self.items[offset].borrow_mut() = value;
             return Ok(());
@@ -266,6 +315,11 @@ impl VbArray {
         let total = dims.iter().map(|(_, count)| *count).product::<usize>();
         let items: Vec<Rc<RefCell<Value>>> =
             (0..total).map(|_| new_cell(fill.copy_value())).collect();
+        let mut narrow = if ty == VbType::Variant {
+            vec![None; total]
+        } else {
+            Vec::new()
+        };
         if preserve && self.dims.len() == dims.len() && !self.dims.is_empty() {
             let element_ty = if template.is_some() {
                 VbType::Variant
@@ -284,11 +338,18 @@ impl VbArray {
                     let old = self.items[row * old_last + column].borrow();
                     *items[row * new_last + column].borrow_mut() =
                         old.coerce(element_ty).unwrap_or_else(|_| fill.copy_value());
+                    if let (Some(target), Some(source)) = (
+                        narrow.get_mut(row * new_last + column),
+                        self.narrow.get(row * old_last + column),
+                    ) {
+                        *target = *source;
+                    }
                 }
             }
         }
         self.dims = dims;
         self.items = items;
+        self.narrow = narrow;
         self.ty = ty;
         self.dynamic = true;
         self.record = template;
@@ -299,11 +360,13 @@ impl VbArray {
         if self.dynamic {
             self.dims.clear();
             self.items.clear();
+            self.narrow.clear();
         } else {
             let fill = self.fill();
             for cell in &self.items {
                 *cell.borrow_mut() = fill.copy_value();
             }
+            self.narrow.fill(None);
         }
     }
 
@@ -317,6 +380,7 @@ impl VbArray {
                 .map(|cell| new_cell(cell.borrow().copy_value()))
                 .collect(),
             ty: self.ty,
+            narrow: self.narrow.clone(),
             dynamic: self.dynamic,
             record: self.record.clone(),
         }
@@ -342,6 +406,10 @@ pub struct RecordField {
     /// `String * n`：赋值时按空格补齐/截断到固定长度。
     fixed_len: Option<usize>,
     cell: Rc<RefCell<Value>>,
+    /// `As Variant` 字段里当前值的内容类型（`u.f = i`（Integer）之后 `VarType(u.f)` 是 2）。
+    ///
+    /// 与 `Slot::narrow` 一样要共享：字段可以 `ByRef` 传出去。
+    narrow: Rc<std::cell::Cell<Option<VbType>>>,
 }
 
 impl RecordField {
@@ -365,6 +433,7 @@ impl RecordField {
             ty,
             fixed_len,
             cell: Rc::new(RefCell::new(value)),
+            narrow: Rc::new(std::cell::Cell::new(None)),
         }
     }
 
@@ -376,12 +445,31 @@ impl RecordField {
         self.cell.clone()
     }
 
-    pub fn set(&self, value: Value) -> Result<(), String> {
+    pub fn narrow(&self) -> Rc<std::cell::Cell<Option<VbType>>> {
+        self.narrow.clone()
+    }
+
+    /// `Variant` 字段里当前值的内容类型。
+    pub fn narrow_type(&self) -> Option<VbType> {
+        self.narrow.get()
+    }
+
+    fn set_narrow(&self, ty: Option<VbType>) {
+        self.narrow.set(ty);
+    }
+
+    /// 写入并记下内容类型（只有 `Variant` 字段用得上，其它字段照常清空标注）。
+    pub fn set_with_narrow(&self, value: Value, narrow: Option<VbType>) -> Result<(), String> {
         let coerced = match self.fixed_len {
             Some(len) => Value::Str(pad_fixed(&value.to_display(), len)),
             None => value.coerce(self.ty)?,
         };
         *self.cell.borrow_mut() = coerced;
+        self.set_narrow(if self.ty == VbType::Variant {
+            narrow
+        } else {
+            None
+        });
         Ok(())
     }
 }
@@ -424,18 +512,28 @@ impl VbRecord {
     }
 
     pub fn set(&mut self, name: &str, value: Value) -> Result<(), String> {
+        self.set_with_narrow(name, value, None)
+    }
+
+    /// 写入字段并记下 `Variant` 字段的内容类型。
+    pub fn set_with_narrow(
+        &mut self,
+        name: &str,
+        value: Value,
+        narrow: Option<VbType>,
+    ) -> Result<(), String> {
         let Some(field) = self.fields.iter().find(|field| field.name == name) else {
             return Err(format!("类型 `{}` 没有字段 `{name}`", self.type_name));
         };
-        field.set(value)
+        field.set_with_narrow(value, narrow)
     }
 
-    /// 字段存储单元，供 `ByRef` 实参共享。
-    pub fn field_cell(&self, name: &str) -> Option<(Rc<RefCell<Value>>, VbType)> {
+    /// 字段的声明类型与内容类型（`VarType(u.f)` 用）。
+    pub fn field_types(&self, name: &str) -> Option<(VbType, Option<VbType>)> {
         self.fields
             .iter()
             .find(|field| field.name == name)
-            .map(|field| (field.cell(), field.ty))
+            .map(|field| (field.ty, field.narrow_type()))
     }
 
     /// 按值复制整条记录（VB 的 UDT 赋值语义）。
@@ -461,7 +559,8 @@ impl VbRecord {
 /// VB 的 `Collection`：按插入顺序保存元素，可选字符串键（键大小写不敏感）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct VbCollection {
-    items: Vec<(Option<String>, Value)>,
+    /// (键, 值, `Variant` 内容类型)；`For Each` 与 `VarType(c(1))` 要用最后一项。
+    items: Vec<(Option<String>, Value, Option<VbType>)>,
 }
 
 impl VbCollection {
@@ -473,23 +572,34 @@ impl VbCollection {
         self.items.len()
     }
 
-    pub fn values(&self) -> Vec<Value> {
-        self.items.iter().map(|(_, value)| value.clone()).collect()
+    /// 元素快照 + 每个元素的内容类型（`For Each` 用）。
+    pub fn values_with_types(&self) -> Vec<(Value, Option<VbType>)> {
+        self.items
+            .iter()
+            .map(|(_, value, narrow)| (value.clone(), *narrow))
+            .collect()
     }
 
-    pub fn add(&mut self, value: Value, key: Option<String>) -> Result<(), String> {
+    pub fn add(
+        &mut self,
+        value: Value,
+        key: Option<String>,
+        narrow: Option<VbType>,
+    ) -> Result<(), String> {
         if let Some(key) = &key
             && self.position_of_key(key).is_some()
         {
             return Err(format!("键 `{key}` 已经存在于集合中"));
         }
-        self.items.push((key, value));
+        self.items.push((key, value, narrow));
         Ok(())
     }
 
-    pub fn item(&self, key: &Value) -> Result<Value, String> {
+    /// 元素的值与内容类型（`VarType(c(1))` 用）。
+    pub fn item_with_type(&self, key: &Value) -> Result<(Value, Option<VbType>), String> {
         let position = self.position(key)?;
-        Ok(self.items[position].1.clone())
+        let (_, value, narrow) = &self.items[position];
+        Ok((value.clone(), *narrow))
     }
 
     pub fn remove(&mut self, key: &Value) -> Result<(), String> {
@@ -518,7 +628,7 @@ impl VbCollection {
     }
 
     fn position_of_key(&self, key: &str) -> Option<usize> {
-        self.items.iter().position(|(name, _)| {
+        self.items.iter().position(|(name, _, _)| {
             name.as_deref()
                 .is_some_and(|name| name.eq_ignore_ascii_case(key))
         })
@@ -537,7 +647,8 @@ impl Default for VbCollection {
 /// 大量插入时不会退化成 O(n²)。
 #[derive(Clone, Debug, PartialEq)]
 pub struct VbDictionary {
-    entries: Vec<(String, Value)>,
+    /// (?, ?, `Variant` ????)?`VarType(d(?))` ???????
+    entries: Vec<(String, Value, Option<VbType>)>,
     index: HashMap<String, usize>,
 }
 
@@ -572,25 +683,33 @@ impl VbDictionary {
             .ok_or_else(|| format!("`Dictionary` 里没有键 `{key}`"))
     }
 
-    pub fn set(&mut self, key: String, value: Value) {
+    /// ?????????`VarType(d("k"))` ???
+    pub fn narrow(&self, key: &str) -> Option<VbType> {
+        self.position(key).and_then(|index| self.entries[index].2)
+    }
+
+    pub fn set(&mut self, key: String, value: Value, narrow: Option<VbType>) {
         match self.index.get(&key.to_ascii_lowercase()).copied() {
-            Some(index) => self.entries[index].1 = value,
+            Some(index) => {
+                self.entries[index].1 = value;
+                self.entries[index].2 = narrow;
+            }
             None => {
                 self.index
                     .insert(key.to_ascii_lowercase(), self.entries.len());
-                self.entries.push((key, value));
+                self.entries.push((key, value, narrow));
             }
         }
     }
 
     /// `Add`：键已存在时报错（与 `d(k) = v` 的覆盖语义不同）。
-    pub fn add(&mut self, key: String, value: Value) -> Result<(), String> {
+    pub fn add(&mut self, key: String, value: Value, narrow: Option<VbType>) -> Result<(), String> {
         if self.exists(&key) {
             return Err(format!("`Dictionary` 里已经有键 `{key}`"));
         }
         self.index
             .insert(key.to_ascii_lowercase(), self.entries.len());
-        self.entries.push((key, value));
+        self.entries.push((key, value, narrow));
         Ok(())
     }
 
@@ -601,7 +720,7 @@ impl VbDictionary {
         self.entries.remove(index);
         // 被删元素之后的下标整体前移一位；重建索引表的代价是 O(n)，与 `Vec::remove` 同阶。
         self.index.clear();
-        for (position, (name, _)) in self.entries.iter().enumerate() {
+        for (position, (name, _, _)) in self.entries.iter().enumerate() {
             self.index.insert(name.to_ascii_lowercase(), position);
         }
         Ok(())
@@ -610,14 +729,14 @@ impl VbDictionary {
     pub fn keys(&self) -> Vec<Value> {
         self.entries
             .iter()
-            .map(|(key, _)| Value::Str(key.clone()))
+            .map(|(key, _, _)| Value::Str(key.clone()))
             .collect()
     }
 
     pub fn values(&self) -> Vec<Value> {
         self.entries
             .iter()
-            .map(|(_, value)| value.clone())
+            .map(|(_, value, _)| value.clone())
             .collect()
     }
 
@@ -652,6 +771,8 @@ pub struct InstanceField {
     pub name: String,
     pub cell: Rc<RefCell<Value>>,
     pub ty: VbType,
+    /// `As Variant` 字段里当前值的内容类型（与 `Slot` / `RecordField` 同一套语义）。
+    pub narrow: Rc<std::cell::Cell<Option<VbType>>>,
 }
 
 impl VbInstance {
@@ -685,17 +806,27 @@ impl VbInstance {
         let name = name.into();
         if let Some(existing) = self.fields.iter().find(|field| field.name == name) {
             *existing.cell.borrow_mut() = value;
+            existing.narrow.set(None);
             return;
         }
         self.fields.push(InstanceField {
             name,
             cell: Rc::new(RefCell::new(value)),
             ty,
+            narrow: Rc::new(std::cell::Cell::new(None)),
         });
     }
 
     pub fn field(&self, name: &str) -> Option<InstanceField> {
         self.fields.iter().find(|field| field.name == name).cloned()
+    }
+
+    /// 字段的声明类型与（`Variant` 字段的）内容类型。
+    pub fn field_narrow(&self, name: &str) -> Option<(VbType, Option<VbType>)> {
+        self.fields
+            .iter()
+            .find(|field| field.name == name)
+            .map(|field| (field.ty, field.narrow.get()))
     }
 
     pub fn fields(&self) -> &[InstanceField] {
@@ -750,12 +881,32 @@ pub enum Value {
     Class(ClassRef),
     /// Windows COM Automation 对象。
     ComObject(ComObject),
+    /// `LoadPicture` 的结果。
+    ///
+    /// QIDE 没有图片控件，也没有图像解码，所以只留来源路径与原文件字节：`TypeName` 报
+    /// `Picture`、`VarType` 报 9（对象）、`Is Nothing` 为 `False`（与 VB6 一致）；
+    /// `IPicture` 的成员（`Width`/`Height`/`Handle`…）不支持。
+    Picture(Rc<PictureValue>),
+}
+
+/// `Value::Picture` 的载荷。
+#[derive(Debug, PartialEq)]
+pub struct PictureValue {
+    /// 来源路径（`LoadPicture()` 不带参数时为空串）。
+    pub path: String,
+    /// 文件内容（空串参数时为空）。
+    pub bytes: Vec<u8>,
 }
 
 impl Value {
     /// 用一组值构造 0 基动态数组（`Split` / `Array`）。
     pub fn array(items: Vec<Value>) -> Self {
         Self::Array(Rc::new(RefCell::new(VbArray::from_values(items))))
+    }
+
+    /// `Array(CByte(1), 2)`：连每个元素的静态类型一起记下来（`For Each` / `VarType` 要用）。
+    pub fn array_with_types(items: Vec<(Value, Option<VbType>)>) -> Self {
+        Self::Array(Rc::new(RefCell::new(VbArray::from_typed_values(items))))
     }
 
     /// 按维度与元素类型构造数组。
@@ -825,7 +976,11 @@ impl Value {
     pub fn is_object(&self) -> bool {
         matches!(
             self,
-            Self::Collection(_) | Self::Dictionary(_) | Self::Class(_) | Self::ComObject(_)
+            Self::Collection(_)
+                | Self::Dictionary(_)
+                | Self::Class(_)
+                | Self::ComObject(_)
+                | Self::Picture(_)
         )
     }
 
@@ -870,7 +1025,9 @@ impl Value {
             Self::Dictionary(_) => "Dictionary".into(),
             Self::FuncPtr(_) => "LongPtr".into(),
             Self::Class(instance) => instance.0.borrow().type_name().to_string(),
-            Self::ComObject(_) => "Object".into(),
+            // COM 对象报类型信息里的接口名（VB6 实测 `Dictionary` / `IWshShell3`），取不到时退回 `Object`。
+            Self::ComObject(object) => object.type_name().unwrap_or_else(|| "Object".into()),
+            Self::Picture(_) => "Picture".into(),
         }
     }
 
@@ -908,6 +1065,7 @@ impl Value {
             Self::FuncPtr(_) => true,
             Self::Class(_) => return Err("类型不匹配：对象不能用作条件".into()),
             Self::ComObject(_) => return Err("类型不匹配：对象不能用作条件".into()),
+            Self::Picture(_) => return Err("类型不匹配：对象不能用作条件".into()),
         })
     }
 
@@ -932,6 +1090,7 @@ impl Value {
             Self::FuncPtr(name) => Err(format!("`AddressOf {name}` 只能传给 `Declare` 的指针参数")),
             Self::Class(_) => Err("对象不能转换为数值".into()),
             Self::ComObject(_) => Err("对象不能转换为数值".into()),
+            Self::Picture(_) => Err("对象不能转换为数值".into()),
         }
     }
 
@@ -954,6 +1113,7 @@ impl Value {
             Self::FuncPtr(name) => Err(format!("`AddressOf {name}` 只能传给 `Declare` 的指针参数")),
             Self::Class(_) => Err("对象不能转换为数值".into()),
             Self::ComObject(_) => Err("对象不能转换为数值".into()),
+            Self::Picture(_) => Err("对象不能转换为数值".into()),
         }
     }
 
@@ -968,7 +1128,12 @@ impl Value {
     pub fn is_numeric_like(&self) -> bool {
         match self {
             Self::Int(_) | Self::Float(_) | Self::Currency(_) | Self::Bool(_) | Self::Empty => true,
-            Self::Str(text) => parse_number(text).is_some(),
+            // `IsNumeric("&H10")` 是 True：进制写法整串都要能解析（`IsNumeric("12a")` 是 False）。
+            Self::Str(text) => {
+                let trimmed = text.trim();
+                parse_number(trimmed).is_some()
+                    || parse_radix_text(trimmed).is_some_and(|(_, used)| used == trimmed.len())
+            }
             Self::Null
             | Self::Date(_)
             | Self::Array(_)
@@ -977,7 +1142,8 @@ impl Value {
             | Self::Dictionary(_)
             | Self::FuncPtr(_)
             | Self::Class(_)
-            | Self::ComObject(_) => false,
+            | Self::ComObject(_)
+            | Self::Picture(_) => false,
         }
     }
 
@@ -1023,6 +1189,13 @@ impl Value {
             Self::FuncPtr(name) => format!("AddressOf {name}"),
             Self::Class(instance) => instance.0.borrow().type_name().to_string(),
             Self::ComObject(_) => "COM Object".into(),
+            Self::Picture(picture) => {
+                if picture.path.is_empty() {
+                    "Picture".into()
+                } else {
+                    format!("Picture({})", picture.path)
+                }
+            }
         }
     }
 
@@ -1104,7 +1277,13 @@ impl Value {
             VbType::Double => Value::Float(self.as_float()?),
             VbType::Currency => Value::Currency(self.as_currency()?),
             VbType::Boolean => Value::Bool(self.to_bool()?),
-            VbType::Str => Value::Str(self.to_display()),
+            VbType::Str => {
+                // VB6 实测：`s = 对象` 报 450（对象没有可用的默认属性）。
+                if matches!(self, Self::ComObject(_)) {
+                    return Err("对象没有可用的默认属性，不能转换为字符串".into());
+                }
+                Value::Str(self.to_display())
+            }
         })
     }
 }
@@ -1179,8 +1358,12 @@ pub fn round_half_even(value: f64) -> f64 {
 /// 数字转字符串：整数不带小数点，浮点按 VB6 的 15 位有效数字显示。
 ///
 /// VB6 的 `Debug.Print` / `CStr` 只显示 15 位有效数字，因此 `0.1 + 0.2` 显示 `0.3`
-/// 而不是最短往返表示 `0.30000000000000004`；绝对值 ≥ 1E+15 或 ≤ 1E-04 时改用科学计数法。
+/// 而不是最短往返表示 `0.30000000000000004`；定点写法的**小数位超过 15 位**或**整数位超过 15 位**
+/// 时改用科学计数法（本机 VB6 实测：`CStr(1.5E-14)` 是 `0.000000000000015`、
+/// `CStr(1.23456789012345E-11)` 是 `1.23456789012345E-11`、`CStr(1E+15)` 是 `1E+15`、
+/// `CStr(999900000000000)` 仍是定点）。
 pub fn format_float(value: f64) -> String {
+    const DIGITS: usize = 15;
     if !value.is_finite() {
         return format!("{value}");
     }
@@ -1188,28 +1371,62 @@ pub fn format_float(value: f64) -> String {
         return "0".into();
     }
     let exponent = value.abs().log10().floor();
-    if !(-3.0..15.0).contains(&exponent) {
-        return format_scientific(value);
+    let decimals = (DIGITS as f64 - 1.0 - exponent).max(0.0) as usize;
+    let fixed = trim_float_text(format!("{value:.decimals$}"));
+    let digits_used = fixed
+        .trim_start_matches('-')
+        .strip_prefix("0.")
+        .unwrap_or_else(|| fixed.trim_start_matches('-'))
+        .chars()
+        .filter(char::is_ascii_digit)
+        .count();
+    if digits_used <= DIGITS {
+        return fixed;
     }
-    // 15 位有效数字：整数部分占 (exponent + 1) 位，其余留给小数。
-    let decimals = (14.0 - exponent).max(0.0) as usize;
-    trim_float_text(format!("{value:.decimals$}"))
+    format_scientific_digits(value, DIGITS)
 }
 
-/// 科学计数法（`1.5E+20`、`1E-05`），尾数同样保留 15 位有效数字。
-fn format_scientific(value: f64) -> String {
+/// `Single` 的打印：VB6 实测用 **7 位有效数字**，定点/科学计数法按「定点写法要占多少位」切换
+/// （`CSng(1.23456789)`→`1.234568`、`CSng(0.1)`→`0.1`、`CSng(12345678)`→`1.234568E+07`、
+/// `CSng(0.00001)`→`0.00001`、`CSng(0.000123456789)`→`1.234568E-04`、`CSng(1E+20)`→`1E+20`）。
+pub fn format_single(value: f64) -> String {
+    const DIGITS: usize = 7;
+    if !value.is_finite() {
+        return format!("{value}");
+    }
+    if value == 0.0 {
+        return "0".into();
+    }
+    let exponent = value.abs().log10().floor();
+    let decimals = (DIGITS as f64 - 1.0 - exponent).max(0.0) as usize;
+    let fixed = trim_float_text(format!("{value:.decimals$}"));
+    // 定点写法要占多少位（`0.` 前缀不算）：`0.3333333` 是 7 位、`0.0001234568` 是 10 位。
+    let digits_used = fixed
+        .trim_start_matches('-')
+        .strip_prefix("0.")
+        .unwrap_or_else(|| fixed.trim_start_matches('-'))
+        .chars()
+        .filter(char::is_ascii_digit)
+        .count();
+    if digits_used <= DIGITS {
+        return fixed;
+    }
+    format_scientific_digits(value, DIGITS)
+}
+
+/// 科学计数法（`1.5E+20`、`1E-05`），尾数保留 `digits` 位有效数字。
+fn format_scientific_digits(value: f64, digits: usize) -> String {
     let mut exponent = value.abs().log10().floor() as i32;
     let mut mantissa = value / 10f64.powi(exponent);
     if !mantissa.is_finite() {
-        // 极端次正规数：`10f64.powi` 已经下溢，退回最短表示。
         return format!("{value}");
     }
-    let mut text = format!("{mantissa:.14}");
+    let mut text = format!("{mantissa:.*}", digits - 1);
     // 舍入可能把尾数推到 10，需要进位到下一档指数。
     if text.trim_start_matches('-').starts_with("10") {
         exponent += 1;
         mantissa /= 10.0;
-        text = format!("{mantissa:.14}");
+        text = format!("{mantissa:.*}", digits - 1);
     }
     format!(
         "{}E{}{:02}",
@@ -1239,6 +1456,50 @@ pub fn parse_number(text: &str) -> Option<f64> {
         return None;
     }
     trimmed.parse::<f64>().ok()
+}
+
+/// 解析 `&H`（十六进制）/ `&O`（八进制）形式的数字文本，返回 `(值, 消耗的字节数)`。
+///
+/// `Val`、`IsNumeric` 用；取补码规则与进制字面量一致：装得进 16 位就当 Integer，
+/// 否则按 Long（`&HFFFF` 是 -1、`&HFFFF&` 是 65535、`&H80000000` 是 -2147483648）。
+pub fn parse_radix_text(text: &str) -> Option<(i64, usize)> {
+    let body = text.strip_prefix('&')?;
+    let (radix, digits_at) = match body.as_bytes().first() {
+        Some(b'h' | b'H') => (16u32, 1usize),
+        Some(b'o' | b'O') => (8, 1),
+        _ => (8, 0),
+    };
+    let mut value = 0i64;
+    let mut digits = 0usize;
+    let mut consumed = 1 + digits_at;
+    for ch in body[digits_at..].chars() {
+        let Some(digit) = ch.to_digit(radix) else {
+            break;
+        };
+        value = value
+            .saturating_mul(i64::from(radix))
+            .saturating_add(i64::from(digit));
+        digits += 1;
+        consumed += ch.len_utf8();
+    }
+    if digits == 0 {
+        return None;
+    }
+    // `&HFFFF&` 末尾的 `&` 表示按 Long 处理（值不变）。
+    let long_suffix = body[consumed - 1..].starts_with('&');
+    if long_suffix {
+        consumed += 1;
+    }
+    let digit_limit = if radix == 16 { 4 } else { 6 };
+    let value = if long_suffix || digits > digit_limit {
+        match u32::try_from(value) {
+            Ok(narrow) => i64::from(narrow as i32),
+            Err(_) => value,
+        }
+    } else {
+        i64::from(value as u16 as i16)
+    };
+    Some((value, consumed))
 }
 
 #[cfg(test)]

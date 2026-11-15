@@ -206,6 +206,11 @@ pub const COMMANDS: &[Command] = &[
         label: "清除所有断点",
         shortcut: "Ctrl+Shift+F9",
     },
+    Command {
+        id: "help.shortcuts",
+        label: "快捷键一览",
+        shortcut: "F1",
+    },
 ];
 
 /// 按输入的文字找最匹配的命令；空输入或不匹配返回 `None`。

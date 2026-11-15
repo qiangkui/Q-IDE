@@ -568,16 +568,21 @@ pub fn tokenize_mapped(source: &str, lines: &[usize]) -> Result<Vec<Token>, Pars
                 }
             }
             '&' if matches!(chars.get(index + 1), Some('h' | 'H' | 'o' | 'O')) => {
-                let (value, next) = scan_radix_number(&chars, index, line)?;
-                tokens.push(Token::new(TokenKind::Int(value), line));
+                let (value, suffix, next) = scan_radix_number(&chars, index, line)?;
+                tokens.push(Token::with_suffix(
+                    TokenKind::Int(value),
+                    line,
+                    String::new(),
+                    suffix,
+                ));
                 index = next;
                 at_statement_start = false;
             }
             c if c.is_ascii_digit()
                 || (c == '.' && matches!(chars.get(index + 1), Some(d) if d.is_ascii_digit())) =>
             {
-                let (kind, next) = scan_number(&chars, index, line)?;
-                tokens.push(Token::new(kind, line));
+                let (kind, suffix, next) = scan_number(&chars, index, line)?;
+                tokens.push(Token::with_suffix(kind, line, String::new(), suffix));
                 index = next;
                 at_statement_start = false;
             }
@@ -698,7 +703,7 @@ fn scan_radix_number(
     chars: &[char],
     start: usize,
     line: usize,
-) -> Result<(i64, usize), ParseError> {
+) -> Result<(i64, Option<char>, usize), ParseError> {
     let radix = if matches!(chars[start + 1], 'h' | 'H') {
         16
     } else {
@@ -714,19 +719,39 @@ fn scan_radix_number(
         return Err(ParseError::new("进制字面量缺少数字", line));
     }
     // `&HFFFF&`：进制字面量后面可以跟类型后缀（`%`/`&`/`!`/`#`/`@`），值不变。
-    if matches!(chars.get(index), Some('%' | '&' | '!' | '#' | '@')) {
-        index += 1;
-    }
+    let suffix = match chars.get(index) {
+        Some(&suffix @ ('%' | '&' | '!' | '#' | '@')) => {
+            index += 1;
+            Some(suffix)
+        }
+        _ => None,
+    };
     let value = i64::from_str_radix(&digits, radix)
         .map_err(|_| ParseError::new(format!("无法解析数字 `{digits}`"), line))?;
-    Ok((value, index))
+    // VB6 实测：进制字面量按「装得下它的最小整数宽度」取补码——`&HFFFF` 是 Integer 的 -1、
+    // `&H8000` 是 -32768、`&O177777` 也是 -1；带 `&` 后缀或位数超过 16 位时按 Long
+    // （`&HFFFF&` 是 65535、`&HFFFFFFFF` 与 `&HFFFFFFFF&` 都是 -1、`&H80000000` 是 -2147483648）。
+    let long_suffix = matches!(suffix, Some('&' | '!' | '#'));
+    let digit_limit = if radix == 16 { 4 } else { 6 };
+    let mut suffix = suffix;
+    let value = if long_suffix || digits.len() > digit_limit {
+        // 超过 16 位的字面量按 Long 记类型（`&HFFFFFFFF` 的 `VarType` 是 3，不像值那样能看出来）。
+        suffix = suffix.or(Some('&'));
+        match u32::try_from(value) {
+            Ok(narrow) => i64::from(narrow as i32),
+            Err(_) => value,
+        }
+    } else {
+        i64::from(value as u16 as i16)
+    };
+    Ok((value, suffix, index))
 }
 
 fn scan_number(
     chars: &[char],
     start: usize,
     line: usize,
-) -> Result<(TokenKind, usize), ParseError> {
+) -> Result<(TokenKind, Option<char>, usize), ParseError> {
     let mut index = start;
     let mut text = String::new();
     let mut is_float = false;
@@ -781,25 +806,25 @@ fn scan_number(
         let scaled = crate::interpreter::value::currency_from_float(value).map_err(|message| {
             ParseError::new(format!("Currency 字面量 `{text}`：{message}"), line)
         })?;
-        return Ok((TokenKind::Currency(scaled), index));
+        return Ok((TokenKind::Currency(scaled), suffix, index));
     }
     if matches!(suffix, Some('!' | '#')) {
         let value: f64 = text
             .parse()
             .map_err(|_| ParseError::new(format!("无法解析数字 `{text}`"), line))?;
-        return Ok((TokenKind::Float(value), index));
+        return Ok((TokenKind::Float(value), suffix, index));
     }
 
     if is_float {
         let value: f64 = text
             .parse()
             .map_err(|_| ParseError::new(format!("无法解析数字 `{text}`"), line))?;
-        Ok((TokenKind::Float(value), index))
+        Ok((TokenKind::Float(value), None, index))
     } else {
         let value: i64 = text
             .parse()
             .map_err(|_| ParseError::new(format!("整数 `{text}` 超出范围"), line))?;
-        Ok((TokenKind::Int(value), index))
+        Ok((TokenKind::Int(value), suffix, index))
     }
 }
 

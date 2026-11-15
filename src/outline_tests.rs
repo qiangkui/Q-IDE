@@ -303,3 +303,27 @@ fn goto_target_parses_line_numbers_and_names() {
     assert_eq!(goto_target("0"), None, "行号从 1 开始");
     assert_eq!(goto_target("   "), None);
 }
+
+#[test]
+fn property_accessors_keep_their_own_kind_in_the_outline() {
+    let model = OutlineModel::from_source(
+        "Class Box\n\
+         Public Property Get Size() As Long\n\
+         Size = 1\n\
+         End Property\n\
+         Public Property Let Caption(value As String)\n\
+         End Property\n\
+         Public Property Set Picture(obj As Object)\n\
+         End Property\n\
+         End Class\n",
+    );
+
+    let kinds: Vec<&str> = model
+        .procedures
+        .iter()
+        .map(|symbol| symbol.detail.split(" ·").next().unwrap_or_default())
+        .collect();
+    assert!(kinds.contains(&"Property Get"), "{kinds:?}");
+    assert!(kinds.contains(&"Property Let"), "{kinds:?}");
+    assert!(kinds.contains(&"Property Set"), "{kinds:?}");
+}

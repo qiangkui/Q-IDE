@@ -21,21 +21,22 @@
 - 多标签：每个标签独立保留光标、选区、滚动位置、折叠与撤销历史；标签右键菜单支持关闭其它/关闭右侧/关闭全部/复制路径。
 - 语法高亮：Visual Basic（`.vb` `.vbs` `.bas` `.cls` `.frm`）、Rust（`.rs`）、JSON，其它文件按纯文本。
 - 括号配对高亮（自定义实现），行号栏显示断点圆点，调试暂停行整行淡黄高亮。
-- 编辑增强：上移行（`Alt+↑`）/ 下移行（`Alt+↓`）/ 切换注释（`Ctrl+/`）/ `Tab`、`Shift+Tab` 缩进 / 回车自动缩进 / 自动闭合括号。
+- 编辑增强：上移行（`Alt+↑`）/ 下移行（`Alt+↓`）/ 切换注释（`Ctrl+/`）/ `Tab`、`Shift+Tab` 缩进（VB 文件一级 4 个空格，其它语言用组件默认 2 个）/ 回车自动缩进（VB 下 `Sub`、`If ... Then`、`For`、`Do`、`With`、`Select Case`、`Case`、`Else`、`Type`、`Class`、`Property` 等块关键字会自动多缩进一级）/ 自动闭合括号。
 - 编辑器内嵌查找与替换面板（`Ctrl+F` / `Ctrl+H`），标签下方固定一行显示当前文件的完整路径。
-- 编码：自动探测 UTF-8 / UTF-16LE / UTF-16BE / GBK（有 BOM 优先），保存时按原编码写回，状态栏显示当前编码。
+- 编码：自动探测 UTF-8 / UTF-16LE / UTF-16BE / GBK（有 BOM 优先），保存时按原编码写回，状态栏显示当前编码；**点击状态栏的编码**会在文字上方弹出编码列表，选一种即按它重新解码当前文件（有未保存修改时先确认），**另存为**时可指定编码与换行符（保持原样 / CRLF / LF）。
 - 自动保存：在设置里开启并设置间隔（5–600 秒，默认关闭），按原编码写回，不移动光标、不打断输入。
 - 外部修改检测：每秒比对文件修改时间；没有未保存修改时静默重新加载，有修改时弹窗询问。
 - 会话恢复：退出时记住打开的标签、激活文件、窗口位置大小、Dock 布局与所有设置。
 
 ### 工作区
 
-- 资源管理器：多根目录、新建文件/文件夹、重命名、删除、复制路径、刷新；条目可拖到文件夹里移动，也可拖到标签栏直接打开。根目录之外的条目左侧有灰色小圆点，点圆点进入选择模式（圆点变成更大的圆圈，选中项在圆圈中心显示实心点）：点条目只切换选中、不再打开文件，可批量删除选中项或拖动移动；根目录不参与选择，全部取消选中后自动退出选择模式。右键条目只会高亮该条目、不会打开文件，菜单里的「删除…」作用于右键指向的条目；批量删除用选择模式标题栏的删除按钮。
+- 资源管理器：多根目录、新建文件/文件夹、重命名、删除、复制路径、刷新；条目可拖到文件夹里移动，也可拖到标签栏直接打开。**把条目拖出窗口外再松开 = 复制该路径**（并在输出面板记一行）。根目录之外的条目左侧有灰色小圆点，点圆点进入选择模式（圆点变成更大的圆圈，选中项在圆圈中心显示实心点）：点条目只切换选中、不再打开文件，可批量删除选中项或拖动移动；根目录不参与选择，全部取消选中后自动退出选择模式。右键条目只会高亮该条目、不会打开文件，菜单里的「删除…」作用于右键指向的条目；批量删除用选择模式标题栏的删除按钮。
 - 项目内搜索（`Ctrl+Shift+F`）：大小写敏感、全词匹配、限定目录，后台线程扫描并实时显示进度；结果按文件分组、命中片段高亮，点击跳转。
 - 跨文件替换：只作用于本次搜索结果里的文件，沿用本次搜索的匹配选项。
 - 代码大纲：符号按模块/过程/类分组、可折叠、带过滤框；另有「断点」「监视」两节，调试暂停时显示变量值与类型。
 - 跳转：转到定义（`F12`）、查找引用（`Shift+F12`）、转到行/符号（`Ctrl+G`）、转到文件（`Ctrl+P`，按文件名或路径模糊匹配）。
-- 命令面板（`Ctrl+Shift+P`）：38 条命令，模糊匹配、回车执行，结果写进输出面板。
+- 命令面板（`Ctrl+Shift+P`）：39 条命令，模糊匹配、回车执行，结果写进输出面板。
+- 快捷键一览（`F1`，帮助菜单里也有）：按文件 / 编辑 / 标签 / 跳转 / 视图 / 运行调试 / 帮助 / 对话框 / 鼠标操作分区列出全部快捷键，内容与 `docs/快捷键.md` 一致。
 - Dock 布局：编辑器居中、输出固定底部；左右两侧各最多放一个面板（资源管理器/代码大纲/搜索/AI 编程）。打开面板时，它偏好的那一侧空着就放那里，否则借用另一侧的空位，两侧都占满时替换偏好侧的面板；拖到已占用的一侧会关闭原面板。完整布局写入布局文件。
 - 主题：设置窗口「主题」页选择内置深色 / 浅色（只读）、已保存的自定义主题或「新建主题」；自定义主题可改名、改颜色（取色器或手填十六进制），改动直接替换同名主题并写入 `themes.txt`。设置窗口按分类分页（布局 / 主题 / 排版 / 保存 / 语法分析器 / 输出 / AI），点左侧导航直接切换。
 - AI 设置：设置窗口「AI」页里先是 **DeepSeek** 分组（以后接入其它模型时按模型分组），组内填 API 密钥、接口地址（默认 `https://api.deepseek.com`）与模型（默认 `deepseek-chat`）。密钥一行是「标签在前、输入框在后」，内容始终遮罩，只存进 Windows 凭据管理器，不写进 `layout.txt`；清空输入或点「清除」即删除。「外部 agent（MCP）」分组可开关接口、允许写入/删除/移动、危险操作跳过确认、允许运行脚本和调试与调用日志。
@@ -87,15 +88,16 @@ Q-IDE 启动后会在本机回环地址（`127.0.0.1`）开一个带随机 token
 
 完整清单见 [docs/脚本语言.md](docs/脚本语言.md)，要点：
 
-- 声明与作用域：`Dim` / `Static` / `Const` / `Public` / `Private`，`Option Explicit` / `Option Base` / `Option Compare`；`#Include "文件.vb"` 引入公共结构体 / 常量 / API 声明（Q-IDE 扩展；先查脚本目录，再查 exe 同级 `assets/`）。
+- 声明与作用域：`Dim` / `Static` / `Const` / `Public` / `Private`，`Option Explicit` / `Option Base` / `Option Compare`；`#Include "文件.vb"` 引入公共结构体 / 常量 / API 声明（Q-IDE 扩展；先查脚本目录，再查 exe 同级 `assets/`）。`As 类型名` 与 `Implements 接口名` 支持前向引用（`Type` / `Enum` / `Class` 写在使用点之后也行）。
 - 过程：`Sub` / `Function` / `Optional` 默认值 / `ParamArray` / 模块级与类内 `Property Get|Let|Set`。
 - 控制流：`If` / `For` / `For Each` / `Do ... Loop` / `While ... Wend` / `Select Case` / `Exit` / `GoTo` 与标签 / `Stop`。
 - 数据结构：多维数组与 `{1, 2, 3}` 数组字面量、`ReDim Preserve`、`Erase`、`Type ... End Type` 记录、`Enum`、`With`。
 - 对象：`Collection`、`Dictionary`、自定义 `Class`（构造函数 / 析构、字段、方法、属性、`WithEvents` + `RaiseEvent` 事件）。
-- 错误处理：`On Error Resume Next` / `On Error GoTo` / `Resume`、`Err.Number|Description|Source`、`Err.Raise`。
+- 接口：`Implements 接口类` + 私有 `接口名_成员名` 实现；实时检查会报漏实现、多写的成员与签名不一致（过程形式、参数个数 / 类型 / `ByRef`-`ByVal` / 数组 / `Optional` 与默认值、返回类型；参数名可以不同）。
+- 错误处理：`On Error Resume Next` / `On Error GoTo 标签` / `On Error GoTo 0` / `On Error GoTo -1` / `Resume`、`Err.Number|Description|Source`、`Err.Raise`、`Err.Clear`、`Error n` 语句（执行任何 `On Error` 语句都会清空 `Err`，与 VB6 一致；默认描述取 VB6 运行时错误表）。
 - 文件 I/O：`Open ... For Input|Output|Append|Binary|Random`、`Print #`、`Write #`、`Line Input #`、`Input #`、`Get #`/`Put #`、`Seek #`、`Lock`/`Unlock`、`EOF`/`LOF`/`Loc`/`FreeFile`。
 - Win32：`Declare ... Lib "user32"`（`ByVal`/`ByRef` 结构体、整数与浮点参数），`AddressOf` 把 VB 过程当回调传给 API（同步回调）。
-- 90 多个内置函数：字符串、数值、类型转换、日期、文件系统、`Shell` / `Command` / `MsgBox` / `InputBox` 等。
+- 90 多个内置函数：字符串、数值、类型转换、日期、文件系统、`Shell` / `Command` / `MsgBox` / `InputBox` 等；`Format` 支持数值/日期命名格式（含 7 种日期命名格式，输出不随区域设置变化）。
 
 ### 主程序命令行（`first.exe`）
 
@@ -232,7 +234,8 @@ Debug.Print "名字个数：" & names.Count
 | `src/ai/tools.rs` | 工具层：工具清单（JSON Schema）+ 把一次调用算成只读结果或待写入文件（路径限制在项目内） |
 | `src/ai/panel.rs` | AI 编程面板（GPUI）：对话气泡、工具活动、写入确认、代码块折叠/展开/复制、流式追加、输入框、关闭与拖动 |
 | `src/editor_pane.rs` | 编辑区面板：标签栏、路径栏、编辑器右键菜单 |
-| `src/explorer.rs` | 资源管理器模型：根目录、展开状态、拖拽、重命名/删除；圆点触发的选择模式与多选状态 |
+| `src/explorer.rs` | 资源管理器模型：根目录、展开状态、拖拽（含拖出窗口复制路径的状态机）、重命名/删除；圆点触发的选择模式与多选状态 |
+| `src/indent.rs` | VB 块级自动缩进规则（正则，装进编辑器的 `LanguageConfig`，有单测） |
 | `src/outline.rs` | 代码大纲、符号解析、转到定义 / 查找引用 |
 | `src/search.rs` | 项目内搜索与跨文件替换的纯逻辑 |
 | `src/layout.rs` | `layout.txt` 的读写与版本迁移 |
@@ -240,6 +243,7 @@ Debug.Print "名字个数：" & names.Count
 | `src/settings/` | 设置模型（`SettingsStore`）与设置窗口（含「AI」页） |
 | `src/secret_store.rs` | API Key 存取：Windows 凭据管理器（不进任何文本文件） |
 | `src/menu.rs` / `src/title_bar.rs` / `src/window_frame.rs` | 顶部菜单、自绘标题栏、窗口外框 |
+| `src/shortcuts.rs` | 帮助菜单「快捷键一览」的分区数据（与 `docs/快捷键.md` 一致，测试校验与命令面板没有出入） |
 | `src/theme.rs` | 内置深/浅配色、自定义主题解析结果与尺寸常量 |
 | `src/*_tests.rs` | crate 级测试文件（在 `src/main.rs` 里用 `#[cfg(test)] mod ...;` 引入） |
 | `assets/`、`app.rc`、`run.rc`、`build.rs` | 图标：`first.exe` 用深蓝的 `app.ico`，`qide-run.exe` 用浅绿的 `run.ico` |
@@ -261,7 +265,7 @@ Debug.Print "名字个数：" & names.Count
 | 文档 | 内容 |
 | --- | --- |
 | [docs/脚本语言.md](docs/脚本语言.md) | VB6/VBA 子集参考：词法、类型、语句、内置函数、Win32 调用、限制 |
-| [docs/快捷键.md](docs/快捷键.md) | 全部快捷键、菜单结构、命令面板 37 条命令 |
+| [docs/快捷键.md](docs/快捷键.md) | 全部快捷键、菜单结构、命令面板 39 条命令 |
 | [docs/架构.md](docs/架构.md) | 模块职责、运行/调试数据流、持久化格式、测试与开发约定 |
 | [ROADMAP.md](ROADMAP.md) | 已完成功能清单、坑位备忘、后续计划 |
 | [.github/copilot-instructions.md](.github/copilot-instructions.md) | 协作约定（验证分工、编码约束、环境注意） |
@@ -270,7 +274,7 @@ Debug.Print "名字个数：" & names.Count
 
 ```powershell
 cargo build              # 通过：first.exe（界面）+ qide-run.exe（命令行）
-cargo test               # 通过：界面 crate 520 条 + qide-run crate 170 条（含解释器自带测试）
+cargo test               # 通过：界面 crate 583 条 + qide-run 175 条（含解释器自带测试）+ qide-mcp 2 条
 cargo clippy --all-targets
 ```
 
@@ -286,7 +290,7 @@ cargo clippy --all-targets
 - 解释器支持基础 COM Automation（`CreateObject`、活动对象/新对象/moniker `GetObject`、文件和 ProgID `GetObject`、位置/命名参数方法与属性读写）；命名参数要求 COM 组件通过 `IDispatch` 暴露形参名，可写标量/字符串变量按 `ByRef VARIANT` 传递，一维 Variant 数组按值转换为 `SAFEARRAY`；多维/强类型数组、UDT 记录封送、COM 事件及 `Implements` 尚不支持。文件中的 `GetObject` 依赖已注册且支持 `IPersistFile` 的类。`Currency` 使用四位小数定点数；`Date` 是独立类型，内部以 OLE Automation `Double` 序列存储。
 - Win32 调用最多支持 64 个标量参数；结构体里的变长 `String` 仍不支持。
 - `AddressOf` 回调最多支持 64 个参数，需在脚本仍运行的同一线程执行；其他线程的回调会返回默认值。可在 API 调用返回后由脚本持有回调指针，但脚本结束后不会再进入解释器，数组形参因原生指针不包含长度/边界信息而不支持。
-- 资源管理器多选通过条目左侧圆点进入（根目录不可选中）；选择模式下只支持删除选中项和拖动移动，不提供批量重命名等其它操作。
+- 资源管理器多选通过条目左侧圆点进入（根目录不可选中）；选择模式下只支持删除选中项和拖动移动，不提供批量重命名等其它操作。拖出窗口只复制路径（Windows 后端不支持把拖动交给系统，所以不是「拖出成文件」）。
 
 ## 声明
 

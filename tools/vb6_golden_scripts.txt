@@ -725,3 +725,309 @@ parts = Split("a,b,c", ",")
 Debug.Print UBound(parts)
 Debug.Print Join(parts, "|")
 Debug.Print parts(1)
+
+=== on_error_goto_minus_one
+On Error Resume Next
+Dim x As Long
+x = 1 / 0
+Debug.Print Err.Number
+On Error GoTo -1
+Debug.Print Err.Number
+On Error Resume Next
+x = 1 / 0
+Debug.Print Err.Number
+
+=== any_on_error_statement_clears_err
+On Error Resume Next
+Dim x As Long
+x = 1 / 0
+Debug.Print Err.Number
+Debug.Print Err.Number
+On Error Resume Next
+Debug.Print Err.Number
+x = 1 / 0
+Debug.Print Err.Number
+On Error GoTo 0
+Debug.Print Err.Number
+
+=== dictionary_for_each_keys
+Dim d As New Dictionary
+d.Add "a", 10
+d.Add "b", 20
+Dim k As Variant
+Dim names As String
+For Each k In d
+    names = names & k
+Next
+Debug.Print names
+Dim total As Long
+For Each k In d
+    total = total + d(k)
+Next
+Debug.Print total
+
+=== binary_string_put_get
+Dim g As Integer
+Dim s As String, t As String
+Dim path As String
+path = Environ("TEMP") & "\qide_golden_bin.dat"
+s = "AB"
+g = FreeFile
+Open path For Binary As #g
+Put #g, , s
+Put #g, , "CD"
+Put #g, , ""
+Debug.Print LOF(g)
+Close #g
+Open path For Binary As #g
+t = "ABCD"
+Get #g, 1, t
+Debug.Print t
+t = ""
+Get #g, , t
+Debug.Print Len(t)
+Close #g
+Kill path
+
+=== variant_content_types
+Dim i As Integer, v As Variant
+Dim x
+i = 1
+v = i
+Debug.Print VarType(v) & " " & TypeName(v)
+v = CByte(1)
+Debug.Print VarType(v)
+v = True
+Debug.Print VarType(v)
+v = CCur(1)
+Debug.Print VarType(v)
+v = CDate(1)
+Debug.Print VarType(v)
+v = i
+Debug.Print VarType(v + 1) & " " & VarType(v * 2)
+v = "x"
+Debug.Print VarType(v) & " " & TypeName(v)
+v = Null
+Debug.Print VarType(v)
+v = Empty
+Debug.Print VarType(v)
+x = 5
+Debug.Print VarType(x) & " " & TypeName(x)
+x = 40000
+Debug.Print VarType(x)
+x = 1.5
+Debug.Print VarType(x)
+
+=== for_each_variant_element_types
+Dim ai(1 To 2) As Integer
+Dim al(1 To 2) As Long
+Dim ad(1 To 2) As Double
+Dim at(1 To 2) As String
+Dim ab(1 To 2) As Byte
+Dim v As Variant
+ai(1) = 1
+al(1) = 40000
+ad(1) = 1.5
+at(1) = "x"
+ab(1) = 9
+For Each v In ai
+    Debug.Print VarType(v) & " " & TypeName(v)
+Next
+For Each v In al
+    Debug.Print VarType(v)
+Next
+For Each v In ad
+    Debug.Print VarType(v)
+Next
+For Each v In at
+    Debug.Print VarType(v) & " " & TypeName(v)
+Next
+For Each v In ab
+    Debug.Print VarType(v)
+Next
+
+=== single_printing
+Dim s As Single
+Debug.Print "1=[" & CSng(1.23456789) & "]"
+Debug.Print "2=[" & CSng(0.1) & "]"
+Debug.Print "3=[" & CSng(12345678) & "]"
+Debug.Print "4=[" & CSng(0.00001) & "]"
+Debug.Print "5=[" & CSng(1234567) & "]"
+Debug.Print "6=[" & CSng(1.5) & "]"
+Debug.Print "7=[" & CSng(0.000123456789) & "]"
+Debug.Print "8=[" & CSng(123456.789) & "]"
+s = 1 / 3
+Debug.Print "9=[" & s & "]"
+Debug.Print "10=[" & CSng(-1.23456789) & "]"
+Debug.Print "11=[" & CSng(100000) & "]"
+Debug.Print "12=[" & CSng(1E+20) & "]"
+Debug.Print "13=[" & CStr(CSng(1.23456789)) & "]"
+Debug.Print "14=[" & CStr(CSng(0.5)) & "]"
+Debug.Print "15=[" & Str(CSng(0.5)) & "]"
+Debug.Print "16=[" & Str(CSng(1.23456789)) & "]"
+Debug.Print "17=[" & Str(CSng(-1.23456789)) & "]"
+s = 0.1
+Debug.Print "18=[" & CStr(s) & "]"
+Debug.Print "19=[" & s & "]"
+Debug.Print "20=[" & Str(s) & "]"
+Debug.Print "21=[" & Format(CSng(1.23456789), "0.000") & "]"
+
+=== vartype_of_declared_variables
+Dim i As Integer, b As Byte, s As Single, l As Long, c As Currency
+Dim dt As Date, flag As Boolean, text As String, v As Variant
+Dim arr(2) As Integer
+Debug.Print VarType(i) & " " & TypeName(i)
+Debug.Print VarType(b) & " " & TypeName(b)
+Debug.Print VarType(s) & " " & TypeName(s)
+Debug.Print VarType(l) & " " & TypeName(l)
+Debug.Print VarType(c) & " " & TypeName(c)
+Debug.Print VarType(dt) & " " & TypeName(dt)
+Debug.Print VarType(flag) & " " & TypeName(flag)
+Debug.Print VarType(text) & " " & TypeName(text)
+Debug.Print VarType(arr) & " " & TypeName(arr)
+Debug.Print VarType(v) & " " & TypeName(v)
+
+=== error_statement_and_error_text
+On Error Resume Next
+Error 5
+Debug.Print Err.Number
+Debug.Print Err.Description
+Err.Clear
+Error 40080
+Debug.Print Err.Number
+Debug.Print Err.Description
+Err.Clear
+Debug.Print Error(5)
+Debug.Print Error$(5)
+Debug.Print Error(40080)
+Debug.Print Len(Error(0))
+
+=== narrow_value_types
+Dim s As Single
+s = CSng(1.23456789)
+Debug.Print s
+Dim v As Variant
+v = CSng(1.23456789)
+Debug.Print v
+Debug.Print VarType(v)
+Debug.Print TypeName(v)
+Dim b As Byte
+b = 200
+On Error Resume Next
+Dim total
+total = b + b
+Debug.Print Err.Number
+On Error GoTo 0
+Dim items
+items = Array(CByte(1), 2)
+Dim item
+For Each item In items
+    Debug.Print VarType(item)
+Next
+Dim picked(1)
+picked(0) = CByte(9)
+Debug.Print VarType(picked(0))
+Dim c As Collection
+Set c = New Collection
+c.Add CByte(7)
+For Each item In c
+    Debug.Print VarType(item)
+Next
+Dim dic As New Dictionary
+dic("k") = CByte(1)
+Debug.Print VarType(dic("k"))
+dic.Add "k2", CSng(1.5)
+Debug.Print VarType(dic("k2"))
+Dim v2
+v2 = dic("k2")
+Debug.Print VarType(v2)
+
+=== new_builtins
+On Error Resume Next
+Err.Clear
+Dim x As Long
+x = RGB(-1, 2, 3)
+Debug.Print Err.Number
+x = QBColor(16)
+Debug.Print Err.Number
+On Error GoTo 0
+Debug.Print RGB(1, 2, 3)
+Debug.Print RGB(255, 255, 255)
+Debug.Print RGB(256, 0, 0)
+Debug.Print RGB(300, 258, 3)
+Debug.Print QBColor(0)
+Debug.Print QBColor(1)
+Debug.Print QBColor(7)
+Debug.Print QBColor(15)
+Debug.Print FormatNumber(1234.5678)
+Debug.Print FormatNumber(1234.5678, 1)
+Debug.Print FormatNumber(-1234.5)
+Debug.Print FormatNumber(1234.5, 0, vbTrue, vbTrue, vbFalse)
+Debug.Print FormatNumber(1234.5, 2, vbTrue, vbTrue)
+Debug.Print FormatNumber(0.5, 2, vbFalse)
+Debug.Print FormatCurrency(1234.5)
+Debug.Print FormatCurrency(1234.5, 0)
+Debug.Print FormatCurrency(-1234.5, 2, vbTrue, vbTrue)
+Debug.Print FormatPercent(0.5)
+Debug.Print FormatPercent(0.5, 1)
+Debug.Print FormatPercent(-0.5, 0)
+Debug.Print FormatDateTime(#2024-02-29 13:05:06#)
+Debug.Print FormatDateTime(#2024-02-29 13:05:06#, 1)
+Debug.Print FormatDateTime(#2024-02-29 13:05:06#, 2)
+Debug.Print FormatDateTime(#2024-02-29 13:05:06#, 3)
+Debug.Print FormatDateTime(#2024-02-29 13:05:06#, 4)
+Debug.Print "a"; Spc(3); "b"
+Debug.Print "a"; Tab(10); "b"
+Debug.Print Tab(3); "x"
+Debug.Print Tab(1); "y"
+Debug.Print "abc"; Tab(2); "z"
+SaveSetting "qide-golden", "section", "key", "value"
+Debug.Print GetSetting("qide-golden", "section", "key")
+Debug.Print GetSetting("qide-golden", "section", "missing", "def")
+Debug.Print "[" & GetSetting("qide-golden", "nosuch", "key") & "]"
+DeleteSetting "qide-golden", "section", "key"
+Debug.Print "[" & GetSetting("qide-golden", "section", "key") & "]"
+Debug.Print VarType(vbTrue)
+Debug.Print TypeName(vbTrue)
+Debug.Print Len(vbCrLf)
+Debug.Print vbCrLf = Chr(13) & Chr(10)
+Debug.Print vbYesNo
+Debug.Print vbOKOnly
+Debug.Print vbObjectError
+
+=== null_argument_rules
+' `Null` 走 `Variant` 形参的函数要原样返回 `Null`，非 `Variant` 形参的函数报 94（本机 VB6 实测）
+Dim v As Variant
+v = Trim(Null)
+Debug.Print IsNull(v)
+v = LTrim(Null)
+Debug.Print IsNull(v)
+v = RTrim(Null)
+Debug.Print IsNull(v)
+v = UCase(Null)
+Debug.Print IsNull(v)
+v = LCase(Null)
+Debug.Print IsNull(v)
+v = Left(Null, 2)
+Debug.Print IsNull(v)
+v = Right(Null, 2)
+Debug.Print IsNull(v)
+v = Mid(Null, 1, 2)
+Debug.Print IsNull(v)
+v = Len(Null)
+Debug.Print IsNull(v)
+v = LenB(Null)
+Debug.Print IsNull(v)
+v = String(3, Null)
+Debug.Print IsNull(v)
+v = InStr(Null, "a")
+Debug.Print IsNull(v)
+v = InStr("a", Null)
+Debug.Print IsNull(v)
+' 不传播、返回空串或非 Null 的
+v = Format(Null, "0")
+Debug.Print "[" & v & "]", IsNull(v)
+v = IsNull(Null)
+Debug.Print v
+v = IsNumeric(Null)
+Debug.Print v

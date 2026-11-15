@@ -18,6 +18,8 @@ anyhow = "1"
 encoding_rs = "0.8"
 # Dock 布局的序列化（DockAreaState 实现了 Serialize/Deserialize）。
 serde_json = "1"
+# VB 块级缩进规则：语言配置要求 `regex::Regex`（与 gpui-base 同一版本）。
+regex = "1"
 
 [patch.crates-io]
 # 上游补全菜单将类型标签样式写死；本地补丁用于缩小字号并取消斜体。

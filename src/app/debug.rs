@@ -1,7 +1,7 @@
 //! 脚本运行、调试会话与监视表达式。
 
-use super::*;
 use super::dialogs::*;
+use super::*;
 
 impl CodeWindow {
     /// 当前脚本在磁盘上的路径：相对路径按它所在目录解析，`App.Path` 也用这个目录。
@@ -204,8 +204,7 @@ impl CodeWindow {
                                     session.watch_request = None;
                                     if state.0 {
                                         // 每次暂停都重新求值：变量可能已经变了。
-                                        session.watch_queue =
-                                            (0..this.watches.len()).collect();
+                                        session.watch_queue = (0..this.watches.len()).collect();
                                         this.watch_states =
                                             vec![WatchState::Pending; this.watches.len()];
                                     } else {
@@ -488,8 +487,10 @@ impl CodeWindow {
         self.pump_watch_requests();
         self.save_layout(cx);
         self.sync_outline_panel(cx);
-        self.output()
-            .command(cx, format!("> 添加监视：{expression}（显示在「代码大纲」面板）"));
+        self.output().command(
+            cx,
+            format!("> 添加监视：{expression}（显示在「代码大纲」面板）"),
+        );
         cx.notify();
     }
 
@@ -637,19 +638,23 @@ impl CodeWindow {
         output.command(cx, "> 语法检查");
 
         let editor = self.editor.clone();
-        let analysis = crate::lint::analyze_with_path(&source, self.active_script_path().as_deref());
+        let analysis =
+            crate::lint::analyze_with_path(&source, self.active_script_path().as_deref());
         if analysis.issues.is_empty() {
             editor.update(cx, crate::lint::clear);
             self.checked_source = Some(source);
             self.error_count = 0;
-            let stats = analysis.program.as_ref().map_or_else(String::new, |program| {
-                format!(
-                    "检查通过：{} 个过程 / {} 个 API 声明 / {} 条主语句",
-                    program.procedures.len(),
-                    program.declares.len(),
-                    program.main.len()
-                )
-            });
+            let stats = analysis
+                .program
+                .as_ref()
+                .map_or_else(String::new, |program| {
+                    format!(
+                        "检查通过：{} 个过程 / {} 个 API 声明 / {} 条主语句",
+                        program.procedures.len(),
+                        program.declares.len(),
+                        program.main.len()
+                    )
+                });
             output.success(cx, stats);
             return;
         }

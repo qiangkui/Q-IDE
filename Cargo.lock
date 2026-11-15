@@ -1571,6 +1571,7 @@ dependencies = [
  "gpui-pre",
  "lsp-types",
  "raw-window-handle",
+ "regex",
  "serde_json",
  "tree-sitter",
 ]

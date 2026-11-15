@@ -544,6 +544,42 @@ impl ExplorerPanel {
         cx.notify();
     }
 
+    /// `Ctrl+点击` / `Shift+点击` 条目：切换选中，或把上一次点到这一行的范围一起选中。
+    ///
+    /// 范围按树当前的可见顺序算（收起的分支不参与），根目录与「空文件夹」占位行跳过。
+    fn select_path_with_key(&mut self, path: &str, shift: bool, cx: &mut Context<Self>) {
+        let was_active = self.selection.is_active();
+        if shift {
+            let anchor = self.selection.anchor().map(str::to_string);
+            let range = anchor.and_then(|anchor| {
+                let tree = self.tree.read(cx);
+                let from = tree.index_of(&SharedString::from(anchor.clone()))?;
+                let to = tree.index_of(&SharedString::from(path.to_string()))?;
+                let (low, high) = (from.min(to), from.max(to));
+                let paths = (low..=high)
+                    .filter_map(|index| tree.entry(index))
+                    .filter(|entry| !entry.is_root())
+                    .map(|entry| entry.item().id.to_string())
+                    .filter(|id| !explorer::is_empty_folder_placeholder(id))
+                    .collect::<Vec<_>>();
+                Some((paths, anchor))
+            });
+            match range {
+                Some((paths, anchor)) => self.selection.set_paths(paths, &anchor),
+                // 还没有起点（或这一行不在树里）就当成普通的多选点击。
+                None => self.selection.toggle(path),
+            }
+        } else {
+            self.selection.toggle(path);
+        }
+        if !was_active && self.selection.is_active() {
+            // 进入选择模式时清掉树自己的单选高亮，避免和本轮多选混在一起。
+            self.tree
+                .update(cx, |tree, cx| tree.set_selected_index(None, cx));
+        }
+        cx.notify();
+    }
+
     fn cancel_selection(&mut self, cx: &mut Context<Self>) {
         self.selection.clear();
         cx.notify();
@@ -895,10 +931,30 @@ impl Render for ExplorerPanel {
                 }
             })
         };
+        let on_item_drag: explorer::ExplorerDragBeginAction = {
+            let app = self.app.clone();
+            Rc::new(move |path: &str, cx: &mut App| {
+                let path = path.to_string();
+                let _ = app.update(cx, |this, _cx| this.begin_explorer_drag(&path));
+            })
+        };
         let on_select: explorer::ExplorerSelectAction = {
             let panel = cx.entity().downgrade();
             Rc::new(move |path, _window, cx| {
                 let _ = panel.update(cx, |panel, cx| panel.select_path(path, cx));
+            })
+        };
+        let on_modifier_select: explorer::ExplorerModifierSelectAction = {
+            let panel = cx.entity().downgrade();
+            Rc::new(move |path, shift, _window, cx| {
+                let _ = panel.update(cx, |panel, cx| panel.select_path_with_key(path, shift, cx));
+            })
+        };
+        let on_row_click: explorer::ExplorerRowClickAction = {
+            let panel = cx.entity().downgrade();
+            Rc::new(move |path, cx| {
+                // 只记范围起点，不用重绘（视觉上看不出变化）。
+                let _ = panel.update(cx, |panel, _cx| panel.selection.set_anchor(path));
             })
         };
         let delete_selected: explorer::PanelCommand = {
@@ -947,9 +1003,12 @@ impl Render for ExplorerPanel {
                         refresh,
                         on_context_menu,
                         on_move,
+                        on_item_drag,
                         selection: self.selection.clone(),
                         context_path: self.context_path.clone(),
                         on_select,
+                        on_modifier_select,
+                        on_row_click,
                         delete_selected,
                         cancel_selection,
                         is_empty: self.is_empty,

@@ -215,9 +215,14 @@ impl CodeWindow {
             "qide_debug_pause" => {
                 self.agent_ai_action(AppAction::PauseDebug, "暂停脚本", true, reply, window, cx)
             }
-            "qide_stop_execution" => {
-                self.agent_ai_action(AppAction::StopExecution, "停止脚本", true, reply, window, cx)
-            }
+            "qide_stop_execution" => self.agent_ai_action(
+                AppAction::StopExecution,
+                "停止脚本",
+                true,
+                reply,
+                window,
+                cx,
+            ),
             "qide_set_breakpoint" => match agent_breakpoint_action(arguments) {
                 Ok(action) => self.agent_ai_action(action, "设置断点", true, reply, window, cx),
                 Err(error) => AgentOutcome::Done(Err(error)),

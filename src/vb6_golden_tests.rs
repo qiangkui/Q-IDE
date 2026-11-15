@@ -9,23 +9,10 @@ use crate::interpreter::{RunOptions, run};
 
 /// QIDE 有意与 VB6 不同、或受实现限制的用例（原因见 `docs/脚本语言.md`）。
 ///
-/// 以 `*` 结尾的条目按前缀匹配（前缀部分用例太多时用）。
-const KNOWN_DIFFERENCES: &[&str] = &[
-    // 整数字面量在 VB6 里是 Integer（`VarType`/`TypeName` 给 2/"Integer"），QIDE 统一按 Long 承载。
-    "VarType(1)",
-    "TypeName(1)",
-    // QIDE 没有独立的 Single 值类型：`CSng` 的值已窄化到 32 位，但按 Double 的 15 位有效数字打印
-    // （VB6 按 Single 的 7 位）。
-    "CSng(*",
-    // 日期显示用固定的 ISO 格式（`2024-02-29`），VB6 用系统区域短日期格式（中文系统是 `2024/2/29`）。
-    // 取舍见 `docs/脚本语言.md`：ISO 不随机器区域变化，测试才可复现。
-    "CStr(CDate(*",
-    "DateAdd(*",
-    // `Hex`/`Oct` 的位数跟着参数类型走：VB6 里 `-1` 是 Integer，给 16 位的 `FFFF`；
-    // QIDE 没有独立的 Integer 值（整数字面量一律按 Long 承载），给 32 位的 `FFFFFFFF`。
-    "Hex(-1)",
-    "Oct(-1)",
-];
+/// 以 `*` 结尾的条目按前缀匹配（前缀部分用例太多时用）。目前**没有**条目：日期显示、
+/// `DateSerial` 归一化、`DatePart` 都已按 VB6 实测对齐（`DatePart` 的年末两天偏差见
+/// `docs/脚本语言.md` 第 13 条，那种日期不进清单）。
+const KNOWN_DIFFERENCES: &[&str] = &[];
 
 fn evaluate(expression: &str) -> Result<String, String> {
     let source = format!("Debug.Print {expression}");

@@ -105,6 +105,9 @@ pub struct Procedure {
     pub params: Vec<Param>,
     pub body: Vec<Stmt>,
     pub is_function: bool,
+    /// `Property Get`：解释器里与 `Function` 同为「有返回值的过程」，
+    /// 但 VB6 的接口实现要求两者形式一致，所以单独记一个标志。
+    pub is_get: bool,
     /// `Property Let`：只能通过赋值语句调用。
     pub is_let: bool,
     /// `Property Set`：只能通过 `Set x = 对象` 调用。
@@ -228,6 +231,14 @@ pub enum BinOp {
 #[derive(Clone, Debug)]
 pub enum Expr {
     Literal(Value),
+    /// 带类型后缀的字面量（`123&` 是 Long、`1.5!` 是 Single、`&HFFFF&` 是 Long）。
+    ///
+    /// 值不变（解释器的整数一律用 `i64` 承载），后缀只影响 `VarType` / `TypeName` / `Hex` / `Oct`
+    /// 这类要看类型的地方，规则来自本机 VB6 实测。
+    TypedLiteral {
+        value: Value,
+        ty: VbType,
+    },
     /// `{1, 2, 3}`：数组字面量（VB.NET 风格，等价于 `Array(1, 2, 3)`）。
     ArrayLiteral(Vec<Expr>),
     Var(String),
@@ -300,7 +311,8 @@ pub enum ErrorMode {
     ResumeNext,
     /// `On Error GoTo 标签`。
     Goto(String),
-    /// `On Error GoTo 0`。
+    /// `On Error GoTo 0` / `On Error GoTo -1`：取消当前过程的错误处理
+    /// （VB6 里两种写法都会顺带清空 `Err`，见 `runtime` 的 `Stmt::OnError`）。
     Disabled,
 }
 
@@ -472,7 +484,9 @@ pub enum Stmt {
     /// `GoSub 标签`。
     Gosub(String, usize),
     /// `Return`：从最近一次 `GoSub` 返回。
-    GosubReturn { line: usize },
+    GosubReturn {
+        line: usize,
+    },
     /// `On Error ...`。
     OnError {
         mode: ErrorMode,
@@ -591,10 +605,13 @@ pub enum Stmt {
         value: Expr,
         line: usize,
     },
-    /// `c.Add x[, key]` / `c.Remove i`：集合方法调用。
+    /// `c.Add x[, key]` / `obj.Sub.Method arg`：成员方法调用。
+    ///
+    /// `path` 的最后一个元素是方法名，前面的元素是逐层读出来的成员
+    /// （`rs.Fields.Append "x", 3` 是 `path = ["Fields", "Append"]`）。
     CallMethod {
         object: String,
-        method: String,
+        path: Vec<String>,
         args: Vec<Expr>,
         line: usize,
     },

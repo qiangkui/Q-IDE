@@ -20,6 +20,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::{Duration, Instant, SystemTime};
 
+use gpui_kit::base::input::TabSize;
+use gpui_kit::base::input::set_language_config;
 use gpui_kit::base::input::{
     Diagnostic, DiagnosticSeverity, GutterDecoration, Position, RangeDecoration,
     RangeDecorationStyle, Rope, RopeExt as _,
@@ -31,7 +33,8 @@ use gpui_kit::component::dock::{
     InsertTarget, NodeId, PaneNode, PaneRef, PanelId, PanelStyle, panel_handle, register_panel,
 };
 use gpui_kit::component::input::{
-    EditorState, Enter, Indent, Input, InputState, Outdent, SelectAll, ShowCompletions,
+    EditorState, Enter, Indent, Input, InputEvent, InputState, Outdent, OutdentInline, SelectAll,
+    ShowCompletions,
 };
 use gpui_kit::component::tree::TreeState;
 use gpui_kit::component::*;
@@ -43,7 +46,7 @@ use crate::brackets;
 use crate::commands;
 use crate::editing;
 use crate::encoding;
-use crate::explorer::{ExplorerModel, Root};
+use crate::explorer::{DragOutState, ExplorerModel, Root};
 use crate::interpreter::RunOptions;
 use crate::interpreter::debug::{self as vb_debug, DebugControl, DebugSnapshot};
 use crate::layout::{LAYOUT_VERSION, Layout, SESSION_LIMIT};
@@ -107,7 +110,8 @@ actions!(
         NextTab,
         PreviousTab,
         ShowCommands,
-        ReopenClosedFile
+        ReopenClosedFile,
+        ShowShortcuts
     ]
 );
 
@@ -157,6 +161,10 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-shift-p", Cancel, Some("Dialog > Input")),
         // 重新打开最近关闭的标签。
         KeyBinding::new("ctrl-shift-t", ReopenClosedFile, None),
+        // 快捷键一览（帮助菜单里也有同样的入口）。
+        KeyBinding::new("f1", ShowShortcuts, None),
+        KeyBinding::new("f1", Cancel, Some("Dialog")),
+        KeyBinding::new("f1", Cancel, Some("Dialog > Input")),
         // 查找 / 替换：由主窗口处理，再按一次同一快捷键收起面板。
         // 使用更具体的上下文覆盖编辑器内置的 `Search` / `Replace` 绑定。
         KeyBinding::new("ctrl-f", ToggleSearch, Some("Input && mode == editor")),
@@ -176,6 +184,18 @@ pub fn init(cx: &mut App) {
             Some("Input && mode == editor"),
         ),
     ]);
+
+    install_vb_indent_rules(cx);
+}
+
+/// 把 VB 的块级缩进规则装进编辑器：`vb` / `vb6` / `vba` 三个语言名共用一套。
+///
+/// 编辑器在回车时用这两条正则决定新行缩进（只在代码上下文生效，注释与字符串不算），
+/// 规则本身在 [`crate::indent`] 里并有单测。
+fn install_vb_indent_rules(cx: &mut App) {
+    for language in ["vb", "vb6", "vba"] {
+        set_language_config(language, crate::indent::language_config(), cx);
+    }
 }
 
 pub struct CodeWindow {
@@ -285,6 +305,8 @@ pub struct CodeWindow {
     panel_drag: Option<PanelDragState>,
     /// 是否已在轮询当前拖动会话是否结束。
     panel_drag_watch: bool,
+    /// 资源管理器条目拖出窗口时用来复制路径的状态。
+    drag_out: DragOutState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -497,6 +519,7 @@ impl CodeWindow {
             panel_visibility: None,
             panel_drag: None,
             panel_drag_watch: false,
+            drag_out: DragOutState::default(),
             _subscriptions: Vec::new(),
         };
 
@@ -584,6 +607,15 @@ impl CodeWindow {
         output.info(cx, crate::title_bar::APP_TITLE);
         output.info(cx, "基于 gpui / gpui-kit 构建的示例 IDE 界面");
         output.success(cx, "界面、编辑器、输出面板与设置均已模块化");
+    }
+
+    /// 帮助菜单 / `F1`：弹出快捷键一览。
+    pub(crate) fn show_shortcuts_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            // 已有对话框在前台时不要再叠一个。
+            return;
+        }
+        dialogs::show_shortcuts_dialog(window, cx);
     }
 
     /// 把当前设置应用到编辑器、主题与输出面板。

@@ -307,6 +307,26 @@ fn implementation_declaration_form_must_match_the_interface() {
 }
 
 #[test]
+fn implementation_property_set_must_not_become_property_let() {
+    let found = issues(
+        "Class IHolder\n\
+             Public Property Set Payload(ByVal value As Object)\n\
+             End Property\n\
+         End Class\n\
+         Class Holder\n\
+             Implements IHolder\n\
+             Private Property Let IHolder_Payload(ByVal value As Object)\n\
+             End Property\n\
+         End Class\n",
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].message.contains("声明形式") && found[0].line == 7,
+        "{found:?}"
+    );
+}
+
+#[test]
 fn interface_private_members_are_not_required() {
     let found = issues(
         "Class IShape\n\
@@ -319,6 +339,152 @@ fn interface_private_members_are_not_required() {
              Implements IShape\n\
              Private Function IShape_Area() As Long\n\
              End Function\n\
+         End Class\n",
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+/// 一对「接口成员 + 实现成员」的签名检查结果；测试只关心消息里出现的片段。
+///
+/// 参数是成员声明行（不含结束语句），结束语句按 `Function` / `Property` / `Sub` 自动补。
+fn signature_issue(interface_member: &str, implementation: &str) -> Option<String> {
+    fn end_keyword(declaration: &str) -> &'static str {
+        if declaration.starts_with("Function") {
+            "End Function"
+        } else if declaration.starts_with("Property") {
+            "End Property"
+        } else {
+            "End Sub"
+        }
+    }
+    let source = format!(
+        "Class IShape\n\
+             Public {interface_member}\n\
+             {}\n\
+         End Class\n\
+         Class Square\n\
+             Implements IShape\n\
+             Private {implementation}\n\
+             {}\n\
+         End Class\n",
+        end_keyword(interface_member),
+        end_keyword(implementation)
+    );
+    issues(&source).first().map(|issue| issue.message.clone())
+}
+
+#[test]
+fn implementation_parameter_count_must_match() {
+    let message = signature_issue(
+        "Function Area(ByVal w As Long) As Long",
+        "Function IShape_Area() As Long",
+    )
+    .expect("参数个数不同应当报错");
+    assert!(message.contains("参数个数"), "{message}");
+}
+
+#[test]
+fn implementation_parameter_type_must_match() {
+    let message = signature_issue(
+        "Function Area(ByVal w As Long) As Long",
+        "Function IShape_Area(ByVal w As Integer) As Long",
+    )
+    .expect("参数类型不同应当报错");
+    assert!(message.contains("类型"), "{message}");
+}
+
+#[test]
+fn implementation_parameter_mode_must_match() {
+    // VB 默认 ByRef，接口写 ByVal 时实现也必须写 ByVal。
+    let message = signature_issue(
+        "Function Area(ByVal w As Long) As Long",
+        "Function IShape_Area(w As Long) As Long",
+    )
+    .expect("ByRef/ByVal 不一致应当报错");
+    assert!(message.contains("传递方式"), "{message}");
+}
+
+#[test]
+fn implementation_array_parameter_must_match() {
+    let message = signature_issue(
+        "Sub Fill(ByRef xs() As Long)",
+        "Sub IShape_Fill(ByRef xs As Long)",
+    )
+    .expect("数组形参与普通形参不同应当报错");
+    assert!(message.contains("数组"), "{message}");
+}
+
+#[test]
+fn implementation_return_type_must_match() {
+    let message = signature_issue(
+        "Function Area() As Long",
+        "Function IShape_Area() As Integer",
+    )
+    .expect("返回类型不同应当报错");
+    assert!(message.contains("返回类型"), "{message}");
+}
+
+#[test]
+fn implementation_cannot_replace_property_get_with_function() {
+    let message = signature_issue(
+        "Property Get Area() As Long",
+        "Function IShape_Area() As Long",
+    )
+    .expect("Property Get 与 Function 不能互相顶替");
+    assert!(message.contains("声明形式"), "{message}");
+
+    let message = signature_issue(
+        "Function Area() As Long",
+        "Property Get IShape_Area() As Long",
+    )
+    .expect("反向也不能互相顶替");
+    assert!(message.contains("声明形式"), "{message}");
+}
+
+#[test]
+fn implementation_may_rename_parameters() {
+    let found = issues(
+        "Class IShape\n\
+             Public Function Area(ByVal w As Long, ByRef h As Long) As Long\n\
+             End Function\n\
+         End Class\n\
+         Class Square\n\
+             Implements IShape\n\
+             Private Function IShape_Area(ByVal width As Long, ByRef height As Long) As Long\n\
+             End Function\n\
+         End Class\n",
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn implementation_optional_flag_and_default_value_must_match() {
+    let message = signature_issue(
+        "Sub Opt(Optional ByVal v As Long = 5)",
+        "Sub IShape_Opt(ByVal v As Long)",
+    )
+    .expect("可选性不同应当报错");
+    assert!(message.contains("可选性"), "{message}");
+
+    let message = signature_issue(
+        "Sub Opt(Optional ByVal v As Long = 5)",
+        "Sub IShape_Opt(Optional ByVal v As Long = 6)",
+    )
+    .expect("默认值不同应当报错");
+    assert!(message.contains("默认值"), "{message}");
+}
+
+#[test]
+fn matching_implementation_with_arrays_and_optionals_reports_nothing() {
+    let found = issues(
+        "Class IShape\n\
+             Public Sub Fill(ByRef xs() As Long, Optional ByVal count As Long = -1)\n\
+             End Sub\n\
+         End Class\n\
+         Class Square\n\
+             Implements IShape\n\
+             Private Sub IShape_Fill(ByRef values() As Long, Optional ByVal total As Long = -1)\n\
+             End Sub\n\
          End Class\n",
     );
     assert!(found.is_empty(), "{found:?}");

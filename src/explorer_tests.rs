@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use crate::explorer::{ExplorerModel, ExplorerSelection, Root};
+use crate::explorer::{DragOutState, ExplorerModel, ExplorerSelection, Root};
 
 /// 造一个临时文件夹：含 `sub/inner.txt` 与 `a.txt`。
 fn temp_dir(name: &str) -> PathBuf {
@@ -199,4 +199,125 @@ fn clearing_selection_leaves_selection_mode() {
 
     assert!(selection.is_empty());
     assert!(!selection.is_active());
+}
+
+#[test]
+fn ctrl_click_enters_selection_mode_from_normal_mode() {
+    // 普通模式下 `Ctrl+点击` 走 `toggle`：过去只在选择模式里调用过，没把 active 置 true，
+    // 所以点下去什么也看不见。现在第一次按下就进入选择模式。
+    let mut selection = ExplorerSelection::default();
+    assert!(!selection.is_active());
+
+    selection.toggle(r"C:\root\a.txt");
+    assert!(selection.is_active(), "Ctrl+点击 要进入选择模式");
+    assert!(selection.contains(r"C:\root\a.txt"));
+
+    selection.toggle(r"C:\root\b.txt");
+    assert_eq!(selection.len(), 2);
+
+    selection.toggle(r"C:\root\a.txt");
+    selection.toggle(r"C:\root\b.txt");
+    assert!(selection.is_empty());
+    assert!(!selection.is_active(), "全部取消后退出选择模式");
+}
+
+#[test]
+fn plain_click_records_the_shift_range_anchor() {
+    // 普通点击（打开文件 / 展开目录）只记起点：之后 `Shift+点击` 从这里选一段范围。
+    let mut selection = ExplorerSelection::default();
+    selection.set_anchor(r"C:\root\a.txt");
+    assert_eq!(selection.anchor(), Some(r"C:\root\a.txt"));
+    assert!(!selection.is_active(), "只记起点不改选择状态");
+    assert!(selection.is_empty());
+}
+
+#[test]
+fn selection_tracks_the_anchor_for_shift_ranges() {
+    let mut selection = ExplorerSelection::default();
+    selection.click(r"C:\root\a.txt");
+    assert_eq!(
+        selection.anchor(),
+        Some(r"C:\root\a.txt"),
+        "点过的条目就是范围起点"
+    );
+
+    selection.toggle(r"C:\root\c.txt");
+    assert_eq!(selection.anchor(), Some(r"C:\root\c.txt"));
+
+    // `Shift+点击` 由调用方按可见顺序算好路径，这里只负责整体替换并保留起点。
+    selection.set_paths(
+        [
+            r"C:\root\c.txt".to_string(),
+            r"C:\root\d.txt".to_string(),
+            r"C:\root\e.txt".to_string(),
+        ],
+        r"C:\root\c.txt",
+    );
+    assert_eq!(selection.len(), 3);
+    assert!(selection.contains(r"C:\root\d.txt"));
+    assert_eq!(selection.anchor(), Some(r"C:\root\c.txt"));
+
+    // 范围为空时退出选择模式，起点保留（下一次 Shift+点击还能接着算）。
+    selection.set_paths(Vec::new(), r"C:\root\c.txt");
+    assert!(!selection.is_active());
+    assert!(selection.is_empty());
+
+    selection.clear();
+    assert_eq!(selection.anchor(), None, "退出选择后范围起点也清空");
+}
+
+#[test]
+fn drag_out_copies_only_after_releasing_outside() {
+    let mut state = DragOutState::default();
+    assert!(!state.is_dragging());
+
+    state.begin(r"C:\root\a.txt");
+    assert!(state.is_dragging());
+    // 窗口内移动、窗口内松开：正常拖放，不复制。
+    assert_eq!(state.moved(true, true), None);
+    state.released_inside();
+    assert!(!state.is_dragging());
+    assert_eq!(state.moved(true, false), None);
+
+    // 离开窗口后松手：复制路径。
+    state.begin(r"C:\root\b.txt");
+    assert_eq!(state.moved(false, true), None);
+    assert_eq!(state.released_outside(), Some(r"C:\root\b.txt".to_string()));
+    assert!(!state.is_dragging());
+    // 同一次松开只复制一次。
+    assert_eq!(state.released_outside(), None);
+}
+
+#[test]
+fn drag_out_falls_back_when_mouse_up_was_not_delivered() {
+    let mut state = DragOutState::default();
+    state.begin(r"C:\root\c.txt");
+    // 指针离开窗口（左键仍按下）。
+    assert_eq!(state.moved(false, true), None);
+    // 在别的窗口上松手，`mouse up` 没送进来；回到窗口内时左键已经不按了。
+    assert_eq!(state.moved(true, false), Some(r"C:\root\c.txt".to_string()));
+    assert!(!state.is_dragging());
+}
+
+#[test]
+fn drag_out_ignores_moves_without_a_drag() {
+    let mut state = DragOutState::default();
+    assert_eq!(state.moved(false, true), None);
+    assert_eq!(state.moved(true, false), None);
+    assert_eq!(state.released_outside(), None);
+}
+
+#[test]
+fn drag_out_cancel_discards_the_path() {
+    let mut state = DragOutState::default();
+    state.begin(r"C:\root\d.txt");
+    state.moved(false, true);
+    state.cancel();
+    assert!(!state.is_dragging());
+    assert_eq!(state.moved(true, false), None);
+    assert_eq!(state.released_outside(), None);
+
+    // 新一次拖动重新记录路径。
+    state.begin(r"C:\root\e.txt");
+    assert_eq!(state.released_outside(), Some(r"C:\root\e.txt".to_string()));
 }

@@ -254,6 +254,385 @@ pub const CASES: &[(&str, &str)] = &[
     ("Format(1234567, \"#,##0\")", "1,234,567"),
     ("Format(0.5, \"0.00%\")", "50.00%"),
     ("Format(12, \"000\")", "012"),
+    ("VarType(1&)", "3"),
+    ("TypeName(1&)", "Long"),
+    ("VarType(1.5!)", "4"),
+    ("TypeName(1.5!)", "Single"),
+    ("VarType(1.5#)", "5"),
+    ("VarType(&HFFFF&)", "3"),
+    ("TypeName(&HFFFF&)", "Long"),
+    ("VarType(&HFFFF)", "2"),
+    ("TypeName(&HFFFF)", "Integer"),
+    ("Hex(1&)", "1"),
+    ("Oct(-1&)", "37777777777"),
+    ("Hex(-32768)", "FFFF8000"),
+    ("Hex(-200)", "FF38"),
+    ("Hex(CInt(-1))", "FFFF"),
+    ("VarType(CByte(1) + CByte(1))", "17"),
+    ("VarType(1& + CSng(1))", "5"),
+    ("VarType(1 + CSng(1))", "4"),
+    ("VarType(CSng(1) + CDbl(1))", "5"),
+    ("VarType(CCur(1) + CDbl(1))", "6"),
+    ("VarType(CDate(1) + 1)", "7"),
+    ("VarType(Not CByte(1))", "17"),
+    ("VarType(Not 1)", "2"),
+    ("VarType(1 < 2)", "11"),
+    ("VarType(1 \\ 2)", "2"),
+    ("VarType(1 Mod 2)", "2"),
+    ("VarType(2 ^ 3)", "5"),
+    ("TypeName(1 + 1)", "Integer"),
+    ("TypeName(Null = Null)", "Null"),
+    ("&HFFFF", "-1"),
+    ("&H8000", "-32768"),
+    ("&HE000", "-8192"),
+    ("&H7FFF", "32767"),
+    ("&H10000", "65536"),
+    ("&O177777", "-1"),
+    ("&H0", "0"),
+    ("&HFFFFFFFF", "-1"),
+    ("&H80000000", "-2147483648"),
+    ("&HFFFFFFFF&", "-1"),
+    ("VarType(&HFFFFFFFF)", "3"),
+    ("TypeName(&H10000)", "Long"),
+    ("Hex(&HFFFF)", "FFFF"),
+    ("CLng(&HFFFF)", "-1"),
+    ("VarType(65535 And &HFFFF)", "3"),
+    ("Round(2.5)", "2"),
+    ("Round(3.5)", "4"),
+    ("Round(-2.5)", "-2"),
+    ("Round(2.675, 2)", "2.68"),
+    ("Round(1.005, 2)", "1"),
+    ("Int(-1.5)", "-2"),
+    ("Fix(-1.5)", "-1"),
+    ("Sgn(-0.0)", "0"),
+    ("Abs(-32768)", "32768"),
+    ("Abs(-1.5)", "1.5"),
+    ("Left(\"abcdef\", 0)", ""),
+    ("Right(\"abcdef\", 0)", ""),
+    ("Mid(\"abcdef\", 3)", "cdef"),
+    ("Mid(\"abcdef\", 10)", ""),
+    ("Len(\"\")", "0"),
+    ("InStr(\"\", \"\")", "0"),
+    ("InStr(\"abc\", \"\")", "1"),
+    ("InStrRev(\"abcabc\", \"a\")", "4"),
+    ("Replace(\"aaa\", \"a\", \"b\", 1, 2)", "bba"),
+    ("Replace(\"\", \"\", \"x\")", ""),
+    ("StrComp(\"a\", \"A\")", "1"),
+    ("StrComp(\"a\", \"A\", 1)", "0"),
+    ("String(3, \"xy\")", "xxx"),
+    ("String(0, \"x\")", ""),
+    ("Space(3) & \"|\"", "   |"),
+    ("Val(\"  12  \")", "12"),
+    ("Val(\"1.5e3\")", "1500"),
+    ("Val(\"&H1F\")", "31"),
+    ("Val(\"1,5\")", "1"),
+    ("Val(\"abc\")", "0"),
+    ("Chr(65) & Asc(\"A\")", "A65"),
+    ("ChrW(20013)", "中"),
+    ("AscW(\"中\")", "20013"),
+    ("Format(1234.5678, \"0.00\")", "1234.57"),
+    ("Format(0.5, \"0.0%\")", "50.0%"),
+    ("Format(1234.5678, \"#,##0.00\")", "1,234.57"),
+    ("Format(-0.004, \"0.00\")", "0.00"),
+    ("Format(1234567, \"Scientific\")", "1.23E+06"),
+    ("Format(1.5, \"Currency\")", "￥1.50"),
+    ("Format(True, \"Yes/No\")", "Yes"),
+    ("Format(1, \"On/Off\")", "On"),
+    ("IsNumeric(\"\")", "False"),
+    ("IsNumeric(\"1.5\")", "True"),
+    ("IsDate(\"2024-02-30\")", "False"),
+    ("IsArray(Array(1))", "True"),
+    ("UBound(Split(\"a,b\", \",\"))", "1"),
+    ("Join(Array(\"a\", \"b\"), \"-\")", "a-b"),
+    ("Year(#2024-02-29#)", "2024"),
+    ("Weekday(#2024-02-29#)", "5"),
+    ("DateDiff(\"d\", #2024-01-01#, #2024-03-01#)", "60"),
+    ("DateAdd(\"m\", 1, #2024-01-31#)", "2024/2/29"),
+    ("Hour(#2024-02-29 13:05:06#)", "13"),
+    ("2 ^ 0.5", "1.4142135623731"),
+    ("-0.0", "0"),
+    ("Int(1E+20)", "1E+20"),
+    ("CLng(2.5)", "2"),
+    ("CLng(3.5)", "4"),
+    ("CInt(2.5)", "2"),
+    ("CInt(-2.5)", "-2"),
+    ("CByte(1.5)", "2"),
+    ("CByte(2.5)", "2"),
+    ("IIf(True, 1, 2)", "1"),
+    ("Switch(False, 1, True, 2)", "2"),
+    ("StrReverse(\"abc\")", "cba"),
+    ("InStr(2, \"abcabc\", \"a\")", "4"),
+    ("InStrRev(\"abcabc\", \"a\", 4)", "4"),
+    ("Mid(\"abcdef\", 2, 3)", "bcd"),
+    ("Mid(\"abcdef\", 2, 0)", ""),
+    ("Left$(\"abc\", 10)", "abc"),
+    ("Right$(\"abc\", 10)", "abc"),
+    ("UCase(\"aBc\")", "ABC"),
+    ("LCase(\"AbC\")", "abc"),
+    ("Trim(\"  x  \")", "x"),
+    ("LTrim(\"  x\")", "x"),
+    ("RTrim(\"x  \")", "x"),
+    ("Format(-1234.5678, \"#,##0.00\")", "-1,234.57"),
+    ("Format(0, \"0.00\")", "0.00"),
+    ("Format(0.5, \"0\")", "1"),
+    ("Format(2.5, \"0\")", "3"),
+    ("Format(1.005, \"0.00\")", "1.01"),
+    ("Format(1234.5678, \"0\")", "1235"),
+    ("DatePart(\"yyyy\", #2024-02-29#)", "2024"),
+    ("DatePart(\"q\", #2024-05-15#)", "2"),
+    ("DatePart(\"ww\", #2024-01-15#)", "3"),
+    ("Weekday(#2024-03-03#)", "1"),
+    ("Weekday(#2024-03-03#, 2)", "7"),
+    ("DateSerial(2024, 2, 30)", "2024/3/1"),
+    ("TimeSerial(25, 0, 0)", "1899/12/31 1:00:00"),
+    ("CDate(\"2024-02-29\")", "2024/2/29"),
+    ("CDate(45000.5)", "2023/3/15 12:00:00"),
+    ("Format(#2024-02-29#, \"yyyy-mm-dd\")", "2024-02-29"),
+    ("Year(0)", "1899"),
+    ("Month(0)", "12"),
+    ("Day(1)", "31"),
+    ("Timer > 0", "True"),
+    ("LenB(\"abc\")", "6"),
+    ("Chr(0) & \"|\"", " |"),
+    ("StrComp(\"abc\", \"abd\")", "-1"),
+    ("StrComp(\"ABC\", \"abc\", 1)", "0"),
+    ("\"abc\" Like \"a*\"", "True"),
+    ("\"abc\" Like \"a?c\"", "True"),
+    ("\"abc\" Like \"[a-c]*\"", "True"),
+    ("\"a1\" Like \"a#\"", "True"),
+    ("Hex(CLng(-2147483648))", "80000000"),
+    ("Val(\"&HFF\")", "255"),
+    ("Val(\"&O17\")", "15"),
+    ("Val(\"1e\")", "1"),
+    ("CInt(\"5\")", "5"),
+    ("CLng(\"5.9\")", "6"),
+    ("CCur(\"1.5\")", "1.5"),
+    ("CDbl(\"1.5e3\")", "1500"),
+    ("CBool(0)", "False"),
+    ("CBool(-1)", "True"),
+    ("CStr(CDate(45000.5))", "2023/3/15 12:00:00"),
+    ("CStr(#2024-02-29#)", "2024/2/29"),
+    ("CStr(CDate(#1899-12-31 01:00:00#))", "1899/12/31 1:00:00"),
+    ("Format(#2024-02-29#, \"Short Date\")", "2024/2/29"),
+    ("Format(#2024-02-29#, \"Medium Date\")", "24-02-29"),
+    ("Format(#2024-02-29 13:05:06#, \"General Date\")", "2024/2/29 13:05:06"),
+    ("Format(#2024-02-29 13:05:06#, \"Long Time\")", "13:05:06"),
+    ("Format(#2024-02-29 13:05:06#, \"Medium Time\")", "01:05 下午"),
+    ("Format(#2024-02-29 13:05:06#, \"Short Time\")", "13:05"),
+    ("Format(#2024-02-29#, \"Long Date\")", "2024年2月29日"),
+    ("Format(1.23456, \"0.00000\")", "1.23456"),
+    ("Format(1.00005, \"0.0000\")", "1.0001"),
+    ("Format(2.675, \"0.00\")", "2.68"),
+    ("DatePart(\"y\", #2024-02-29#)", "60"),
+    ("DatePart(\"w\", #2024-02-29#)", "5"),
+    ("DatePart(\"w\", #2024-02-29#, 3)", "3"),
+    ("DatePart(\"ww\", #2024-01-01#)", "1"),
+    ("DatePart(\"ww\", #2024-12-31#)", "53"),
+    ("DatePart(\"ww\", #2025-01-01#)", "1"),
+    ("DatePart(\"ww\", #2024-01-01#, 1, 2)", "1"),
+    ("DatePart(\"ww\", #2024-12-28#, 1, 2)", "52"),
+    ("DatePart(\"ww\", #2024-12-29#, 1, 2)", "1"),
+    ("DatePart(\"ww\", #2024-12-30#, 1, 2)", "1"),
+    ("DatePart(\"ww\", #2024-01-01#, 1, 3)", "53"),
+    ("DatePart(\"ww\", #2024-12-30#, 1, 3)", "52"),
+    ("DatePart(\"ww\", #2024-01-01#, 2, 1)", "1"),
+    ("DatePart(\"ww\", #2024-01-01#, 3, 1)", "1"),
+    ("DatePart(\"h\", #2024-02-29 13:05:06#)", "13"),
+    ("DatePart(\"n\", #2024-02-29 13:05:06#)", "5"),
+    ("DatePart(\"s\", #2024-02-29 13:05:06#)", "6"),
+    ("DatePart(\"q\", #2024-12-31#)", "4"),
+    ("DatePart(\"d\", #2024-02-29 23:00:00#)", "29"),
+    ("CStr(DateSerial(2024, 2, 30))", "2024/3/1"),
+    ("Year(DateSerial(2024, 13, 1))", "2025"),
+    ("Month(DateSerial(2024, 0, 1))", "12"),
+    ("Day(DateSerial(2024, 1, 0))", "31"),
+    ("CStr(DateSerial(2024, 3, -1))", "2024/2/28"),
+    ("Year(DateSerial(0, 1, 1))", "2000"),
+    ("Year(DateSerial(100, 1, 1))", "100"),
+    ("LenB(\"中文\")", "4"),
+    ("LenB(\"\")", "0"),
+    ("Val(\"1e5\")", "100000"),
+    ("Val(\"1E+\")", "1"),
+    ("Val(\"1.2e3x\")", "1200"),
+    ("Val(\".5\")", "0.5"),
+    ("Val(\"1.2.3\")", "1.2"),
+    ("Mid(\"abc\", 2, 0)", ""),
+    ("Mid(\"abc\", 5)", ""),
+    ("Left(\"abc\", 0)", ""),
+    ("Right(\"abc\", 5)", "abc"),
+    ("String(3, \"x\")", "xxx"),
+    ("String(3, 65)", "AAA"),
+    ("String(0, \"x\")", ""),
+    ("Space(3) & \"|\"", "   |"),
+    ("UCase(\"中文abc\")", "中文ABC"),
+    ("LCase(\"中文ABC\")", "中文abc"),
+    ("AscW(\"中\")", "20013"),
+    ("ChrW(20013)", "中"),
+    ("CInt(2.5)", "2"),
+    ("CInt(3.5)", "4"),
+    ("CInt(-2.5)", "-2"),
+    ("CLng(2.5)", "2"),
+    ("CByte(2.5)", "2"),
+    ("CCur(2.345)", "2.345"),
+    ("CSng(1.0000001)", "1"),
+    ("CStr(-0.5)", "-0.5"),
+    ("Str(-0.5)", "-.5"),
+    ("CStr(1E+20)", "1E+20"),
+    ("CStr(0.0000001)", "0.0000001"),
+    ("CStr(1 / 3)", "0.333333333333333"),
+    ("CStr(1.5E-14)", "0.000000000000015"),
+    ("CStr(1.23456789012345E-11)", "1.23456789012345E-11"),
+    ("CStr(123456789.123456789)", "123456789.123457"),
+    ("CStr(1234567890123.4567)", "1234567890123.46"),
+    ("CStr(999900000000000)", "999900000000000"),
+    ("Int(-1.5)", "-2"),
+    ("Fix(-1.5)", "-1"),
+    ("Round(2.5)", "2"),
+    ("Round(1.5)", "2"),
+    ("Round(-2.5)", "-2"),
+    ("Round(2.345, 2)", "2.35"),
+    ("Sgn(-0.5)", "-1"),
+    ("Sqr(2)", "1.4142135623731"),
+    ("2 ^ 0.5", "1.4142135623731"),
+    ("-7 \\ 2", "-3"),
+    ("-7 Mod 2", "-1"),
+    ("7 Mod -2", "1"),
+    ("Hex(-1.5)", "FFFFFFFE"),
+    ("Hex(0)", "0"),
+    ("Oct(-1)", "177777"),
+    ("IsNumeric(\"&H10\")", "True"),
+    ("IsNumeric(\"1e5\")", "True"),
+    ("IsNumeric(\"\")", "False"),
+    ("IsDate(\"24-2-29\")", "True"),
+    ("IsDate(\"2024-2-30\")", "False"),
+    ("\"a\" Like \"[a-z]\"", "True"),
+    ("\"5\" Like \"#\"", "True"),
+    ("\"abc\" Like \"*b*\"", "True"),
+    ("\"abc\" Like \"a?c\"", "True"),
+    ("\"ABC\" Like \"a*\"", "False"),
+    ("\"a]\" Like \"[]]\"", "False"),
+    ("Join(Split(\"a b c\", \" \"), \"-\")", "a-b-c"),
+    ("UBound(Split(\"a,b\", \",\", 2))", "1"),
+    ("WeekdayName(1)", "星期一"),
+    ("WeekdayName(1, True)", "周一"),
+    ("WeekdayName(1, False, 1)", "星期日"),
+    ("WeekdayName(2, True)", "周二"),
+    ("WeekdayName(7)", "星期日"),
+    ("MonthName(1)", "一月"),
+    ("MonthName(11)", "十一月"),
+    ("MonthName(12, True)", "12月"),
+    ("MonthName(6, True)", "6月"),
+    ("Format(0.5, \"0.0%\")", "50.0%"),
+    ("Format(1234.5, \"##0\")", "1235"),
+    ("Format(5, \"0000\")", "0005"),
+    ("Format(-5, \"0.00;(0.00)\")", "(5.00)"),
+    ("Format(1234.5678, \"0.00E-00\")", "1.23E03"),
+    ("Format(\"abc\", \">\")", "ABC"),
+    ("Val(\"&HFFFFFFFF\")", "-1"),
+    ("Val(\"&HFFFF\")", "-1"),
+    ("Val(\"&H7FFFFFFF\")", "2147483647"),
+    ("Val(\"&H80000000\")", "-2147483648"),
+    ("Val(\"&HFFFF&\")", "65535"),
+    ("Val(\"1D5\")", "100000"),
+    ("Val(\"1.5D3\")", "1500"),
+    ("CBool(\"False\")", "False"),
+    ("CDate(\"2024/2/29\") = CDate(\"2024-02-29\")", "True"),
+    ("CDate(\"24-2-29\")", "2024/2/29"),
+    ("DateValue(\"2/29/2024\")", "2024/2/29"),
+    ("DateValue(\"3/4/2024\")", "2024/3/4"),
+    ("DateValue(\"31/12/2024\")", "2024/12/31"),
+    ("DateValue(\"1/2/3\")", "2001/2/3"),
+    ("Year(#1899-12-30#)", "1899"),
+    ("DateDiff(\"m\", #2024-01-31#, #2024-03-01#)", "2"),
+    ("DateDiff(\"ww\", #2024-01-01#, #2024-02-01#)", "4"),
+    ("DateAdd(\"q\", 1, #2024-11-30#)", "2025/2/28"),
+    ("DateSerial(2024, 2, 29) = #2024-02-29#", "True"),
+    ("Abs(-32768)", "32768"),
+    ("Int(CCur(1.5))", "1"),
+    ("Fix(CCur(-1.5))", "-1"),
+    ("Hex(CDbl(1.5))", "2"),
+    ("Hex(CSng(-1.5))", "FFFFFFFE"),
+    ("Hex(CCur(-1))", "FFFFFFFF"),
+    ("Format(CCur(-1.5), \"0.00\")", "-1.50"),
+    ("Str(CCur(1.5))", " 1.5"),
+    ("CStr(CCur(1.5))", "1.5"),
+    ("VarType(Abs(1))", "2"),
+    ("VarType(Abs(1&))", "3"),
+    ("VarType(Int(1.5))", "5"),
+    ("VarType(Sqr(4))", "5"),
+    ("VarType(2 ^ 2)", "5"),
+    ("Val(\"%\")", "0"),
+    ("Val(\"  -  1\")", "-1"),
+    ("Format(1.5, \"0.0%\")", "150.0%"),
+    ("Format(-1.5, \"0.0%\")", "-150.0%"),
+    ("Format(0, \"0.0%\")", "0.0%"),
+    ("Choose(1, \"a\", \"b\")", "a"),
+    ("Switch(False, 1, True, 2)", "2"),
+    ("IIf(True, 1, 2)", "1"),
+    ("UBound(Array(1, 2, 3))", "2"),
+    ("LBound(Array(1, 2, 3))", "0"),
+    ("InStr(1, \"中文abc\", \"ABC\", 1)", "3"),
+    ("StrComp(\"a\", \"A\", 0)", "1"),
+    ("StrComp(\"a\", \"A\", 1)", "0"),
+    ("Replace(\"aaa\", \"a\", \"b\", 1, 0)", "aaa"),
+    ("Replace(\"aaa\", \"a\", \"b\", 1, -1, 1)", "bbb"),
+    ("Mid(\"abcdef\", 2)", "bcdef"),
+    ("Trim(\"  a  \") & \"|\"", "a|"),
+    ("Len(Trim(\"  a  \"))", "1"),
+    ("Format(1234.5678, \"#,##0.000\")", "1,234.568"),
+    ("Format(0.5, \"0%\")", "50%"),
+    ("Format(5, \"0.00;;zero\")", "5.00"),
+    ("Format(0, \"0.00;neg;zero\")", "zero"),
+    ("Hex(255.9)", "100"),
+    ("Oct(8.9)", "11"),
+    ("CStr(0.1 + 0.2)", "0.3"),
+    ("CDbl(\"1e5\")", "100000"),
+    ("Format(#2024-02-29#, \"aaaa\")", "星期四"),
+    ("Format(#2024-02-29#, \"aaa\")", "周四"),
+    ("Format(#2024-02-29#, \"d\")", "29"),
+    ("Format(#2024-02-29#, \"dd\")", "29"),
+    ("Format(#2024-02-29#, \"m\")", "2"),
+    ("Format(#2024-02-29#, \"mm\")", "02"),
+    ("Format(#2024-02-29#, \"yy\")", "24"),
+    ("Format(#2024-02-29#, \"y\")", "60"),
+    ("Format(#2024-02-29#, \"mmm d, yyyy\")", "Feb 29, 2024"),
+    ("Format(#2024-02-29#, \"dddd, mmmm dd, yyyy\")", "Thursday, February 29, 2024"),
+    ("Format(#2024-02-29#, \"ddd d\")", "Thu 29"),
+    ("Format(#2024-02-29 13:05:06#, \"hh:mm\")", "13:05"),
+    ("Format(#2024-02-29 13:05:06#, \"nn\")", "05"),
+    ("Format(#2024-02-29 13:05:06#, \"h AM/PM\")", "1 PM"),
+    ("Format(#2024-02-29 13:05:06#, \"hh am/pm\")", "01 pm"),
+    ("Format(#2024-02-29 13:05:06#, \"h A/P\")", "1 P"),
+    ("Format(#2024-02-29 13:05:06#, \"h a/p\")", "1 p"),
+    ("Format(#2024-02-29 00:05:06#, \"hh:mm AM/PM\")", "12:05 AM"),
+    ("Format(#2024-02-29 12:05:06#, \"hh:mm AM/PM\")", "12:05 PM"),
+    ("Format(#2024-02-29 13:05:06#, \"mm:ss\")", "02:06"),
+    ("Format(#2024-02-29 13:05:06#, \"yyyy-mm-dd hh:mm:ss\")", "2024-02-29 13:05:06"),
+    ("Format(#2024-02-29#, \"yyyy\"\"年\"\"m\"\"月\"\"d\"\"日\"\"\")", "2024年2月29日"),
+    ("Format(#2024-02-29#, \"yyyy\\-mm\\-dd\")", "2024-02-29"),
+    ("Format(#2024-02-29#, \"w\")", "5"),
+    ("Format(#2024-02-29#, \"ww\")", "9"),
+    ("Format(#2024-01-01#, \"ww\")", "1"),
+    ("Format(#2024-12-31#, \"ww\")", "53"),
+    ("Format(#2024-01-01#, \"q\")", "1"),
+    ("Format(1, \"@@@\")", "  1"),
+    ("Format(\"abc\", \"@@@@@\")", "  abc"),
+    ("Format(\"ab\", \"&\")", "ab"),
+    ("Format(1234.5, \"@@@@@@\")", "1234.5"),
+    ("Format(1234567, \"0,\")", "1235"),
+    ("Format(1234567, \"0,,\")", "1"),
+    ("Format(1234, \"#,##0,\")", "1"),
+    ("DateAdd(\"y\", 1, #2024-12-31#)", "2025/1/1"),
+    ("DateAdd(\"w\", 3, #2024-02-27#)", "2024/3/1"),
+    ("DateAdd(\"ww\", 1, #2024-02-27#)", "2024/3/5"),
+    ("DateDiff(\"y\", #2024-01-01#, #2024-03-01#)", "60"),
+    ("DateDiff(\"w\", #2024-01-01#, #2024-01-15#)", "2"),
+    ("DateDiff(\"w\", #2024-01-01#, #2024-01-16#)", "2"),
+    ("DateDiff(\"w\", #2024-01-15#, #2024-01-01#)", "-2"),
+    ("DateDiff(\"q\", #2024-01-15#, #2024-11-15#)", "3"),
+    ("DateDiff(\"q\", #2024-03-31#, #2024-04-01#)", "1"),
+    ("DateDiff(\"q\", #2024-04-01#, #2024-03-31#)", "-1"),
+    ("DateDiff(\"q\", #2024-01-01#, #2025-01-01#)", "4"),
 ];
 
 /// 会失败的语句 → `Err.Number`。
@@ -286,6 +665,41 @@ pub const ERROR_CASES: &[(&str, i64)] = &[
     ("x = Partition(5, -10, 10, 5)", 5),
     ("x = Partition(5, 10, 5, 1)", 5),
     ("x = Partition(5, 0, 0, 1)", 5),
+    ("x = 32767 + 1", 6),
+    ("x = 32767 * 2", 6),
+    ("x = 2147483647 + 1", 6),
+    ("x = 2147483647 * 2", 6),
+    ("x = -2147483647 - 2", 6),
+    ("x = Sqr(-1)", 5),
+    ("x = Log(0)", 5),
+    ("x = Exp(1000)", 6),
+    ("x = CSng(1E+40)", 6),
+    ("x = CDbl(\"1e400\")", 6),
+    ("x = CInt(\"32768\")", 6),
+    ("x = Asc(Null)", 94),
+    ("x = Asc(\"\")", 5),
+    ("x = Chr(Null)", 94),
+    ("x = Val(Null)", 94),
+    ("x = Split(Null, \",\")", 94),
+    ("x = Join(Null, \",\")", 13),
+    ("x = Replace(Null, \"a\", \"b\")", 94),
+    ("x = Replace(\"abc\", Null, \"b\")", 94),
+    ("x = StrReverse(Null)", 94),
+    ("x = Len(Array(1))", 13),
+    ("x = CStr(Null)", 94),
+    ("x = CStr(Array(1))", 13),
+    ("x = CInt(Null)", 94),
+    ("x = CLng(Null)", 94),
+    ("x = Space(Null)", 94),
+    ("x = Space(-1)", 5),
+    ("x = String(-1, \"x\")", 5),
+    ("x = Mid(\"abcdef\", 0, 2)", 5),
+    ("x = Mid(\"abc\", Null)", 94),
+    ("x = Left(\"abc\", Null)", 94),
+    ("x = Left(\"abc\", -1)", 5),
+    ("x = InStr(0, \"abc\", \"b\")", 5),
+    ("x = InStrRev(\"abc\", \"b\", 0)", 5),
+    ("x = InStr(\"abc\", \"b\", Null)", 13),
 ];
 
 /// 脚本用例共用的声明与辅助过程（与 VB6 侧同一份）。
@@ -933,4 +1347,286 @@ parts = Split(\"a,b,c\", \",\")
 Debug.Print UBound(parts)
 Debug.Print Join(parts, \"|\")
 Debug.Print parts(1)", " 2\na|b|c\nb"),
+    ("on_error_goto_minus_one", "", "On Error Resume Next
+Dim x As Long
+x = 1 / 0
+Debug.Print Err.Number
+On Error GoTo -1
+Debug.Print Err.Number
+On Error Resume Next
+x = 1 / 0
+Debug.Print Err.Number", " 11\n 0\n 11"),
+    ("any_on_error_statement_clears_err", "", "On Error Resume Next
+Dim x As Long
+x = 1 / 0
+Debug.Print Err.Number
+Debug.Print Err.Number
+On Error Resume Next
+Debug.Print Err.Number
+x = 1 / 0
+Debug.Print Err.Number
+On Error GoTo 0
+Debug.Print Err.Number", " 11\n 11\n 0\n 11\n 0"),
+    ("dictionary_for_each_keys", "", "Dim d As New Dictionary
+d.Add \"a\", 10
+d.Add \"b\", 20
+Dim k As Variant
+Dim names As String
+For Each k In d
+    names = names & k
+Next
+Debug.Print names
+Dim total As Long
+For Each k In d
+    total = total + d(k)
+Next
+Debug.Print total", "ab\n 30"),
+    ("binary_string_put_get", "", "Dim g As Integer
+Dim s As String, t As String
+Dim path As String
+path = Environ(\"TEMP\") & \"\\qide_golden_bin.dat\"
+s = \"AB\"
+g = FreeFile
+Open path For Binary As #g
+Put #g, , s
+Put #g, , \"CD\"
+Put #g, , \"\"
+Debug.Print LOF(g)
+Close #g
+Open path For Binary As #g
+t = \"ABCD\"
+Get #g, 1, t
+Debug.Print t
+t = \"\"
+Get #g, , t
+Debug.Print Len(t)
+Close #g
+Kill path", " 4\nABCD\n 0"),
+    ("variant_content_types", "", "Dim i As Integer, v As Variant
+Dim x
+i = 1
+v = i
+Debug.Print VarType(v) & \" \" & TypeName(v)
+v = CByte(1)
+Debug.Print VarType(v)
+v = True
+Debug.Print VarType(v)
+v = CCur(1)
+Debug.Print VarType(v)
+v = CDate(1)
+Debug.Print VarType(v)
+v = i
+Debug.Print VarType(v + 1) & \" \" & VarType(v * 2)
+v = \"x\"
+Debug.Print VarType(v) & \" \" & TypeName(v)
+v = Null
+Debug.Print VarType(v)
+v = Empty
+Debug.Print VarType(v)
+x = 5
+Debug.Print VarType(x) & \" \" & TypeName(x)
+x = 40000
+Debug.Print VarType(x)
+x = 1.5
+Debug.Print VarType(x)", "2 Integer\n 17\n 11\n 6\n 7\n2 2\n8 String\n 1\n 0\n2 Integer\n 3\n 5"),
+    ("for_each_variant_element_types", "", "Dim ai(1 To 2) As Integer
+Dim al(1 To 2) As Long
+Dim ad(1 To 2) As Double
+Dim at(1 To 2) As String
+Dim ab(1 To 2) As Byte
+Dim v As Variant
+ai(1) = 1
+al(1) = 40000
+ad(1) = 1.5
+at(1) = \"x\"
+ab(1) = 9
+For Each v In ai
+    Debug.Print VarType(v) & \" \" & TypeName(v)
+Next
+For Each v In al
+    Debug.Print VarType(v)
+Next
+For Each v In ad
+    Debug.Print VarType(v)
+Next
+For Each v In at
+    Debug.Print VarType(v) & \" \" & TypeName(v)
+Next
+For Each v In ab
+    Debug.Print VarType(v)
+Next", "2 Integer\n2 Integer\n 3\n 3\n 5\n 5\n8 String\n8 String\n 17\n 17"),
+    ("single_printing", "", "Dim s As Single
+Debug.Print \"1=[\" & CSng(1.23456789) & \"]\"
+Debug.Print \"2=[\" & CSng(0.1) & \"]\"
+Debug.Print \"3=[\" & CSng(12345678) & \"]\"
+Debug.Print \"4=[\" & CSng(0.00001) & \"]\"
+Debug.Print \"5=[\" & CSng(1234567) & \"]\"
+Debug.Print \"6=[\" & CSng(1.5) & \"]\"
+Debug.Print \"7=[\" & CSng(0.000123456789) & \"]\"
+Debug.Print \"8=[\" & CSng(123456.789) & \"]\"
+s = 1 / 3
+Debug.Print \"9=[\" & s & \"]\"
+Debug.Print \"10=[\" & CSng(-1.23456789) & \"]\"
+Debug.Print \"11=[\" & CSng(100000) & \"]\"
+Debug.Print \"12=[\" & CSng(1E+20) & \"]\"
+Debug.Print \"13=[\" & CStr(CSng(1.23456789)) & \"]\"
+Debug.Print \"14=[\" & CStr(CSng(0.5)) & \"]\"
+Debug.Print \"15=[\" & Str(CSng(0.5)) & \"]\"
+Debug.Print \"16=[\" & Str(CSng(1.23456789)) & \"]\"
+Debug.Print \"17=[\" & Str(CSng(-1.23456789)) & \"]\"
+s = 0.1
+Debug.Print \"18=[\" & CStr(s) & \"]\"
+Debug.Print \"19=[\" & s & \"]\"
+Debug.Print \"20=[\" & Str(s) & \"]\"
+Debug.Print \"21=[\" & Format(CSng(1.23456789), \"0.000\") & \"]\"", "1=[1.234568]\n2=[0.1]\n3=[1.234568E+07]\n4=[0.00001]\n5=[1234567]\n6=[1.5]\n7=[1.234568E-04]\n8=[123456.8]\n9=[0.3333333]\n10=[-1.234568]\n11=[100000]\n12=[1E+20]\n13=[1.234568]\n14=[0.5]\n15=[ .5]\n16=[ 1.234568]\n17=[-1.234568]\n18=[0.1]\n19=[0.1]\n20=[ .1]\n21=[1.235]"),
+    ("vartype_of_declared_variables", "", "Dim i As Integer, b As Byte, s As Single, l As Long, c As Currency
+Dim dt As Date, flag As Boolean, text As String, v As Variant
+Dim arr(2) As Integer
+Debug.Print VarType(i) & \" \" & TypeName(i)
+Debug.Print VarType(b) & \" \" & TypeName(b)
+Debug.Print VarType(s) & \" \" & TypeName(s)
+Debug.Print VarType(l) & \" \" & TypeName(l)
+Debug.Print VarType(c) & \" \" & TypeName(c)
+Debug.Print VarType(dt) & \" \" & TypeName(dt)
+Debug.Print VarType(flag) & \" \" & TypeName(flag)
+Debug.Print VarType(text) & \" \" & TypeName(text)
+Debug.Print VarType(arr) & \" \" & TypeName(arr)
+Debug.Print VarType(v) & \" \" & TypeName(v)", "2 Integer\n17 Byte\n4 Single\n3 Long\n6 Currency\n7 Date\n11 Boolean\n8 String\n8194 Integer()\n0 Empty"),
+    ("error_statement_and_error_text", "", "On Error Resume Next
+Error 5
+Debug.Print Err.Number
+Debug.Print Err.Description
+Err.Clear
+Error 40080
+Debug.Print Err.Number
+Debug.Print Err.Description
+Err.Clear
+Debug.Print Error(5)
+Debug.Print Error$(5)
+Debug.Print Error(40080)
+Debug.Print Len(Error(0))", " 5\n无效的过程调用或参数\n 40080\n定义的应用程序或对象错误\n无效的过程调用或参数\n无效的过程调用或参数\n定义的应用程序或对象错误\n 0"),
+    ("narrow_value_types", "", "Dim s As Single
+s = CSng(1.23456789)
+Debug.Print s
+Dim v As Variant
+v = CSng(1.23456789)
+Debug.Print v
+Debug.Print VarType(v)
+Debug.Print TypeName(v)
+Dim b As Byte
+b = 200
+On Error Resume Next
+Dim total
+total = b + b
+Debug.Print Err.Number
+On Error GoTo 0
+Dim items
+items = Array(CByte(1), 2)
+Dim item
+For Each item In items
+    Debug.Print VarType(item)
+Next
+Dim picked(1)
+picked(0) = CByte(9)
+Debug.Print VarType(picked(0))
+Dim c As Collection
+Set c = New Collection
+c.Add CByte(7)
+For Each item In c
+    Debug.Print VarType(item)
+Next
+Dim dic As New Dictionary
+dic(\"k\") = CByte(1)
+Debug.Print VarType(dic(\"k\"))
+dic.Add \"k2\", CSng(1.5)
+Debug.Print VarType(dic(\"k2\"))
+Dim v2
+v2 = dic(\"k2\")
+Debug.Print VarType(v2)", " 1.234568\n 1.234568\n 4\nSingle\n 6\n 17\n 2\n 17\n 17\n 17\n 4\n 4"),
+    ("new_builtins", "", "On Error Resume Next
+Err.Clear
+Dim x As Long
+x = RGB(-1, 2, 3)
+Debug.Print Err.Number
+x = QBColor(16)
+Debug.Print Err.Number
+On Error GoTo 0
+Debug.Print RGB(1, 2, 3)
+Debug.Print RGB(255, 255, 255)
+Debug.Print RGB(256, 0, 0)
+Debug.Print RGB(300, 258, 3)
+Debug.Print QBColor(0)
+Debug.Print QBColor(1)
+Debug.Print QBColor(7)
+Debug.Print QBColor(15)
+Debug.Print FormatNumber(1234.5678)
+Debug.Print FormatNumber(1234.5678, 1)
+Debug.Print FormatNumber(-1234.5)
+Debug.Print FormatNumber(1234.5, 0, vbTrue, vbTrue, vbFalse)
+Debug.Print FormatNumber(1234.5, 2, vbTrue, vbTrue)
+Debug.Print FormatNumber(0.5, 2, vbFalse)
+Debug.Print FormatCurrency(1234.5)
+Debug.Print FormatCurrency(1234.5, 0)
+Debug.Print FormatCurrency(-1234.5, 2, vbTrue, vbTrue)
+Debug.Print FormatPercent(0.5)
+Debug.Print FormatPercent(0.5, 1)
+Debug.Print FormatPercent(-0.5, 0)
+Debug.Print FormatDateTime(#2024-02-29 13:05:06#)
+Debug.Print FormatDateTime(#2024-02-29 13:05:06#, 1)
+Debug.Print FormatDateTime(#2024-02-29 13:05:06#, 2)
+Debug.Print FormatDateTime(#2024-02-29 13:05:06#, 3)
+Debug.Print FormatDateTime(#2024-02-29 13:05:06#, 4)
+Debug.Print \"a\"; Spc(3); \"b\"
+Debug.Print \"a\"; Tab(10); \"b\"
+Debug.Print Tab(3); \"x\"
+Debug.Print Tab(1); \"y\"
+Debug.Print \"abc\"; Tab(2); \"z\"
+SaveSetting \"qide-golden\", \"section\", \"key\", \"value\"
+Debug.Print GetSetting(\"qide-golden\", \"section\", \"key\")
+Debug.Print GetSetting(\"qide-golden\", \"section\", \"missing\", \"def\")
+Debug.Print \"[\" & GetSetting(\"qide-golden\", \"nosuch\", \"key\") & \"]\"
+DeleteSetting \"qide-golden\", \"section\", \"key\"
+Debug.Print \"[\" & GetSetting(\"qide-golden\", \"section\", \"key\") & \"]\"
+Debug.Print VarType(vbTrue)
+Debug.Print TypeName(vbTrue)
+Debug.Print Len(vbCrLf)
+Debug.Print vbCrLf = Chr(13) & Chr(10)
+Debug.Print vbYesNo
+Debug.Print vbOKOnly
+Debug.Print vbObjectError", " 5\n 5\n 197121\n 16777215\n 255\n 262143\n 0\n 8388608\n 12632256\n 16777215\n1,234.57\n1,234.6\n-1,234.50\n1235\n1,234.50\n.50\n￥1,234.50\n￥1,235\n(￥1,234.50)\n50.00%\n50.0%\n-50%\n2024/2/29 13:05:06\n2024年2月29日\n2024/2/29\n13:05:06\n13:05\na   b\na        b\n  x\ny\nabc\n z\nvalue\ndef\n[]\n[]\n 3\nLong\n 2\nTrue\n 4\n 0\n-2147221504"),
+    ("null_argument_rules", "", "' `Null` 走 `Variant` 形参的函数要原样返回 `Null`，非 `Variant` 形参的函数报 94（本机 VB6 实测）
+Dim v As Variant
+v = Trim(Null)
+Debug.Print IsNull(v)
+v = LTrim(Null)
+Debug.Print IsNull(v)
+v = RTrim(Null)
+Debug.Print IsNull(v)
+v = UCase(Null)
+Debug.Print IsNull(v)
+v = LCase(Null)
+Debug.Print IsNull(v)
+v = Left(Null, 2)
+Debug.Print IsNull(v)
+v = Right(Null, 2)
+Debug.Print IsNull(v)
+v = Mid(Null, 1, 2)
+Debug.Print IsNull(v)
+v = Len(Null)
+Debug.Print IsNull(v)
+v = LenB(Null)
+Debug.Print IsNull(v)
+v = String(3, Null)
+Debug.Print IsNull(v)
+v = InStr(Null, \"a\")
+Debug.Print IsNull(v)
+v = InStr(\"a\", Null)
+Debug.Print IsNull(v)
+' 不传播、返回空串或非 Null 的
+v = Format(Null, \"0\")
+Debug.Print \"[\" & v & \"]\", IsNull(v)
+v = IsNull(Null)
+Debug.Print v
+v = IsNumeric(Null)
+Debug.Print v", "True\nTrue\nTrue\nTrue\nTrue\nTrue\nTrue\nTrue\nTrue\nTrue\nTrue\nTrue\nTrue\n[]            False\nTrue\nFalse"),
 ];

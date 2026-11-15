@@ -29,7 +29,11 @@ impl CodeWindow {
     }
 
     /// 最左侧活动栏。
-    pub(super) fn activity_bar(&self, cx: &mut Context<Self>, appearance: &AppearanceSettings) -> AnyElement {
+    pub(super) fn activity_bar(
+        &self,
+        cx: &mut Context<Self>,
+        appearance: &AppearanceSettings,
+    ) -> AnyElement {
         let palette = Palette::for_theme(cx);
         // 选中态用偏白的高亮盖掉组件默认的“按下变暗”。
         let selected_bg = rgba(palette.activity_bar_selected);
@@ -54,9 +58,7 @@ impl CodeWindow {
             .border_color(rgba(Palette::for_theme(cx).border))
             .overflow_hidden()
             // 把面板拖到活动栏上，就把它放回左侧 dock。
-            .drag_over::<DragPanel>(|this, _, _, cx| {
-                this.bg(rgba(Palette::for_theme(cx).hover))
-            })
+            .drag_over::<DragPanel>(|this, _, _, cx| this.bg(rgba(Palette::for_theme(cx).hover)))
             .on_drop(cx.listener(|this, drag: &DragPanel, window, cx| {
                 this.panel_drag = None;
                 this.move_panel_to_slot(drag.panel(), SideSlot::Left, window, cx);
@@ -67,9 +69,7 @@ impl CodeWindow {
                     .ghost()
                     .icon(Icon::new(IconName::PanelLeft).text_color(icon_color))
                     .selected(appearance.show_explorer())
-                    .when(appearance.show_explorer(), |button| {
-                        button.bg(selected_bg)
-                    })
+                    .when(appearance.show_explorer(), |button| button.bg(selected_bg))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_panel(PanelKind::Explorer, window, cx)
                     })),
@@ -79,9 +79,7 @@ impl CodeWindow {
                     .ghost()
                     .icon(Icon::new(IconName::FileText).text_color(icon_color))
                     .selected(appearance.show_outline())
-                    .when(appearance.show_outline(), |button| {
-                        button.bg(selected_bg)
-                    })
+                    .when(appearance.show_outline(), |button| button.bg(selected_bg))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_panel(PanelKind::Outline, window, cx)
                     })),
@@ -93,21 +91,17 @@ impl CodeWindow {
                     .tooltip("AI 编程")
                     .selected(appearance.show_ai())
                     .when(appearance.show_ai(), |button| button.bg(selected_bg))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_ai_panel(window, cx)
-                    })),
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_ai_panel(window, cx))),
             )
             .child(
                 Button::new("toggle-search-panel")
                     .ghost()
                     .icon(Icon::new(IconName::Search).text_color(icon_color))
                     .selected(appearance.show_search())
-                    .when(appearance.show_search(), |button| {
-                        button.bg(selected_bg)
-                    })
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_search_panel(window, cx)
-                    })),
+                    .when(appearance.show_search(), |button| button.bg(selected_bg))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.toggle_search_panel(window, cx)),
+                    ),
             )
             .child(div().flex_1())
             .child(
@@ -136,10 +130,10 @@ impl CodeWindow {
             .and_then(|index| self.open_files.get(index))
             .map(|file| file.name.to_string());
         let language = workspace::language_label(&self.effective_language(settings));
-        let file_encoding = self
+        let encoding_menu = self
             .active_file
             .and_then(|index| self.open_files.get(index))
-            .map(|file| file.encoding.label());
+            .map(|file| menu::encoding_menu(cx, palette, cx.entity().downgrade(), file.encoding));
         let output_lines = self.output.read(cx).len();
         let cursor = if self.active_file.is_some() {
             let editor = self.editor.read(cx);
@@ -182,7 +176,6 @@ impl CodeWindow {
             StatusInfo {
                 file_name: file_name.as_deref(),
                 language,
-                encoding: file_encoding,
                 line_count,
                 char_count,
                 cursor,
@@ -191,6 +184,7 @@ impl CodeWindow {
                 debug_state: debug_state.as_deref(),
             },
             on_toggle_output,
+            encoding_menu,
         )
     }
 }
@@ -202,36 +196,59 @@ impl Render for CodeWindow {
         let appearance = settings.appearance.clone();
 
         div()
+            .id("code-window")
             .relative()
             .v_flex()
             .size_full()
             .bg(rgb(palette.window_bg))
+            // 松开鼠标：窗口内是正常拖放，窗口外则把正在拖的资源管理器路径复制到剪贴板。
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, _cx| this.reset_explorer_drag()),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                if !this.drag_out.is_dragging() {
+                    return;
+                }
+                let size = window.viewport_size();
+                let inside = event.position.x >= px(0.0)
+                    && event.position.y >= px(0.0)
+                    && event.position.x <= size.width
+                    && event.position.y <= size.height;
+                this.explorer_drag_moved(inside, event.pressed_button.is_some(), cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, _cx| this.finish_explorer_drag_inside()),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.finish_explorer_drag_outside(cx)),
+            )
             .on_action(cx.listener(|this, _: &SaveFile, _window, cx| this.save_file(cx)))
-            .on_action(cx.listener(|this, _: &SaveFileAs, window, cx| {
-                this.save_file_as(window, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &SaveFileAs, window, cx| this.save_file_as(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &NewFile, window, cx| this.new_file(window, cx)))
-            .on_action(cx.listener(|this, _: &OpenFiles, window, cx| {
-                this.open_files_dialog(window, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &OpenFiles, window, cx| this.open_files_dialog(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &RunScript, _window, cx| this.run_script(cx)))
             .on_action(cx.listener(|this, _: &StopScript, _window, cx| this.stop_script(cx)))
             .on_action(cx.listener(|this, _: &DebugRun, _window, cx| this.start_debug(cx)))
             .on_action(cx.listener(|this, _: &DebugPause, _window, cx| this.debug_pause(cx)))
             .on_action(cx.listener(|this, _: &DebugResume, _window, cx| this.debug_resume(cx)))
             .on_action(cx.listener(|this, _: &DebugStep, _window, cx| this.debug_step(cx)))
-            .on_action(cx.listener(|this, _: &GoToDefinition, window, cx| {
-                this.go_to_definition(window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &FindReferences, _, cx| {
-                this.find_references(cx)
-            }))
-            .on_action(cx.listener(|this, _: &GoToLine, window, cx| {
-                this.goto_dialog(window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &GoToFile, window, cx| {
-                this.goto_file_dialog(window, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &GoToDefinition, window, cx| {
+                    this.go_to_definition(window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &FindReferences, _, cx| this.find_references(cx)))
+            .on_action(cx.listener(|this, _: &GoToLine, window, cx| this.goto_dialog(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &GoToFile, window, cx| this.goto_file_dialog(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &ToggleSearch, window, cx| {
                 this.toggle_search(false, window, cx)
             }))
@@ -250,36 +267,29 @@ impl Render for CodeWindow {
             .on_action(cx.listener(|this, _: &ToggleComment, window, cx| {
                 this.toggle_active_comment(window, cx)
             }))
-            .on_action(cx.listener(|this, _: &SaveAllFiles, _window, cx| {
-                this.save_all_files(cx)
-            }))
-            .on_action(cx.listener(|this, _: &NextTab, window, cx| {
-                this.cycle_tab(true, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &PreviousTab, window, cx| {
-                this.cycle_tab(false, window, cx)
-            }))
+            .on_action(cx.listener(|this, _: &SaveAllFiles, _window, cx| this.save_all_files(cx)))
+            .on_action(
+                cx.listener(|this, _: &NextTab, window, cx| this.cycle_tab(true, window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &PreviousTab, window, cx| this.cycle_tab(false, window, cx)),
+            )
             .on_action(cx.listener(|this, _: &ShowCommands, window, cx| {
                 this.command_palette_dialog(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowShortcuts, window, cx| {
+                this.show_shortcuts_dialog(window, cx)
             }))
             .on_action(cx.listener(|this, _: &ReopenClosedFile, window, cx| {
                 this.reopen_closed_file(window, cx)
             }))
-            .on_action(cx.listener(|this, _: &RunToCursor, _, cx| {
-                this.run_to_cursor(cx)
-            }))
-            .on_action(cx.listener(|this, _: &ClearBreakpoints, _, cx| {
-                this.clear_all_breakpoints(cx)
-            }))
-            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| {
-                this.zoom_editor(Some(1.0), cx)
-            }))
-            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| {
-                this.zoom_editor(Some(-1.0), cx)
-            }))
-            .on_action(cx.listener(|this, _: &ZoomReset, _, cx| {
-                this.zoom_editor(None, cx)
-            }))
+            .on_action(cx.listener(|this, _: &RunToCursor, _, cx| this.run_to_cursor(cx)))
+            .on_action(
+                cx.listener(|this, _: &ClearBreakpoints, _, cx| this.clear_all_breakpoints(cx)),
+            )
+            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom_editor(Some(1.0), cx)))
+            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom_editor(Some(-1.0), cx)))
+            .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom_editor(None, cx)))
             .on_action(cx.listener(|this, _: &ToggleBreakpoint, window, cx| {
                 // 断点按编辑框光标所在行切换，先让编辑框拿到焦点。
                 let editor = this.editor.clone();

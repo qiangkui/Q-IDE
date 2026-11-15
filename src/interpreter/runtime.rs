@@ -23,6 +23,7 @@ use crate::interpreter::debug::{
 use crate::interpreter::error::RuntimeError;
 use crate::interpreter::ffi;
 use crate::interpreter::filelock;
+use crate::interpreter::hasher::FastMap;
 use crate::interpreter::trampoline::Trampoline;
 use crate::interpreter::value::{
     ClassRef, RecordField, Value, VbArray, VbDictionary, VbInstance, VbRecord, VbType,
@@ -93,6 +94,11 @@ pub struct Slot {
     /// 循环体里的 `Dim` 每轮都会执行到，靠它区分「同一条声明又跑了一遍」和
     /// 「同一过程里重复声明了两个同名变量」。
     declared_at: usize,
+    /// `Variant` 槽里当前值的 VB6 类型（见 [`Slot::narrow_type`]）。
+    ///
+    /// 用 `Rc<Cell<_>>` 而不是 `Cell`：`Slot` 是克隆出去用的（`find_slot` 返回克隆），
+    /// 存储共享、标注也必须共享，否则写在克隆上的类型就丢了。
+    narrow: Rc<std::cell::Cell<Option<VbType>>>,
 }
 
 impl Slot {
@@ -107,6 +113,15 @@ impl Slot {
 
     /// 共享一个已有的值单元（数组元素持 `ByRef` 传参时使用）。
     pub fn from_cell(cell: Rc<RefCell<Value>>, ty: VbType) -> Self {
+        Self::from_cell_with_narrow(cell, ty, Rc::new(std::cell::Cell::new(None)))
+    }
+
+    /// 共享值单元与内容类型标注（UDT 的 `Variant` 字段当 `ByRef` 实参时用）。
+    pub fn from_cell_with_narrow(
+        cell: Rc<RefCell<Value>>,
+        ty: VbType,
+        narrow: Rc<std::cell::Cell<Option<VbType>>>,
+    ) -> Self {
         Self {
             cell,
             ty,
@@ -114,6 +129,7 @@ impl Slot {
             array_binding: false,
             missing: std::cell::Cell::new(false),
             declared_at: 0,
+            narrow,
         }
     }
 
@@ -126,6 +142,7 @@ impl Slot {
             array_binding,
             missing: std::cell::Cell::new(false),
             declared_at: 0,
+            narrow: Rc::new(std::cell::Cell::new(None)),
         }
     }
 
@@ -161,11 +178,25 @@ impl Slot {
         self.ty
     }
 
+    /// `Variant` 槽里当前值的 VB6 类型（`v = i`（Integer）之后是 `Integer`）。
+    ///
+    /// 值本身只带动态类型，所以赋值时把右侧表达式的静态类型记在这里；`VarType` / `TypeName`
+    /// 用它把 `Integer`/`Long`、`Single`/`Double` 区分开。每次写入都会先清空（`set`），
+    /// 不会留下过期信息。
+    pub fn narrow_type(&self) -> Option<VbType> {
+        self.narrow.get()
+    }
+
+    fn set_narrow(&self, ty: Option<VbType>) {
+        self.narrow.set(ty);
+    }
+
     pub fn set(&self, value: Value) -> Result<(), String> {
         if self.readonly {
             return Err("不能给常量赋值".into());
         }
         self.missing.set(false);
+        self.narrow.set(None);
         if fits_directly(self.ty, &value) {
             *self.cell.borrow_mut() = value;
             return Ok(());
@@ -178,7 +209,7 @@ impl Slot {
 
 #[derive(Default)]
 struct Frame {
-    locals: HashMap<String, Slot>,
+    locals: FastMap<String, Slot>,
     /// 函数返回值所在的槽（函数名即返回值）。
     result: Option<Slot>,
     /// 当前过程名，`Static` 局部变量按它归档。
@@ -376,6 +407,16 @@ impl BinaryFile {
     }
 }
 
+/// 一个已挂接的 COM 事件源：模块级变量（`instance` 为 `None`）或类字段上的 `WithEvents`。
+struct ComEventOwner {
+    instance: Option<Weak<RefCell<VbInstance>>>,
+    field: String,
+    events: com::ComEvents,
+}
+
+/// COM 调用的一个实参：命名实参的名字、值、是否按 `ByRef` 传、写回用的变量槽。
+type ComArgument = (Option<String>, Value, bool, Option<Slot>);
+
 pub struct Runtime<'p, 'o> {
     generation: u64,
     procedures: HashMap<String, &'p Procedure>,
@@ -387,11 +428,11 @@ pub struct Runtime<'p, 'o> {
     /// `Class ... End Class` 定义。
     classes: HashMap<String, &'p ClassDef>,
     /// 模块级变量，所有过程都能看到。
-    globals: HashMap<String, Slot>,
+    globals: FastMap<String, Slot>,
     /// 过程调用栈，只保存当前过程的局部变量。
     frames: Vec<Frame>,
     /// `Static` 局部变量：过程合 → 变量。
-    statics: HashMap<String, HashMap<String, Slot>>,
+    statics: FastMap<String, FastMap<String, Slot>>,
     /// `Option Explicit`：未声明变量直接报错。
     option_explicit: bool,
     /// `Option Compare Text`：字符串比较忽略大小写。
@@ -423,6 +464,10 @@ pub struct Runtime<'p, 'o> {
     persistent_callbacks: Vec<PersistentCallback>,
     /// 事件订阅表：源实例 → 订阅它的 `WithEvents` 对象（弱引用，随对象一起消失）。
     events: HashMap<usize, Vec<Weak<RefCell<VbInstance>>>>,
+    /// `WithEvents` 声明的变量名（标识符已小写）：`Set` 到 COM 对象时挂接事件。
+    com_event_vars: std::collections::HashSet<String>,
+    /// 已挂接的 COM 事件连接；`Drop` 时自动 `Unadvise`。
+    com_events: Vec<ComEventOwner>,
     /// 调试控制器；普通运行时为 `None`。
     debug: Option<Arc<DebugControl>>,
     /// 是否累计执行频次统计（`--stats`）。
@@ -440,6 +485,13 @@ pub struct Runtime<'p, 'o> {
     cwd: PathBuf,
     /// COM apartment initialization failure is deferred until a script requests COM.
     com_error: Option<String>,
+    /// 「刚刚求值出来的那个值」的内容类型（`Variant` 里装的是 `Integer` 还是 `Long`）。
+    ///
+    /// `Value` 本身不带窄类型，`Slot` / 数组 / UDT 字段 / 类字段都各自记了一份；唯独
+    /// **返回 `Variant` 的函数**与**返回实参的 `IIf`/`Choose`/`Switch`** 这类路径把值直接交出去，
+    /// 类型信息会丢。`VarType` / `TypeName` 需要它，所以在这些路径上顺手记一笔
+    /// （只有求值这几个函数时才被读写，热路径没有开销）。
+    result_narrow: Option<VbType>,
 }
 
 impl Drop for Runtime<'_, '_> {
@@ -536,7 +588,7 @@ pub fn run_program_with_stats(
     }
 
     // `Enum` 成员注册成模块级常量；重名时报错。
-    let mut globals = HashMap::new();
+    let mut globals = FastMap::default();
     for def in &program.enums {
         for (name, value) in &def.members {
             if globals.contains_key(name) {
@@ -575,7 +627,7 @@ pub fn run_program_with_stats(
         classes,
         globals,
         frames: Vec::new(),
-        statics: HashMap::new(),
+        statics: FastMap::default(),
         option_explicit: program.option_explicit,
         option_compare_text: program.option_compare_text,
         allow_ui: options.allow_ui,
@@ -599,12 +651,25 @@ pub fn run_program_with_stats(
         strings: Vec::new(),
         persistent_callbacks: Vec::new(),
         events: HashMap::new(),
+        com_event_vars: program
+            .main
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Stmt::Dim { items, .. } => Some(items),
+                _ => None,
+            })
+            .flatten()
+            .filter(|item| item.with_events)
+            .map(|item| item.name.clone())
+            .collect(),
+        com_events: Vec::new(),
         debug,
         evaluating: false,
         command_line: options.command_line.clone(),
         script_dir: script_dir.clone(),
         cwd: script_dir,
         com_error,
+        result_narrow: None,
     };
 
     // 脚本执行期间让 `Class_Terminate` 能找到解释器；结束时先释放变量再撤回指针。
@@ -673,8 +738,18 @@ impl<'p, 'o> Runtime<'p, 'o> {
         self.globals.get(name).cloned()
     }
 
+    /// 只读地借用槽（读变量走这条，省掉 `Slot` 克隆带来的 `Rc` 计数与释放）。
+    fn lookup_slot(&self, name: &str) -> Option<&Slot> {
+        if let Some(frame) = self.frames.last()
+            && let Some(slot) = frame.locals.get(name)
+        {
+            return Some(slot);
+        }
+        self.globals.get(name)
+    }
+
     /// 当前作用域：模块级写全局表，过程内写栈顶帧。
-    fn scope_mut(&mut self) -> &mut HashMap<String, Slot> {
+    fn scope_mut(&mut self) -> &mut FastMap<String, Slot> {
         match self.frames.last_mut() {
             Some(frame) => &mut frame.locals,
             None => &mut self.globals,
@@ -785,9 +860,15 @@ impl<'p, 'o> Runtime<'p, 'o> {
         Ok(slot)
     }
 
-    fn set_var(&mut self, name: &str, value: Value, line: usize) -> Result<(), RuntimeError> {
-        match self.find_slot(name) {
-            Some(slot) => self.store_in(&slot, name, value, line),
+    fn set_var(
+        &mut self,
+        name: &str,
+        value: Value,
+        line: usize,
+        from: Option<&Expr>,
+    ) -> Result<(), RuntimeError> {
+        match self.lookup_slot(name) {
+            Some(slot) => self.store_in(slot, name, value, line, from),
             None => {
                 if self.option_explicit {
                     return Err(RuntimeError::new(
@@ -795,13 +876,28 @@ impl<'p, 'o> Runtime<'p, 'o> {
                         line,
                     ));
                 }
-                self.scope_mut().insert(
-                    name.to_string(),
-                    Slot::new(value.copy_value(), VbType::Variant),
-                );
+                let narrow = self.narrow_of(from);
+                let slot = Slot::new(value.copy_value(), VbType::Variant);
+                slot.set_narrow(narrow);
+                self.scope_mut().insert(name.to_string(), slot);
                 Ok(())
             }
         }
+    }
+
+    /// `&` 拼接时把 `Single` 值先按 7 位有效数字渲染成字符串（VB6 实测）；其它值原样不动。
+    fn render_single(&self, expr: &Expr, value: &mut Value) {
+        if let Value::Float(number) = value
+            && self.static_type(expr) == Some(VbType::Single)
+        {
+            *value = Value::Str(crate::interpreter::value::format_single(*number));
+        }
+    }
+
+    /// `Variant` 槽要记下的内容类型（`Variant` / 对象 / 推断不出来的都记为 `None`）。
+    fn narrow_of(&self, from: Option<&Expr>) -> Option<VbType> {
+        let ty = self.static_type(from?)?;
+        (!matches!(ty, VbType::Variant | VbType::Any | VbType::Object)).then_some(ty)
     }
 
     /// 写入已有的单元（`set_var` 与循环计数器共用）。
@@ -811,6 +907,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         name: &str,
         value: Value,
         line: usize,
+        from: Option<&Expr>,
     ) -> Result<(), RuntimeError> {
         if slot.is_readonly() {
             return Err(RuntimeError::new(format!("不能给常量 `{name}` 赋值"), line));
@@ -822,7 +919,12 @@ impl<'p, 'o> Runtime<'p, 'o> {
             ));
         }
         slot.set(value)
-            .map_err(|message| RuntimeError::from_coerce(message, line))
+            .map_err(|message| RuntimeError::from_coerce(message, line))?;
+        // 写进 `Variant` 时记下值的 VB6 类型（实测 `v = i`（Integer）之后 `VarType(v)` 是 2）。
+        if slot.ty() == VbType::Variant {
+            slot.set_narrow(self.narrow_of(from));
+        }
+        Ok(())
     }
 
     // ---------- 步数 / 中断 ----------
@@ -966,6 +1068,8 @@ impl<'p, 'o> Runtime<'p, 'o> {
         let mut index = 0usize;
         let mut gosub_returns = Vec::new();
         while index < stmts.len() {
+            // COM 事件在语句边界分派：回调里只排队，避免重入解释器。
+            self.drain_com_events()?;
             match self.exec(&stmts[index]) {
                 Ok(Flow::Normal) => index += 1,
                 Ok(Flow::Goto(label)) => match find_label(stmts, &label) {
@@ -1087,7 +1191,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     } else if !self.declare_slot(&item.name, value.clone(), slot_ty, *line)? {
                         // 同一条 `Dim` 又跑了一遍（循环体里）：变量保留，初值重新算。
                         if item.initializer.is_some() {
-                            self.set_var(&item.name, value, *line)?;
+                            self.set_var(&item.name, value, *line, None)?;
                         }
                     }
                 }
@@ -1187,7 +1291,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 {
                     return self.call_property_let(procedure, &[], value, *line);
                 }
-                let value = self.eval(value, *line)?;
+                let evaluated = self.eval(value, *line)?;
                 // 只有带类型后缀（`x$ = ...`）才可能在这里隐式声明。
                 if !self.option_explicit
                     && suffix.is_some()
@@ -1196,22 +1300,23 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 {
                     self.declare(target, ty, *line)?;
                 }
-                self.set_var(target, value, *line)?;
+                // `Variant` 变量要记下右侧表达式的静态类型（见 `Slot::narrow_type`）。
+                self.set_var(target, evaluated, *line, Some(value))?;
                 Ok(Flow::Normal)
             }
             Stmt::AssignIndex {
                 name,
                 indices,
-                value,
+                value: rhs,
                 line,
             } => {
                 if !self.lets.is_empty()
                     && self.find_slot(name).is_none()
                     && let Some(procedure) = self.lets.get(name).copied()
                 {
-                    return self.call_property_let(procedure, indices, value, *line);
+                    return self.call_property_let(procedure, indices, rhs, *line);
                 }
-                let value = self.eval(value, *line)?;
+                let value = self.eval(rhs, *line)?;
                 let slot = self
                     .find_slot(name)
                     .ok_or_else(|| RuntimeError::new(format!("未定义的变量 `{name}`"), *line))?;
@@ -1235,7 +1340,21 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     };
                     let key = VbDictionary::key_of(&key)
                         .map_err(|message| RuntimeError::new(message, *line))?;
-                    entries.borrow_mut().set(key, value);
+                    let narrow = self.narrow_of(Some(rhs));
+                    entries.borrow_mut().set(key, value, narrow);
+                    return Ok(Flow::Normal);
+                }
+                if let Value::ComObject(object) = &current {
+                    // `d("键") = 值`：COM 对象的默认成员（`DISPID_VALUE`）写入（VB6 实测可用）。
+                    let mut index_values = Vec::with_capacity(indices.len());
+                    for expr in indices {
+                        index_values.push(self.eval(expr, *line)?);
+                    }
+                    object
+                        .set_default(&index_values, &value)
+                        .map_err(|failure| {
+                            RuntimeError::new(failure.message, *line).with_number(failure.number)
+                        })?;
                     return Ok(Flow::Normal);
                 }
                 let indices = self.eval_indices(indices, *line)?;
@@ -1245,13 +1364,23 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 let array = current
                     .as_array()
                     .map_err(|message| RuntimeError::new(format!("`{name}` {message}"), *line))?;
-                array.borrow_mut().set(&indices, value).map_err(|message| {
-                    if message.contains("溢出") {
-                        RuntimeError::from_coerce(format!("数组 `{name}`：{message}"), *line)
-                    } else {
-                        RuntimeError::new(format!("数组 `{name}`：{message}"), *line).with_number(9)
-                    }
-                })?;
+                // `Variant` 数组要记下元素的内容类型（`arr(0) = CByte(9)` 之后 `VarType(arr(0))` 是 17）。
+                let narrow = if array.borrow().element_type() == VbType::Variant {
+                    self.narrow_of(Some(rhs))
+                } else {
+                    None
+                };
+                array
+                    .borrow_mut()
+                    .set(&indices, value, narrow)
+                    .map_err(|message| {
+                        if message.contains("溢出") {
+                            RuntimeError::from_coerce(format!("数组 `{name}`：{message}"), *line)
+                        } else {
+                            RuntimeError::new(format!("数组 `{name}`：{message}"), *line)
+                                .with_number(9)
+                        }
+                    })?;
                 Ok(Flow::Normal)
             }
             Stmt::AssignMember {
@@ -1262,14 +1391,24 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 line,
             } => {
                 let root = self.eval(base, *line)?;
-                if let Value::ComObject(object) = &root {
-                    if path.len() != 1 {
-                        return Err(RuntimeError::new("COM 属性暂不支持链式成员赋值", *line));
+                if matches!(root, Value::ComObject(_)) {
+                    // `obj.Sub.Prop = v`：中间层按属性读出来，赋值落在最后一层。
+                    let mut target = root.clone();
+                    for member in &path[..path.len().saturating_sub(1)] {
+                        target = self.read_member(&Expr::Literal(target), member, *line)?;
                     }
+                    let last = path.last().cloned().unwrap_or_default();
                     let value = self.eval(value, *line)?;
-                    object
-                        .set(&path[0], &value)
-                        .map_err(|message| RuntimeError::new(message, *line).with_number(438))?;
+                    let Value::ComObject(object) = &target else {
+                        return Err(RuntimeError::new(
+                            format!("`{last}` 所在的值不是 COM 对象"),
+                            *line,
+                        )
+                        .with_number(424));
+                    };
+                    object.set(&last, &value).map_err(|failure| {
+                        RuntimeError::new(failure.message, *line).with_number(failure.number)
+                    })?;
                     return Ok(Flow::Normal);
                 }
                 if let Value::Class(instance) = &root {
@@ -1279,8 +1418,10 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 if !root.is_record() {
                     return Err(RuntimeError::new("成员赋值的目标不是记录类型", *line));
                 }
+                // `Variant` 字段要记下右侧表达式的静态类型（`u.f = i` 之后 `VarType(u.f)` 是 2）。
+                let narrow = self.narrow_of(Some(value));
                 let value = self.eval(value, *line)?;
-                self.assign_member(root, path, value, *line)?;
+                self.assign_member(root, path, value, narrow, *line)?;
                 Ok(Flow::Normal)
             }
             Stmt::AssignMemberIndex {
@@ -1293,18 +1434,48 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 line,
             } => {
                 let root = self.eval(base, *line)?;
-                if let Value::ComObject(object) = &root {
-                    if path.len() != 1 || !member_path.is_empty() {
-                        return Err(RuntimeError::new("COM 索引属性暂不支持链式成员赋值", *line));
+                if matches!(root, Value::ComObject(_)) {
+                    // 中间层按属性读出来（`rs.Fields`），再分两种情形：
+                    // `d.Item("k") = v` 走索引属性写入，`rs.Fields("id").Value = v` 则读出中间对象再设成员。
+                    let mut target = root.clone();
+                    for member in &path[..path.len().saturating_sub(1)] {
+                        target = self.read_member(&Expr::Literal(target), member, *line)?;
                     }
+                    let Some(member) = path.last().cloned() else {
+                        return Err(RuntimeError::new("缺少成员名", *line));
+                    };
+                    let Value::ComObject(com) = &target else {
+                        return Err(RuntimeError::new("COM 索引属性的目标不是对象", *line));
+                    };
                     let mut index_values = Vec::with_capacity(indices.len());
                     for expr in indices {
                         index_values.push(self.eval(expr, *line)?);
                     }
                     let value = self.eval(value, *line)?;
-                    object
-                        .set_indexed(&path[0], &index_values, &value)
-                        .map_err(|message| RuntimeError::new(message, *line).with_number(438))?;
+                    if member_path.is_empty() {
+                        com.set_indexed(&member, &index_values, &value)
+                            .map_err(|failure| {
+                                RuntimeError::new(failure.message, *line)
+                                    .with_number(failure.number)
+                            })?;
+                        return Ok(Flow::Normal);
+                    }
+                    let mut nested =
+                        self.call_com_with_values(com, &member, index_values, *line)?;
+                    for step in &member_path[..member_path.len() - 1] {
+                        nested = self.read_member(&Expr::Literal(nested), step, *line)?;
+                    }
+                    let last = member_path.last().cloned().unwrap_or_default();
+                    let Value::ComObject(object) = &nested else {
+                        return Err(RuntimeError::new(
+                            format!("`{last}` 所在的值不是 COM 对象"),
+                            *line,
+                        )
+                        .with_number(424));
+                    };
+                    object.set(&last, &value).map_err(|failure| {
+                        RuntimeError::new(failure.message, *line).with_number(failure.number)
+                    })?;
                     return Ok(Flow::Normal);
                 }
                 if let Value::Class(instance) = &root {
@@ -1334,14 +1505,20 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     .as_array()
                     .map_err(|_| RuntimeError::new(format!("字段 `{last}` 不是数组"), *line))?;
                 if member_path.is_empty() {
-                    array.borrow_mut().set(&indices, value).map_err(|message| {
-                        if message.contains("溢出") {
-                            RuntimeError::from_coerce(format!("字段 `{last}`：{message}"), *line)
-                        } else {
-                            RuntimeError::new(format!("字段 `{last}`：{message}"), *line)
-                                .with_number(9)
-                        }
-                    })?;
+                    array
+                        .borrow_mut()
+                        .set(&indices, value, None)
+                        .map_err(|message| {
+                            if message.contains("溢出") {
+                                RuntimeError::from_coerce(
+                                    format!("字段 `{last}`：{message}"),
+                                    *line,
+                                )
+                            } else {
+                                RuntimeError::new(format!("字段 `{last}`：{message}"), *line)
+                                    .with_number(9)
+                            }
+                        })?;
                 } else {
                     let element = array.borrow().get(&indices).map_err(|message| {
                         RuntimeError::new(format!("字段 `{last}`：{message}"), *line).with_number(9)
@@ -1352,7 +1529,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                             *line,
                         ));
                     }
-                    self.assign_member(element, member_path, value, *line)?;
+                    self.assign_member(element, member_path, value, None, *line)?;
                 }
                 Ok(Flow::Normal)
             }
@@ -1365,9 +1542,11 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 };
                 let value = self.eval(value, *line)?;
                 match &root {
-                    Value::ComObject(object) if path.len() == 1 => object
-                        .set(&path[0], &value)
-                        .map_err(|message| RuntimeError::new(message, *line).with_number(438))?,
+                    Value::ComObject(object) if path.len() == 1 => {
+                        object.set(&path[0], &value).map_err(|failure| {
+                            RuntimeError::new(failure.message, *line).with_number(failure.number)
+                        })?;
+                    }
                     Value::ComObject(_) => {
                         return Err(RuntimeError::new("COM 属性暂不支持链式成员赋值", *line));
                     }
@@ -1380,7 +1559,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                             *line,
                         )?;
                     }
-                    _ => self.assign_member(root, path, value, *line)?,
+                    _ => self.assign_member(root, path, value, None, *line)?,
                 }
                 Ok(Flow::Normal)
             }
@@ -1444,46 +1623,53 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 let value = self.eval(value, *line)?;
                 if !value.is_collection()
                     && !value.is_dictionary()
-                    && !matches!(value, Value::Class(_) | Value::ComObject(_) | Value::Empty)
+                    && !matches!(
+                        value,
+                        Value::Class(_) | Value::ComObject(_) | Value::Picture(_) | Value::Empty
+                    )
                 {
                     return Err(RuntimeError::new(
-                        "`Set` 目前支持 `Collection`、`Dictionary`、`New 类名`、COM 对象与 `Nothing`",
+                        "`Set` 目前支持 `Collection`、`Dictionary`、`New 类名`、COM 对象、`LoadPicture` 与 `Nothing`",
                         *line,
                     ));
                 }
                 if self.find_slot(target).is_none() {
                     self.declare(target, VbType::Object, *line)?;
                 }
-                self.set_var(target, value, *line)?;
+                self.connect_events_for_name(target, &value, *line)?;
+                self.set_var(target, value, *line, None)?;
                 Ok(Flow::Normal)
             }
             Stmt::CallMethod {
                 object,
-                method,
+                path,
                 args,
                 line,
             } => {
+                let method = path.last().cloned().unwrap_or_default();
                 let slot = self.find_slot(object);
                 let Some(slot) = slot else {
                     // `Bump .Y`（过程调用 + `With` 相对实参）与 `obj.Member` 的记号完全一样，
                     // 这里按「`object` 不是变量」回退成普通调用。
                     let call_args = if args.is_empty() {
-                        vec![Expr::WithMember {
-                            path: vec![method.clone()],
-                        }]
+                        vec![Expr::WithMember { path: path.clone() }]
                     } else {
                         args.clone()
                     };
                     self.call(object, &call_args, *line)?;
                     return Ok(Flow::Normal);
                 };
-                let target = slot.value();
+                // `rs.Fields.Append "x", 3`：先逐层读出中间成员，再在最后一层上调用。
+                let mut target = slot.value();
+                for member in &path[..path.len().saturating_sub(1)] {
+                    target = self.read_member(&Expr::Literal(target), member, *line)?;
+                }
                 if let Value::Class(instance) = &target {
-                    self.call_class_method(&instance.0, method, args, *line)?;
+                    self.call_class_method(&instance.0, &method, args, *line)?;
                     return Ok(Flow::Normal);
                 }
                 if let Value::ComObject(object) = &target {
-                    self.call_com_member(object, method, args, *line)?;
+                    self.call_com_member(object, &method, args, *line)?;
                     return Ok(Flow::Normal);
                 }
                 let mut values = Vec::with_capacity(args.len());
@@ -1503,9 +1689,10 @@ impl<'p, 'o> Runtime<'p, 'o> {
                                 ));
                             }
                             let key = values.get(1).map(|value| value.to_display());
+                            let narrow = args.first().and_then(|expr| self.narrow_of(Some(expr)));
                             collection
                                 .borrow_mut()
-                                .add(item.clone(), key)
+                                .add(item.clone(), key, narrow)
                                 .map_err(|message| RuntimeError::new(message, *line))?;
                         }
                         "remove" => {
@@ -1536,9 +1723,10 @@ impl<'p, 'o> Runtime<'p, 'o> {
                             }
                             let key = VbDictionary::key_of(&values[0])
                                 .map_err(|message| RuntimeError::new(message, *line))?;
+                            let narrow = args.get(1).and_then(|expr| self.narrow_of(Some(expr)));
                             entries
                                 .borrow_mut()
-                                .add(key, values[1].clone())
+                                .add(key, values[1].clone(), narrow)
                                 .map_err(|message| RuntimeError::new(message, *line))?;
                         }
                         "remove" => {
@@ -1654,6 +1842,9 @@ impl<'p, 'o> Runtime<'p, 'o> {
             Stmt::Gosub(label, _) => Ok(Flow::Gosub(label.clone())),
             Stmt::OnError { mode, .. } => {
                 self.set_error_handler(Some(mode.clone()));
+                // VB6 里执行任何 `On Error` 语句都会把 `Err` 清空（本机实测：
+                // `On Error Resume Next` / `GoTo 0` / `GoTo -1` 都清）。
+                self.last_error = None;
                 Ok(Flow::Normal)
             }
             Stmt::Resume { target, line } => match target {
@@ -1972,7 +2163,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     buffer
                 };
                 let text = text.trim_end_matches(['\r', '\n']).to_string();
-                self.set_var(target, Value::Str(text), *line)?;
+                self.set_var(target, Value::Str(text), *line, None)?;
                 Ok(Flow::Normal)
             }
             Stmt::InputFile {
@@ -2000,7 +2191,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                         .get(index)
                         .map(|field| parse_input_value(field))
                         .unwrap_or(Value::Empty);
-                    self.set_var(target, value, *line)?;
+                    self.set_var(target, value, *line, None)?;
                 }
                 Ok(Flow::Normal)
             }
@@ -2027,6 +2218,35 @@ impl<'p, 'o> Runtime<'p, 'o> {
                             RuntimeError::new(format!("读取 #{number} 失败：{message}"), *line)
                         },
                     )?;
+                    return Ok(Flow::Normal);
+                }
+                // 变长 `String`：VB6 实测没有长度前缀，`Get` 按变量当前长度（字节）读，
+                // 当前是空串就一个字节也不读（文件位置不动）。
+                if slot.ty() == VbType::Str {
+                    let len = match current {
+                        Value::Str(text) => text.len(),
+                        _ => 0,
+                    };
+                    if len == 0 {
+                        return Ok(Flow::Normal);
+                    }
+                    let bytes = self.binary_read(number, position, len, *line)?;
+                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                    slot.set(Value::Str(text))
+                        .map_err(|message| RuntimeError::new(message, *line))?;
+                    return Ok(Flow::Normal);
+                }
+                // `Variant` 变量：VB6 实测读的是「2 字节 VARTYPE + 内容」的带标记布局，
+                // 读回来之后 `VarType` 也变成标记里的类型（`Get` 一个 Integer 之后是 2）。
+                if slot.ty() == VbType::Variant {
+                    let mut tag = [0u8; 2];
+                    let header = self.binary_read(number, position, 2, *line)?;
+                    tag.copy_from_slice(&header[..2]);
+                    let code = i16::from_le_bytes(tag);
+                    let (value, narrow) = self.read_variant(code, number, *line)?;
+                    slot.set(value)
+                        .map_err(|message| RuntimeError::new(message, *line))?;
+                    slot.set_narrow(narrow);
                     return Ok(Flow::Normal);
                 }
                 let size = ffi::binary_width(slot.ty())
@@ -2140,9 +2360,9 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     break;
                 }
                 match &counter_slot {
-                    Some(slot) => self.store_in(slot, var, Value::Int(current), line)?,
+                    Some(slot) => self.store_in(slot, var, Value::Int(current), line, None)?,
                     None => {
-                        self.set_var(var, Value::Int(current), line)?;
+                        self.set_var(var, Value::Int(current), line, None)?;
                         counter_slot = self.find_slot(var);
                     }
                 }
@@ -2166,7 +2386,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
             }
             // VB 的 `For` 走完时计数器停在「第一个不满足条件的值」（`For i = 1 To 4` 之后 `i` 是 5）。
             if let Some(slot) = &counter_slot {
-                self.store_in(slot, var, Value::Int(current), line)?;
+                self.store_in(slot, var, Value::Int(current), line, None)?;
             }
             return Ok(Flow::Normal);
         }
@@ -2195,9 +2415,9 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 break;
             }
             match &counter_slot {
-                Some(slot) => self.store_in(slot, var, number_value(current), line)?,
+                Some(slot) => self.store_in(slot, var, number_value(current), line, None)?,
                 None => {
-                    self.set_var(var, number_value(current), line)?;
+                    self.set_var(var, number_value(current), line, None)?;
                     counter_slot = self.find_slot(var);
                 }
             }
@@ -2210,7 +2430,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         }
         // 与整数循环一致：正常结束后计数器停在越界后的那个值。
         if let Some(slot) = &counter_slot {
-            self.store_in(slot, var, number_value(current), line)?;
+            self.store_in(slot, var, number_value(current), line, None)?;
         }
         Ok(Flow::Normal)
     }
@@ -2224,10 +2444,10 @@ impl<'p, 'o> Runtime<'p, 'o> {
     ) -> Result<Flow, RuntimeError> {
         let value = self.eval(collection, line)?;
         if let Ok(items) = value.as_collection() {
-            let snapshot = items.borrow().values();
-            for item in snapshot {
+            let snapshot = items.borrow().values_with_types();
+            for (item, narrow) in snapshot {
                 self.tick(line)?;
-                self.set_var(var, item, line)?;
+                self.set_iteration_var(var, item, narrow, line)?;
                 match self.exec_block(body)? {
                     Flow::Normal | Flow::ExitDo => {}
                     Flow::ExitFor => break,
@@ -2237,11 +2457,34 @@ impl<'p, 'o> Runtime<'p, 'o> {
             return Ok(Flow::Normal);
         }
         if let Ok(entries) = value.as_dictionary() {
-            // `For Each` 遍历字典时取「值」（键用 `d.Keys`）。
-            let snapshot = entries.borrow().values();
+            // `For Each` 遍历 Scripting.Dictionary 时取「键」，按插入顺序（本机 VB6 实测）；
+            // 要遍历值请写 `For Each v In d.Items`。
+            let snapshot = entries.borrow().keys();
             for item in snapshot {
                 self.tick(line)?;
-                self.set_var(var, item, line)?;
+                self.set_var(var, item, line, None)?;
+                match self.exec_block(body)? {
+                    Flow::Normal | Flow::ExitDo => {}
+                    Flow::ExitFor => break,
+                    other => return Ok(other),
+                }
+            }
+            return Ok(Flow::Normal);
+        }
+        if let Value::ComObject(object) = &value {
+            // COM 集合：走 `_NewEnum`（`IEnumVARIANT`）取元素快照，再按普通集合遍历。
+            let mut enumerator = object.items().map_err(|failure| {
+                RuntimeError::new(failure.message, line).with_number(failure.number)
+            })?;
+            let mut snapshot = Vec::new();
+            while let Some(item) = enumerator.next().map_err(|failure| {
+                RuntimeError::new(failure.message, line).with_number(failure.number)
+            })? {
+                snapshot.push(item);
+            }
+            for item in snapshot {
+                self.tick(line)?;
+                self.set_iteration_var(var, item, None, line)?;
                 match self.exec_block(body)? {
                     Flow::Normal | Flow::ExitDo => {}
                     Flow::ExitFor => break,
@@ -2251,10 +2494,13 @@ impl<'p, 'o> Runtime<'p, 'o> {
             return Ok(Flow::Normal);
         }
         let array = value.as_array().map_err(|message| {
-            RuntimeError::new(format!("`For Each` 需要数组或 Collection：{message}"), line)
+            RuntimeError::new(
+                format!("`For Each` 需要数组、Collection、Dictionary 或 COM 集合：{message}"),
+                line,
+            )
         })?;
         // 先取快照，避免循环体里改写数组时长时间持有借用。
-        let items = {
+        let (items, element) = {
             let array = array.borrow();
             if array.dims().is_empty() {
                 return Err(RuntimeError::new("`For Each` 的数组尚未初始化", line));
@@ -2262,12 +2508,29 @@ impl<'p, 'o> Runtime<'p, 'o> {
             if array.dims().len() > 1 {
                 return Err(RuntimeError::new("`For Each` 只支持一维数组", line));
             }
-            array.values()
+            // VB6 实测：循环变量取**元素声明类型**（Integer 数组 → 2、Byte 数组 → 17、String → 8）；
+            // `Variant` 数组取每个元素记下的内容类型（`Array(CByte(1), 2)` 的第一个是 17）。
+            let element = array.element_type();
+            let element = (!matches!(element, VbType::Variant | VbType::Any)).then_some(element);
+            (array.values_with_types(), element)
         };
 
-        for item in items {
+        // 循环变量的槽只查一次；`Variant` 变量每轮把元素类型记进去（见 `Slot::narrow_type`）。
+        if self.find_slot(var).is_none() {
+            self.set_var(var, Value::Empty, line, None)?;
+        }
+        let loop_slot = self.find_slot(var);
+        for (item, narrowed) in items {
             self.tick(line)?;
-            self.set_var(var, item, line)?;
+            match &loop_slot {
+                Some(slot) => {
+                    self.store_in(slot, var, item, line, None)?;
+                    if slot.ty() == VbType::Variant {
+                        slot.set_narrow(element.or(narrowed));
+                    }
+                }
+                None => self.set_var(var, item, line, None)?,
+            }
             match self.exec_block(body)? {
                 Flow::Normal | Flow::ExitDo => {}
                 Flow::ExitFor => break,
@@ -2277,8 +2540,185 @@ impl<'p, 'o> Runtime<'p, 'o> {
         Ok(Flow::Normal)
     }
 
-    // ---------- 文件 ----------
+    /// `For Each` 的循环变量：把元素（连同内容类型）写进去。
+    fn set_iteration_var(
+        &mut self,
+        var: &str,
+        item: Value,
+        narrow: Option<VbType>,
+        line: usize,
+    ) -> Result<(), RuntimeError> {
+        self.set_var(var, item, line, None)?;
+        if let Some(slot) = self.find_slot(var)
+            && slot.ty() == VbType::Variant
+        {
+            slot.set_narrow(narrow);
+        }
+        Ok(())
+    }
 
+    /// `WithEvents x As Object` 的变量 `Set` 到 COM 对象时挂接它的事件。
+    ///
+    /// VB6 的处理过程名是 `变量_事件`，所以这里只登记脚本里真的写了处理过程的事件名。
+    fn connect_com_events(
+        &mut self,
+        object: &com::ComObject,
+        variable: &str,
+        line: usize,
+    ) -> Result<(), RuntimeError> {
+        let prefix = format!("{variable}_");
+        let mut handlers = Vec::new();
+        for name in self.procedures.keys() {
+            if let Some(event) = name.strip_prefix(&prefix)
+                && !event.is_empty()
+            {
+                handlers.push(event.to_string());
+            }
+        }
+        if handlers.is_empty() {
+            // 没写任何处理过程：不需要挂接，也不算错误。
+            return Ok(());
+        }
+        match object.connect_events(variable, &handlers) {
+            Ok(events) => {
+                self.com_events.push(ComEventOwner {
+                    instance: None,
+                    field: variable.to_string(),
+                    events,
+                });
+                Ok(())
+            }
+            Err(failure) => {
+                Err(RuntimeError::new(failure.message, line).with_number(failure.number))
+            }
+        }
+    }
+
+    /// `Set 名字 = COM 对象`：按「模块级 `WithEvents` 变量」或「当前类的 `WithEvents` 字段」挂接事件。
+    fn connect_events_for_name(
+        &mut self,
+        name: &str,
+        value: &Value,
+        line: usize,
+    ) -> Result<(), RuntimeError> {
+        let Value::ComObject(object) = value else {
+            return Ok(());
+        };
+        // 类字段：方法体的局部变量表里就是实例字段，所以要查当前类的声明。
+        if let Some(instance) = self.current_instance() {
+            let class_name = instance.borrow().key().to_string();
+            if let Some(def) = self.classes.get(&class_name).copied() {
+                let with_events = def
+                    .fields
+                    .iter()
+                    .any(|field| field.name == name && field.with_events);
+                if with_events {
+                    return self.connect_field_events(object, def, name, &instance, line);
+                }
+            }
+        }
+        if self.com_event_vars.contains(name) {
+            return self.connect_com_events(object, name, line);
+        }
+        Ok(())
+    }
+
+    /// 类字段上的 `WithEvents`：处理过程是同类的 `字段_事件`。
+    fn connect_field_events(
+        &mut self,
+        object: &com::ComObject,
+        def: &'p ClassDef,
+        name: &str,
+        instance: &Rc<RefCell<VbInstance>>,
+        line: usize,
+    ) -> Result<(), RuntimeError> {
+        let prefix = format!("{name}_");
+        let handlers: Vec<String> = def
+            .methods
+            .iter()
+            .filter_map(|method| method.name.strip_prefix(prefix.as_str()))
+            .filter(|event| !event.is_empty())
+            .map(str::to_string)
+            .collect();
+        if handlers.is_empty() {
+            return Ok(());
+        }
+        match object.connect_events(name, &handlers) {
+            Ok(events) => {
+                self.com_events.push(ComEventOwner {
+                    instance: Some(Rc::downgrade(instance)),
+                    field: name.to_string(),
+                    events,
+                });
+                Ok(())
+            }
+            Err(failure) => {
+                Err(RuntimeError::new(failure.message, line).with_number(failure.number))
+            }
+        }
+    }
+
+    /// 分派已排队的 COM 事件（在语句边界调用，避免在 COM 回调里重入解释器）。
+    fn drain_com_events(&mut self) -> Result<(), RuntimeError> {
+        if self.com_events.is_empty() {
+            return Ok(());
+        }
+        let mut pending = Vec::new();
+        for owner in &self.com_events {
+            for event in owner.events.drain() {
+                pending.push((owner.instance.clone(), owner.field.clone(), event));
+            }
+        }
+        for (instance, field, event) in pending {
+            let handler_name = format!("{field}_{}", event.event);
+            let mut values = Vec::with_capacity(event.args.len());
+            for arg in event.args {
+                values.push(match arg {
+                    com::EventArg::Empty => Value::Empty,
+                    com::EventArg::Null => Value::Null,
+                    com::EventArg::Int(number) => Value::Int(number),
+                    com::EventArg::Float(number) => Value::Float(number),
+                    com::EventArg::Bool(flag) => Value::Bool(flag),
+                    com::EventArg::Str(text) => Value::Str(text),
+                    com::EventArg::Object(pointer) => {
+                        match com::ComObject::from_raw_owned(pointer) {
+                            Some(object) => Value::ComObject(object),
+                            None => Value::Empty,
+                        }
+                    }
+                });
+            }
+            match instance {
+                // 类字段上的 `WithEvents`：在类里找 `字段_事件` 方法，用实例的局部变量调用。
+                Some(weak_owner) => {
+                    let Some(owner) = weak_owner.upgrade() else {
+                        continue;
+                    };
+                    let class_name = owner.borrow().key().to_string();
+                    let Some(handler) = self
+                        .classes
+                        .get(&class_name)
+                        .and_then(|def| def.method(&handler_name))
+                    else {
+                        continue;
+                    };
+                    let locals = Self::instance_locals(&owner);
+                    actions_pad_values(&mut values, handler.params.len());
+                    self.call_procedure_values(handler, values, locals)?;
+                }
+                None => {
+                    let Some(procedure) = self.procedures.get(&handler_name).copied() else {
+                        continue;
+                    };
+                    actions_pad_values(&mut values, procedure.params.len());
+                    self.call_procedure_values(procedure, values, FastMap::default())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ---------- 文件 ----------
     fn file_number(&mut self, expr: &Expr, line: usize) -> Result<i32, RuntimeError> {
         let value = self
             .eval(expr, line)?
@@ -2314,7 +2754,8 @@ impl<'p, 'o> Runtime<'p, 'o> {
         }
     }
 
-    /// `Put #` 的写入值：UDT 按结构体布局，标量按声明类型（变量）或动态类型（表达式）写。
+    /// `Put #` 的写入值：UDT 按结构体布局，标量按声明类型（变量）或动态类型（表达式）写，
+    /// 变长 `String` 直接写字符字节（没有长度前缀，见 VB6 实测）。
     fn encode_put(&mut self, expr: &Expr, line: usize) -> Result<Vec<u8>, RuntimeError> {
         let value = self.eval(expr, line)?;
         if let Ok(record) = value.as_record() {
@@ -2335,8 +2776,105 @@ impl<'p, 'o> Runtime<'p, 'o> {
             }
             Some(ty) => ty,
         };
+        // `Variant` 变量：VB6 实测写的是「2 字节 VARTYPE + 内容」的带标记布局
+        // （`v = 5` 写 4 字节、`v = "AB"` 写 6 字节、`v = True` 写 4 字节）。
+        if matches!(declared, Some(VbType::Variant)) {
+            let narrow = self
+                .static_type(expr)
+                .filter(|ty| !matches!(ty, VbType::Variant | VbType::Any | VbType::Object));
+            return Self::encode_variant(narrow.unwrap_or(ty), &value);
+        }
+        // 变长 `String`：VB6 实测直接写字符字节、没有长度前缀（VB6 用系统代码页，QIDE 统一 UTF-8）。
+        if ty == VbType::Str {
+            return Ok(value.to_display().into_bytes());
+        }
         ffi::encode_scalar(ty, &value)
             .map_err(|message| RuntimeError::new(format!("`Put` {message}"), line))
+    }
+
+    /// `Put #` 写 `Variant` 时的带标记布局：2 字节 VARTYPE + 内容（本机 VB6 逐字节比对过）。
+    ///
+    /// 不支持的类型（对象、数组…）报错误号 458，与 VB6 一致。
+    fn encode_variant(ty: VbType, value: &Value) -> Result<Vec<u8>, RuntimeError> {
+        let number = builtins::vartype_of(ty);
+        let mut bytes = vec![0u8; 2];
+        let code = match (&value, ty) {
+            (Value::Empty, _) => 0,
+            (Value::Null, _) => 1,
+            _ => number,
+        };
+        bytes[..2].copy_from_slice(&(code as i16).to_le_bytes());
+        match code {
+            0 | 1 => {}
+            // `Boolean` 在 VB6 的 Variant 里是 2 字节（`0B 00 FF FF`），不是 Win32 的 4 字节 BOOL。
+            11 => {
+                let flag: i16 = match value {
+                    Value::Bool(true) => -1,
+                    _ => 0,
+                };
+                bytes.extend_from_slice(&flag.to_le_bytes());
+            }
+            // `String`：2 字节长度前缀 + 字节（QIDE 用 UTF-8，长度按字节数）。
+            8 => {
+                let text = value.to_display();
+                let raw = text.as_bytes();
+                let len = u16::try_from(raw.len()).map_err(|_| {
+                    RuntimeError::new("`Put` 的字符串太长（超过 65535 字节）", 0).with_number(458)
+                })?;
+                bytes.extend_from_slice(&len.to_le_bytes());
+                bytes.extend_from_slice(raw);
+            }
+            _ => bytes.extend_from_slice(&ffi::encode_scalar(ty, value).map_err(|message| {
+                RuntimeError::new(format!("`Put` {message}"), 0).with_number(458)
+            })?),
+        }
+        Ok(bytes)
+    }
+
+    /// 读回 `Put #` 写下的带标记 `Variant`：按 2 字节 VARTYPE 决定后面跟多少字节。
+    fn read_variant(
+        &mut self,
+        code: i16,
+        number: i32,
+        line: usize,
+    ) -> Result<(Value, Option<VbType>), RuntimeError> {
+        let (ty, narrow) = match code {
+            0 => return Ok((Value::Empty, None)),
+            1 => return Ok((Value::Null, None)),
+            2 => (VbType::Integer, VbType::Integer),
+            3 => (VbType::Long, VbType::Long),
+            4 => (VbType::Single, VbType::Single),
+            5 => (VbType::Double, VbType::Double),
+            6 => (VbType::Currency, VbType::Currency),
+            7 => (VbType::Date, VbType::Date),
+            17 => (VbType::Byte, VbType::Byte),
+            11 => {
+                let raw = self.binary_read(number, None, 2, line)?;
+                let flag = i16::from_le_bytes([raw[0], raw[1]]) != 0;
+                return Ok((Value::Bool(flag), Some(VbType::Boolean)));
+            }
+            8 => {
+                let header = self.binary_read(number, None, 2, line)?;
+                let len = u16::from_le_bytes([header[0], header[1]]) as usize;
+                let raw = self.binary_read(number, None, len, line)?;
+                let text = String::from_utf8_lossy(&raw).into_owned();
+                return Ok((Value::Str(text), Some(VbType::Str)));
+            }
+            other => {
+                return Err(RuntimeError::new(
+                    format!("`Get` 读到不支持的 Variant 类型标记 {other}"),
+                    line,
+                )
+                .with_number(458));
+            }
+        };
+        let size = ffi::binary_width(ty)
+            .map_err(|message| RuntimeError::new(format!("`Get` {message}"), line))?;
+        let bytes = self.binary_read(number, None, size, line)?;
+        let value = ffi::decode_scalar(ty, &bytes).map_err(|message| {
+            RuntimeError::new(format!("读取 #{number} 失败：{message}"), line)
+        })?;
+        Ok((value, Some(narrow)))
     }
 
     /// `Lock #` 的范围换算：`For Random` 下位置是记录号，其它模式是 1 基字节偏移。
@@ -2686,10 +3224,10 @@ impl<'p, 'o> Runtime<'p, 'o> {
     }
 
     /// 裸调用同类成员时沿用的局部变量（实例变量 + `Me`）。
-    fn current_instance_locals(&self) -> HashMap<String, Slot> {
+    fn current_instance_locals(&self) -> FastMap<String, Slot> {
         match self.current_instance() {
             Some(instance) => Self::instance_locals(&instance),
-            None => HashMap::new(),
+            None => FastMap::default(),
         }
     }
 
@@ -2701,7 +3239,10 @@ impl<'p, 'o> Runtime<'p, 'o> {
         let Some(terminate) = def.method("class_terminate") else {
             return;
         };
-        let mut locals = HashMap::with_capacity(instance.fields().len());
+        let mut locals = FastMap::with_capacity_and_hasher(
+            instance.fields().len(),
+            std::hash::BuildHasherDefault::default(),
+        );
         for field in instance.fields() {
             locals.insert(
                 field.name.clone(),
@@ -2770,15 +3311,18 @@ impl<'p, 'o> Runtime<'p, 'o> {
     }
 
     /// 类方法执行时的起始局部变量：实例变量（共享存储）+ `Me`。
-    fn instance_locals(instance: &Rc<RefCell<VbInstance>>) -> HashMap<String, Slot> {
+    fn instance_locals(instance: &Rc<RefCell<VbInstance>>) -> FastMap<String, Slot> {
         let borrowed = instance.borrow();
         let fields = borrowed.fields();
         // 预分配容量，避免字段较多时反复扩容。
-        let mut locals = HashMap::with_capacity(fields.len() + 1);
+        let mut locals = FastMap::with_capacity_and_hasher(
+            fields.len() + 1,
+            std::hash::BuildHasherDefault::default(),
+        );
         for field in fields {
             locals.insert(
                 field.name.clone(),
-                Slot::from_cell(field.cell.clone(), field.ty),
+                Slot::from_cell_with_narrow(field.cell.clone(), field.ty, field.narrow.clone()),
             );
         }
         drop(borrowed);
@@ -2879,6 +3423,10 @@ impl<'p, 'o> Runtime<'p, 'o> {
         if let Some(field) = instance.borrow().field(name) {
             let is_private = def.is_some_and(|def| def.field_is_private(name));
             self.ensure_class_member_access(instance, name, is_private, line)?;
+            // `Variant` 字段的内容类型也一并交给 `result_narrow`（`VarType(obj.Field)` 用）。
+            if field.ty == VbType::Variant {
+                self.result_narrow = field.narrow.get();
+            }
             return Ok(field.cell.borrow().clone());
         }
         let display = instance.borrow().type_name().to_string();
@@ -2904,7 +3452,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 ));
             }
             let value = self.eval(value, line)?;
-            return self.assign_member(inner, &path[1..], value, line);
+            return self.assign_member(inner, &path[1..], value, None, line);
         }
         let name = path
             .first()
@@ -2939,6 +3487,8 @@ impl<'p, 'o> Runtime<'p, 'o> {
         if let Some(field) = instance.borrow().field(name) {
             let is_private = def.is_some_and(|def| def.field_is_private(name));
             self.ensure_class_member_access(instance, name, is_private, line)?;
+            // `Variant` 字段要记下右侧表达式的静态类型（`c.P = i` 之后 `VarType(c.P)` 是 2）。
+            let narrow = self.narrow_of(Some(value));
             let value = self
                 .eval(value, line)?
                 .coerce(field.ty)
@@ -2954,7 +3504,19 @@ impl<'p, 'o> Runtime<'p, 'o> {
             if with_events && let Value::Class(source) = &value {
                 Self::register_event_sink(&mut self.events, &source.0, instance);
             }
+            if with_events
+                && let Value::ComObject(object) = &value
+                && let Some(def) = def
+            {
+                // 类字段上的 `WithEvents`：处理过程是同类的 `字段_事件`。
+                self.connect_field_events(object, def, name, instance, line)?;
+            }
             *field.cell.borrow_mut() = value;
+            field.narrow.set(if field.ty == VbType::Variant {
+                narrow
+            } else {
+                None
+            });
             return Ok(());
         }
         if let Some(def) = def
@@ -3172,9 +3734,9 @@ impl<'p, 'o> Runtime<'p, 'o> {
             return self.read_instance_member(&instance.0, name, line);
         }
         if let Value::ComObject(object) = &value {
-            return object
-                .get(name)
-                .map_err(|message| RuntimeError::new(message, line).with_number(438));
+            return object.get(name).map_err(|failure| {
+                RuntimeError::new(failure.message, line).with_number(failure.number)
+            });
         }
         if matches!(value, Value::Empty) {
             return Err(RuntimeError::new(
@@ -3246,12 +3808,13 @@ impl<'p, 'o> Runtime<'p, 'o> {
         root: Value,
         path: &[String],
         value: Value,
+        narrow: Option<VbType>,
         line: usize,
     ) -> Result<(), RuntimeError> {
         let (parent, last) = Self::record_parent(root, path, line)?;
         parent
             .borrow_mut()
-            .set(&last, value)
+            .set_with_narrow(&last, value, narrow)
             .map_err(|message| RuntimeError::from_coerce(message, line))
     }
 
@@ -3287,15 +3850,40 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 let pad = if name == "spc" {
                     target.max(0) as usize
                 } else {
-                    // `Tab(n)`：移到第 n 列（1 基）；已经越过时至少补一个空格。
-                    (target.max(1) as usize).saturating_sub(column + 1).max(1)
+                    // `Tab(n)`：移到第 n 列（1 基）。已经越过目标列时 VB6 会先换行再到第 n 列
+                    // （实测 `"abc"; Tab(2); "z"` 是 `abc` 换行后 ` z`）。
+                    let wanted = (target.max(1) - 1) as usize;
+                    if wanted >= column {
+                        let pad = wanted - column;
+                        text.extend(std::iter::repeat_n(' ', pad));
+                        column = wanted;
+                        continue;
+                    }
+                    text.push('\n');
+                    text.extend(std::iter::repeat_n(' ', wanted));
+                    column = wanted;
+                    continue;
                 };
                 text.extend(std::iter::repeat_n(' ', pad));
                 column += pad;
                 continue;
             }
             let value = self.eval(expr, line)?;
-            let rendered = value.to_display();
+            // `Single` 按 7 位有效数字打印（VB6 实测）；其余类型仍走 `to_display`。
+            let rendered = match &value {
+                Value::Float(number) if self.static_type(expr) == Some(VbType::Single) => {
+                    crate::interpreter::value::format_single(*number)
+                }
+                // VB6 实测：`Debug.Print 对象` / `Print #1, 对象` 报 450。
+                Value::ComObject(_) => {
+                    return Err(RuntimeError::new(
+                        "对象没有可用的默认属性，不能转换为字符串",
+                        line,
+                    )
+                    .with_number(450));
+                }
+                _ => value.to_display(),
+            };
             // 边写边记列位置，避免每个值都重新数一遍整段文本（`Print` 参数很多时是 O(n²)）。
             column += rendered.chars().count();
             text.push_str(&rendered);
@@ -3409,6 +3997,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         self.tick(line)?;
         match expr {
             Expr::Literal(value) => Ok(value.clone()),
+            Expr::TypedLiteral { value, .. } => Ok(value.clone()),
             Expr::ArrayLiteral(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
@@ -3424,8 +4013,12 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 if self.count_stats {
                     self.stats.variable_reads += 1;
                 }
-                if let Some(slot) = self.find_slot(name) {
+                if let Some(slot) = self.lookup_slot(name) {
                     return Ok(slot.value());
+                }
+                // `vbTrue` / `vbCrLf` 这类 VB 标准常量（VB6 里是 VBA 库的全局常量）。
+                if let Some(value) = builtins::vb_constant(name) {
+                    return Ok(value);
                 }
                 if self.procedures.contains_key(name)
                     || self.declares.contains_key(name)
@@ -3459,10 +4052,12 @@ impl<'p, 'o> Runtime<'p, 'o> {
                             ));
                         }
                     };
-                    return collection
+                    let (value, narrow) = collection
                         .borrow()
-                        .item(&key)
-                        .map_err(|message| RuntimeError::new(message, line).with_number(9));
+                        .item_with_type(&key)
+                        .map_err(|message| RuntimeError::new(message, line).with_number(9))?;
+                    self.result_narrow = narrow;
+                    return Ok(value);
                 }
                 if let Ok(entries) = root.as_dictionary() {
                     let key = match indices.as_slice() {
@@ -3536,7 +4131,11 @@ impl<'p, 'o> Runtime<'p, 'o> {
             }
             Expr::Unary { op, expr } => {
                 let value = self.eval(expr, line)?;
-                Ok(match op {
+                let before = match &value {
+                    Value::Int(number) => Some(*number),
+                    _ => None,
+                };
+                let negated = match op {
                     UnOp::Negate => match value {
                         Value::Float(number) => Value::Float(-number),
                         Value::Date(number) => Value::Date(-number),
@@ -3561,12 +4160,48 @@ impl<'p, 'o> Runtime<'p, 'o> {
                             Value::Int(!number)
                         }
                     },
-                })
+                };
+                // `-i`（`i As Integer` = -32768）在 VB6 里报错误号 6（实测）。
+                if *op == UnOp::Negate
+                    && let (Some(number), Value::Int(after)) = (before, &negated)
+                    && fits_i16(number)
+                    && !fits_i16(*after)
+                    && self.static_type(expr) == Some(VbType::Integer)
+                {
+                    return Err(RuntimeError::new("溢出", line).with_number(6));
+                }
+                Ok(negated)
             }
             Expr::Binary { op, left, right } => {
-                let left = self.eval(left, line)?;
-                let right = self.eval(right, line)?;
-                apply_binary(*op, left, right, line, self.option_compare_text)
+                let mut left_value = self.eval(left, line)?;
+                let mut right_value = self.eval(right, line)?;
+                // 拼字符串时 `Single` 也按 7 位有效数字写（VB6 实测 `"v=" & CSng(1.23456789)` 是 `v=1.234568`）；
+                // 只有真的在拼浮点数时才去查静态类型，字符串拼接的热路径不受影响。
+                if *op == BinOp::Concat {
+                    self.render_single(left, &mut left_value);
+                    self.render_single(right, &mut right_value);
+                }
+                let mut overflow = None;
+                let value = apply_binary(
+                    *op,
+                    left_value,
+                    right_value,
+                    line,
+                    self.option_compare_text,
+                    &mut overflow,
+                )?;
+                // VB6 的 Integer / Long 运算溢出报错误号 6（实测）：`apply_binary` 只在
+                // 「操作数都装得进窄类型、结果却装不进去」时给候选，这里再核实一下静态类型。
+                if let Some(narrow) = overflow
+                    && Self::binary_static_type(
+                        *op,
+                        self.static_type(left),
+                        self.static_type(right),
+                    ) == Some(narrow)
+                {
+                    return Err(RuntimeError::new("溢出", line).with_number(6));
+                }
+                Ok(value)
             }
         }
     }
@@ -3577,6 +4212,222 @@ impl<'p, 'o> Runtime<'p, 'o> {
         self.call_with_by_value_args(name, args, &[], line)
     }
 
+    /// `CallByName(对象, "成员", 调用方式[, 实参…])`：按名字做后期绑定。
+    ///
+    /// 语义逐条来自本机 VB6 实测：名字不区分大小写；`VbGet` 取值、`VbLet` 赋值、
+    /// `VbSet` 给对象、`VbMethod` 调方法；实参按原表达式传入，所以 `ByRef` 形参照样能改回调用方
+    /// （`CallByName(o, "RefArg", VbMethod, x)` 之后 `x` 也会变）。
+    fn call_by_name(&mut self, args: &[Expr], line: usize) -> Result<Value, RuntimeError> {
+        let Some((object_expr, rest)) = args.split_first() else {
+            return Err(
+                RuntimeError::new("`CallByName` 需要对象、成员名和调用方式", line).with_number(449),
+            );
+        };
+        if rest.len() < 2 {
+            return Err(
+                RuntimeError::new("`CallByName` 需要对象、成员名和调用方式", line).with_number(449),
+            );
+        }
+        // `Nothing`（声明成对象的变量）与空 `Variant` 在 VB6 里错号不同：5 / 424。
+        let object_is_object = matches!(self.static_type(object_expr), Some(VbType::Object));
+        let object = self.eval(object_expr, line)?;
+        let name = self.eval(&rest[0], line)?.to_display().to_lowercase();
+        let call_type = self
+            .eval(&rest[1], line)?
+            .coerce(VbType::Long)
+            .map_err(|message| RuntimeError::from_coerce(message, line))?;
+        let call_args = &rest[2..];
+        let Value::Int(call_type) = call_type else {
+            return Err(RuntimeError::new("错误的调用方式", line).with_number(438));
+        };
+        match &object {
+            Value::Class(instance) => {
+                self.call_by_name_on_instance(&instance.0, &name, call_type, call_args, line)
+            }
+            Value::ComObject(object) => match call_type {
+                1 => self.call_com_member(object, &name, call_args, line),
+                2 if call_args.is_empty() => self.call_com_member(object, &name, call_args, line),
+                4 | 8 => self.com_put_member(object, &name, call_args, line),
+                _ => self.call_com_member(object, &name, call_args, line),
+            },
+            Value::Empty if object_is_object => {
+                Err(RuntimeError::new(builtins::error_text(5), line).with_number(5))
+            }
+            _ => Err(RuntimeError::new(builtins::error_text(424), line).with_number(424)),
+        }
+    }
+
+    /// `CallByName` 落在 QIDE 自己的类实例上（`VbGet` / `VbLet` / `VbSet` / `VbMethod`）。
+    fn call_by_name_on_instance(
+        &mut self,
+        instance: &Rc<RefCell<VbInstance>>,
+        name: &str,
+        call_type: i64,
+        args: &[Expr],
+        line: usize,
+    ) -> Result<Value, RuntimeError> {
+        let def = {
+            let borrowed = instance.borrow();
+            self.classes.get(borrowed.key()).copied()
+        };
+        let Some(def) = def else {
+            let display = instance.borrow().type_name().to_string();
+            return Err(RuntimeError::new(format!("未定义的类 `{display}`"), line));
+        };
+        match call_type {
+            // `VbMethod`
+            1 => self.call_class_method(instance, name, args, line),
+            // `VbGet`
+            2 => {
+                let method = def.method(name).or_else(|| def.implemented_method(name));
+                if let Some(method) = method
+                    && !method.is_get
+                {
+                    // `Function`/`Sub` 不能用 `VbGet` 取（VB6 实测 `Sub` 是 450，带参数的 `Function` 也是 450）。
+                    return Err(RuntimeError::new(builtins::error_text(450), line).with_number(450));
+                }
+                if method.is_some() && !args.is_empty() {
+                    return self.call_class_method(instance, name, args, line);
+                }
+                self.read_instance_member(instance, name, line)
+            }
+            // `VbLet` / `VbSet`
+            4 | 8 => {
+                let set_op = call_type == 8;
+                let Some(value) = args.first() else {
+                    return Err(RuntimeError::new(builtins::error_text(446), line).with_number(446));
+                };
+                if args.len() > 1 {
+                    return Err(RuntimeError::new(builtins::error_text(451), line).with_number(451));
+                }
+                self.assign_by_name(instance, def, name, value, set_op, line)
+            }
+            _ => Err(RuntimeError::new(builtins::error_text(438), line).with_number(438)),
+        }
+    }
+
+    /// `CallByName` 的 `VbLet` / `VbSet` 分支：有 `Property` 就走它，否则写实例变量。
+    fn assign_by_name(
+        &mut self,
+        instance: &Rc<RefCell<VbInstance>>,
+        def: &'p ClassDef,
+        name: &str,
+        value: &Expr,
+        set_op: bool,
+        line: usize,
+    ) -> Result<Value, RuntimeError> {
+        let setter = if set_op {
+            def.property_set(name)
+                .or_else(|| def.implemented_property_set(name))
+        } else {
+            def.property_let(name)
+                .or_else(|| def.implemented_property_let(name))
+        };
+        if let Some(setter) = setter {
+            let direct = if set_op {
+                def.property_set(name).is_some()
+            } else {
+                def.property_let(name).is_some()
+            };
+            if direct {
+                self.ensure_class_member_access(instance, name, setter.is_private, line)?;
+            }
+            let locals = Self::instance_locals(instance);
+            self.call_user_with_locals(setter, std::slice::from_ref(value), locals, line)?;
+            return Ok(Value::Empty);
+        }
+        if let Some(field) = instance.borrow().field(name) {
+            let is_private = def.field_is_private(name);
+            self.ensure_class_member_access(instance, name, is_private, line)?;
+            // VB6 实测：对象类型的字段用 `VbLet` 赋值报 91，用 `VbSet` 给普通字段报 451。
+            if !set_op && field.ty == VbType::Object {
+                return Err(RuntimeError::new(builtins::error_text(91), line).with_number(91));
+            }
+            if set_op && !matches!(field.ty, VbType::Object | VbType::Variant) {
+                return Err(RuntimeError::new(builtins::error_text(451), line).with_number(451));
+            }
+            let value = self
+                .eval(value, line)?
+                .coerce(field.ty)
+                .map_err(|message| RuntimeError::from_coerce(message, line))?;
+            let with_events = def
+                .fields
+                .iter()
+                .find(|item| item.name == *name)
+                .is_some_and(|item| item.with_events);
+            if with_events && let Value::Class(source) = &value {
+                Self::register_event_sink(&mut self.events, &source.0, instance);
+            }
+            *field.cell.borrow_mut() = value;
+            return Ok(Value::Empty);
+        }
+        // 只剩只读成员（`Property Get` / `Function` / `Sub`）：VB6 实测 `VbSet` 给只有 `Get` 的属性是 450。
+        if def.method(name).is_some() || def.implemented_method(name).is_some() {
+            return Err(RuntimeError::new(builtins::error_text(450), line).with_number(450));
+        }
+        Err(RuntimeError::new(builtins::error_text(438), line).with_number(438))
+    }
+
+    /// COM 对象的 `VbLet` / `VbSet`：`IDispatch::Invoke` 的属性写入。
+    fn com_put_member(
+        &mut self,
+        object: &com::ComObject,
+        name: &str,
+        args: &[Expr],
+        line: usize,
+    ) -> Result<Value, RuntimeError> {
+        let Some(value) = args.first() else {
+            return Err(RuntimeError::new(builtins::error_text(446), line).with_number(446));
+        };
+        let value = self.eval(value, line)?;
+        object.set(name, &value).map_err(|failure| {
+            RuntimeError::new(failure.message, line).with_number(failure.number)
+        })?;
+        Ok(Value::Empty)
+    }
+
+    /// `VarPtr(变量)` / `ObjPtr(对象)`：返回一个 `Long` 形式的「地址」。
+    ///
+    /// QIDE 的值是解释器内部结构，没有稳定的原生地址；这里给的是**进程内唯一且稳定**的标识：
+    /// `VarPtr` 取变量共享单元的地址（同一变量不变、不同变量不同），
+    /// `ObjPtr` 取对象实例（`Rc`）的地址（同一对象相等、不同对象不等）。
+    /// 本机 VB6 实测：两者 `VarType` 都是 3（`Long`），`ObjPtr(Nothing)` 是 0。
+    fn pointer_of(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        line: usize,
+    ) -> Result<Value, RuntimeError> {
+        let Some(expr) = args.first() else {
+            return Err(
+                RuntimeError::new(format!("`{name}` 缺少第 1 个参数"), line).with_number(449)
+            );
+        };
+        if name == "varptr" {
+            let Some(slot) = self.lvalue_slot(expr, false, line)? else {
+                return Err(
+                    RuntimeError::new("`VarPtr` 需要变量、数组元素或记录字段", line)
+                        .with_number(449),
+                );
+            };
+            return Ok(Value::Int(std::rc::Rc::as_ptr(&slot.cell) as usize as i64));
+        }
+        let value = self.eval(expr, line)?;
+        let pointer = match &value {
+            Value::Empty => 0,
+            Value::Class(instance) => std::rc::Rc::as_ptr(&instance.0) as usize as i64,
+            Value::Collection(items) => std::rc::Rc::as_ptr(items) as usize as i64,
+            Value::Dictionary(entries) => std::rc::Rc::as_ptr(entries) as usize as i64,
+            Value::Picture(picture) => std::rc::Rc::as_ptr(picture) as usize as i64,
+            Value::Record(record) => std::rc::Rc::as_ptr(record) as usize as i64,
+            Value::ComObject(object) => object.identity() as i64,
+            _ => {
+                return Err(RuntimeError::new("`ObjPtr` 需要一个对象", line).with_number(424));
+            }
+        };
+        Ok(Value::Int(pointer))
+    }
+
     fn call_com_member(
         &mut self,
         object: &com::ComObject,
@@ -3584,6 +4435,48 @@ impl<'p, 'o> Runtime<'p, 'o> {
         args: &[Expr],
         line: usize,
     ) -> Result<Value, RuntimeError> {
+        let values = self.com_call_arguments(args, line)?;
+        let call_args = Self::com_call_args(&values);
+        let outcome = object.call_with_argument_modes(name, &call_args);
+        Self::finish_com_call(values, outcome, line)
+    }
+
+    /// `obj(实参…)`：走 COM 的**默认成员**（`DISPID_VALUE`），`d("k")` 等同于 `d.Item("k")`。
+    fn call_com_default(
+        &mut self,
+        object: &com::ComObject,
+        args: &[Expr],
+        line: usize,
+    ) -> Result<Value, RuntimeError> {
+        let values = self.com_call_arguments(args, line)?;
+        let call_args = Self::com_call_args(&values);
+        let outcome = object.call_default(&call_args);
+        Self::finish_com_call(values, outcome, line)
+    }
+
+    /// 用**已经求好值**的实参调用 COM 成员（`rs.Fields("id")` 这种链式里中间层用得上）。
+    fn call_com_with_values(
+        &mut self,
+        object: &com::ComObject,
+        name: &str,
+        values: Vec<Value>,
+        line: usize,
+    ) -> Result<Value, RuntimeError> {
+        let arguments: Vec<ComArgument> = values
+            .into_iter()
+            .map(|value| (None, value, false, None))
+            .collect();
+        let call_args = Self::com_call_args(&arguments);
+        let outcome = object.call_with_argument_modes(name, &call_args);
+        Self::finish_com_call(arguments, outcome, line)
+    }
+
+    /// 逐个求值 COM 调用的实参，并记下可写回的变量槽（`ByRef` 形参写回用）。
+    fn com_call_arguments(
+        &mut self,
+        args: &[Expr],
+        line: usize,
+    ) -> Result<Vec<ComArgument>, RuntimeError> {
         let mut values = Vec::with_capacity(args.len());
         for expr in args {
             let (argument_name, argument_expr) = match expr {
@@ -3600,13 +4493,24 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 .is_some_and(|slot| !slot.is_readonly() && !value.is_array());
             values.push((argument_name, value, by_ref, slot));
         }
-        let call_args = values
+        Ok(values)
+    }
+
+    fn com_call_args(values: &[ComArgument]) -> Vec<(Option<String>, Value, bool)> {
+        values
             .iter()
-            .map(|(arg_name, value, by_ref, _)| (arg_name.clone(), value.clone(), *by_ref))
-            .collect::<Vec<_>>();
-        let (result, updated) = object
-            .call_with_argument_modes(name, &call_args)
-            .map_err(|message| RuntimeError::new(message, line).with_number(438))?;
+            .map(|(name, value, by_ref, _)| (name.clone(), value.clone(), *by_ref))
+            .collect()
+    }
+
+    fn finish_com_call(
+        values: Vec<ComArgument>,
+        outcome: Result<(Value, Vec<(usize, Value)>), com::ComFailure>,
+        line: usize,
+    ) -> Result<Value, RuntimeError> {
+        let (result, updated) = outcome.map_err(|failure| {
+            RuntimeError::new(failure.message, line).with_number(failure.number)
+        })?;
         for (index, value) in updated {
             if let Some(slot) = values[index].3.as_ref() {
                 slot.set(value)
@@ -3614,6 +4518,216 @@ impl<'p, 'o> Runtime<'p, 'o> {
             }
         }
         Ok(result)
+    }
+
+    /// 表达式的 VB6 静态类型（只用于 `VarType` / `TypeName` / `Hex` / `Oct` 这类要看类型的地方）。
+    ///
+    /// 值本身只带动态类型（整数一律是 `i64`），所以这里按语法推断：字面量宽度、变量/参数的声明类型、
+    /// 一元与二元运算的类型提升、转换函数与用户过程的返回类型。推断不出来时返回 `None`，
+    /// 调用方退回按值判断（大部分内置函数、对象成员、数组元素都属于这一类）。规则逐条来自本机 VB6 实测。
+    fn static_type(&self, expr: &Expr) -> Option<VbType> {
+        match expr {
+            Expr::TypedLiteral { ty, .. } => Some(*ty),
+            Expr::Literal(value) => match value {
+                // 整数字面量：装得进 Integer 就是 Integer，否则 Long（实测 `VarType(32767)`=2、`VarType(32768)`=3）。
+                Value::Int(number) => Some(if i16::try_from(*number).is_ok() {
+                    VbType::Integer
+                } else {
+                    VbType::Long
+                }),
+                Value::Float(_) => Some(VbType::Double),
+                Value::Currency(_) => Some(VbType::Currency),
+                Value::Date(_) => Some(VbType::Date),
+                Value::Bool(_) => Some(VbType::Boolean),
+                Value::Str(_) => Some(VbType::Str),
+                _ => None,
+            },
+            Expr::Var(name) => {
+                if let Some(slot) = self.lookup_slot(name) {
+                    // 数组按 `vbArray + 元素类型码` 报，交给按值判断。
+                    if slot.value().is_array() {
+                        return None;
+                    }
+                    if slot.ty() == VbType::Variant {
+                        // `Variant` 变量按赋值时记下的内容类型回答（`v = i` 之后是 Integer）。
+                        return slot.narrow_type();
+                    }
+                    return Some(slot.ty());
+                }
+                // `VarType(vbTrue)` 是 3（Long）、`VarType(vbCrLf)` 是 8。
+                builtins::vb_constant_type(name)
+            }
+            // `VarType(u.f)`：记录里 `As Variant` 的字段按写入时记下的内容类型回答。
+            // `VarType(obj.Prop)`：类成员的返回类型来自 `Property Get` / `Function` 的声明，
+            // `VarType(obj.Field)`：`Variant` 字段按写入时记下的内容类型回答。
+            Expr::Member { base, name } => {
+                let root = self.static_base_value(base)?;
+                if let Value::Class(instance) = &root {
+                    let borrowed = instance.0.borrow();
+                    if let Some(def) = self.classes.get(borrowed.key()).copied()
+                        && let Some(method) =
+                            def.method(name).or_else(|| def.implemented_method(name))
+                    {
+                        return (method.ret != VbType::Variant).then_some(method.ret);
+                    }
+                    let (field_ty, narrow) = borrowed.field_narrow(name)?;
+                    return if field_ty == VbType::Variant {
+                        narrow
+                    } else {
+                        Some(field_ty)
+                    };
+                }
+                let record = root.as_record().ok()?;
+                let borrowed = record.borrow();
+                let (ty, narrow) = borrowed.field_types(name)?;
+                if ty == VbType::Variant {
+                    narrow
+                } else {
+                    Some(ty)
+                }
+            }
+            // `With u: VarType(.f)`：与 `u.f` 同样处理。
+            Expr::WithMember { path } => {
+                let root = self.with_stack.last().cloned()?;
+                let mut value = root;
+                for (index, name) in path.iter().enumerate() {
+                    let record = value.as_record().ok()?;
+                    let borrowed = record.borrow();
+                    if index + 1 == path.len() {
+                        let (ty, narrow) = borrowed.field_types(name)?;
+                        return if ty == VbType::Variant {
+                            narrow
+                        } else {
+                            Some(ty)
+                        };
+                    }
+                    value = borrowed.get(name)?;
+                }
+                None
+            }
+            // `Not` 保持操作数类型（实测 `Not CByte(1)`=17、`Not 1`=2）；
+            // `-32768` 实测是 Long，因为 `32768` 本身已是 Long。
+            Expr::Unary { expr, .. } => self.static_type(expr),
+            Expr::Binary { op, left, right } => {
+                Self::binary_static_type(*op, self.static_type(left), self.static_type(right))
+            }
+            Expr::Call { name, args } => {
+                if let Some(ty) = conversion_type(name) {
+                    return Some(ty);
+                }
+                // `VarType(arr(0))`：`Variant` 数组要取元素记下的内容类型
+                // （`picked(0) = CByte(9)` 之后是 17），字面量下标才能静态查。
+                if let Some(ty) = self.array_element_static_type(name, args) {
+                    return Some(ty);
+                }
+                match name.as_str() {
+                    // `VarType(CVar(1))` 实测是 2：`CVar` 不改类型。
+                    "cvar" | "cvdate" | "abs" | "int" | "fix" => {
+                        args.first().and_then(|arg| self.static_type(arg))
+                    }
+                    "hex" | "oct" | "str" | "chr" => Some(VbType::Str),
+                    "sgn" => Some(VbType::Integer),
+                    _ => self.procedures.get(name).map(|procedure| procedure.ret),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `static_type` 用的「静态基值」：只认变量与字面量下标的数组元素（`u`、`recs(0)`）。
+    fn static_base_value(&self, expr: &Expr) -> Option<Value> {
+        match expr {
+            Expr::Var(name) => Some(self.lookup_slot(name)?.value()),
+            Expr::Call { name, args } => {
+                let array = self.lookup_slot(name)?.value();
+                if !array.is_array() {
+                    return None;
+                }
+                let mut indices = Vec::with_capacity(args.len());
+                for arg in args {
+                    match arg {
+                        Expr::Literal(Value::Int(number)) => {
+                            indices.push(i32::try_from(*number).ok()?);
+                        }
+                        _ => return None,
+                    }
+                }
+                let array = array.as_array().ok()?;
+                array.borrow().get(&indices).ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// `arr(0)` 这类**字面量下标**的元素内容类型（只有 `Variant` 数组记了内容类型）。
+    fn array_element_static_type(&self, name: &str, args: &[Expr]) -> Option<VbType> {
+        let slot = self.find_slot(name)?;
+        let value = slot.value();
+        if value.is_array() {
+            let array = value.as_array().ok()?;
+            let array = array.borrow();
+            if array.element_type() != VbType::Variant {
+                return None;
+            }
+            let mut indices = Vec::with_capacity(args.len());
+            for arg in args {
+                match arg {
+                    Expr::Literal(Value::Int(number)) => {
+                        indices.push(i32::try_from(*number).ok()?);
+                    }
+                    _ => return None,
+                }
+            }
+            return array.narrow_at(&indices);
+        }
+        // `VarType(d("k"))`：字典也记了每个键的内容类型，字面量键才静态查。
+        if value.is_dictionary()
+            && let [Expr::Literal(Value::Str(key))] = args
+        {
+            let entries = value.as_dictionary().ok()?;
+            return entries.borrow().narrow(key);
+        }
+        None
+    }
+
+    /// 二元运算结果类型（比较运算给 Boolean，`/` 与 `^` 给 Double，字符串拼接给 String）。
+    fn binary_static_type(
+        op: BinOp,
+        left: Option<VbType>,
+        right: Option<VbType>,
+    ) -> Option<VbType> {
+        let (left, right) = (left?, right?);
+        // `Variant`（含装 `Null` 的变量）在运算里会传播 `Null`，类型推断不出来，交给按值判断
+        // （例如 `TypeName(Null = Null)` 是 "Null"）。
+        if matches!(left, VbType::Variant | VbType::Any | VbType::Object)
+            || matches!(right, VbType::Variant | VbType::Any | VbType::Object)
+        {
+            return None;
+        }
+        if matches!(
+            op,
+            BinOp::Eq
+                | BinOp::NotEq
+                | BinOp::Lt
+                | BinOp::Gt
+                | BinOp::LtEq
+                | BinOp::GtEq
+                | BinOp::Like
+                | BinOp::Is
+        ) {
+            return Some(VbType::Boolean);
+        }
+        // `+` 与 `&` 遇到字符串都拼接（实测 `VarType("a" & "b")` 与 `VarType("a" + "b")` 都是 String）。
+        if op == BinOp::Concat
+            || (op == BinOp::Add && (left == VbType::Str || right == VbType::Str))
+        {
+            return Some(VbType::Str);
+        }
+        match op {
+            // 浮点除法与乘方一律 Double（实测 `VarType(1 / 2)`=5、`VarType(2 ^ 3)`=5）。
+            BinOp::Divide | BinOp::Power => Some(VbType::Double),
+            _ => promote_numeric(left, right),
+        }
     }
 
     fn call_with_by_value_args(
@@ -3633,6 +4747,66 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 _ => false,
             };
             return Ok(Value::Bool(missing));
+        }
+        // `VarType` / `TypeName` 要看表达式的**静态类型**（VB6 实测：`Dim n As Integer` 是 2 / "Integer"，
+        // `Byte` 是 17、`Single` 是 4，`1 + 1` 也是 2）。值本身不带窄类型信息，所以按语法推断。
+        // 推断不出来（大部分内置函数、对象成员、数组）时退回按值判断。
+        if matches!(name, "vartype" | "typename")
+            && let Some(expr) = args.first()
+        {
+            if let Some(ty) = self.static_type(expr)
+                && !matches!(ty, VbType::Variant | VbType::Any | VbType::Object)
+            {
+                return Ok(if name == "vartype" {
+                    Value::Int(builtins::vartype_of(ty))
+                } else {
+                    Value::Str(ty.name().to_string())
+                });
+            }
+            // 调用/成员表达式的内容类型只有求值后才知道（返回 `Variant` 的函数、`IIf`/`Choose`/`Switch`、
+            // `Collection.Item`），求值时会把类型记进 `result_narrow`
+            // （本机 VB6 实测：`IIf(True, i, s)` 是 2、`IIf(False, i, s)` 是 4、`VarType(c.Item(1))` 是 2）。
+            if matches!(
+                expr,
+                Expr::Call { .. }
+                    | Expr::Member { .. }
+                    | Expr::MemberIndex { .. }
+                    | Expr::WithMember { .. }
+            ) {
+                self.result_narrow = None;
+                let value = self.eval(expr, line)?;
+                if let Some(ty) = self.result_narrow.take()
+                    && !matches!(ty, VbType::Variant | VbType::Any | VbType::Object)
+                {
+                    return Ok(if name == "vartype" {
+                        Value::Int(builtins::vartype_of(ty))
+                    } else {
+                        Value::Str(ty.name().to_string())
+                    });
+                }
+                return Ok(if name == "vartype" {
+                    Value::Int(builtins::vartype_code_of(&value))
+                } else {
+                    Value::Str(value.type_name())
+                });
+            }
+        }
+        // `CStr` / `Str` 拿不到表达式的类型，`Single` 要先按 7 位有效数字渲染再交给内置函数
+        // （VB6 实测：`CStr(CSng(1.23456789))` 是 `1.234568`、`Str(CSng(0.5))` 是 `" .5"`）。
+        if matches!(name, "cstr" | "str")
+            && let Some(expr) = args.first()
+            && self.static_type(expr) == Some(VbType::Single)
+        {
+            let text = match self.eval(expr, line)? {
+                Value::Float(number) => crate::interpreter::value::format_single(number),
+                Value::Null => return Ok(Value::Null),
+                other => other.to_display(),
+            };
+            return Ok(Value::Str(if name == "str" {
+                builtins::str_number_text(text, true)
+            } else {
+                text
+            }));
         }
         if matches!(name, "createobject" | "getobject") {
             if let Some(message) = &self.com_error {
@@ -3738,6 +4912,28 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     .get(&key)
                     .map_err(|message| RuntimeError::new(message, line).with_number(9));
             }
+            if let Ok(collection) = value.as_collection() {
+                // `c(1)` / `c("键")`：`Collection` 的默认成员就是 `Item`（VB6 实测可用）。
+                let key = match args {
+                    [single] => self.eval(single, line)?,
+                    _ => {
+                        return Err(RuntimeError::new(
+                            "`Collection` 的下标只能是一个下标或键",
+                            line,
+                        ));
+                    }
+                };
+                let (item, narrow) = collection
+                    .borrow()
+                    .item_with_type(&key)
+                    .map_err(|message| RuntimeError::new(message, line).with_number(9))?;
+                self.result_narrow = narrow;
+                return Ok(item);
+            }
+            if let Value::ComObject(object) = &value {
+                // `d("k")`：COM 对象的默认成员（`DISPID_VALUE`），等同 `d.Item("k")`（VB6 实测）。
+                return self.call_com_default(object, args, line);
+            }
         }
         if matches!(name, "eof" | "lof" | "freefile" | "seek" | "loc") {
             return self.file_builtin(name, args, line);
@@ -3761,7 +4957,30 @@ impl<'p, 'o> Runtime<'p, 'o> {
         if let Some(declare) = self.declares.get(name).copied() {
             return self.call_declare(declare, args, by_value_args, line);
         }
+        // `CallByName` 要拿到原始实参表达式（`ByRef` 形参得能写回调用方的槽），所以放在内置函数分派之前。
+        if name == "callbyname" {
+            return self.call_by_name(args, line);
+        }
+        // `VarPtr` / `ObjPtr` 也要原始表达式：前者取变量的存储单元，后者取对象实例的身份。
+        if name == "varptr" || name == "objptr" {
+            return self.pointer_of(name, args, line);
+        }
         if builtins::is_builtin(name) {
+            // `Hex` / `Oct` 的输出宽度跟着实参的静态类型走（`Hex(-1)` 是 16 位、`Hex(-1&)` 是 32 位）。
+            let arg_type = if matches!(name, "hex" | "oct") {
+                args.first().and_then(|expr| self.static_type(expr))
+            } else {
+                None
+            };
+            // `Array(CByte(1), 2)` 要把每个实参的类型一起记进数组（`For Each` / `VarType` 用）；
+            // `IIf`/`Choose`/`Switch` 返回的是其中一个实参，要用它的类型回答 `VarType`。
+            let arg_types: Vec<Option<VbType>> = if name == "array" {
+                args.iter().map(|expr| self.narrow_of(Some(expr))).collect()
+            } else if matches!(name, "iif" | "choose" | "switch") {
+                args.iter().map(|expr| self.narrow_of(Some(expr))).collect()
+            } else {
+                Vec::new()
+            };
             let mut values = Vec::with_capacity(args.len());
             for expr in args {
                 values.push(self.eval(expr, line)?);
@@ -3785,9 +5004,13 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 command: &self.command_line,
                 cwd: &mut self.cwd,
                 strings: &mut self.strings,
+                arg_type,
+                arg_types: &arg_types,
+                result_narrow: None,
             };
             let outcome = builtins::call(name, values, &mut ctx);
             let failure = ctx.failure;
+            self.result_narrow = ctx.result_narrow;
             return outcome.map_err(|message| {
                 let error = RuntimeError::from_coerce(message, line);
                 match failure {
@@ -3854,7 +5077,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         args: &[Expr],
         line: usize,
     ) -> Result<Value, RuntimeError> {
-        self.call_user_with_locals(procedure, args, HashMap::new(), line)
+        self.call_user_with_locals(procedure, args, FastMap::default(), line)
     }
 
     fn call_user_with_by_value_args(
@@ -3867,7 +5090,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         self.call_user_with_locals_and_by_value_args(
             procedure,
             args,
-            HashMap::new(),
+            FastMap::default(),
             by_value_args,
             line,
         )
@@ -3878,7 +5101,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         &mut self,
         procedure: &'p Procedure,
         args: &[Expr],
-        locals: HashMap<String, Slot>,
+        locals: FastMap<String, Slot>,
         line: usize,
     ) -> Result<Value, RuntimeError> {
         self.call_user_with_locals_and_by_value_args(procedure, args, locals, &[], line)
@@ -3888,7 +5111,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         &mut self,
         procedure: &'p Procedure,
         args: &[Expr],
-        mut locals: HashMap<String, Slot>,
+        mut locals: FastMap<String, Slot>,
         by_value_args: &[bool],
         line: usize,
     ) -> Result<Value, RuntimeError> {
@@ -3906,6 +5129,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         if args.len() > procedure.params.len()
             && !procedure.params.iter().any(|param| param.param_array)
         {
+            // VB6 实测：实参比形参多是 450（`CallByName(o, "Bump", VbMethod, 1, 2)`）。
             return Err(RuntimeError::new(
                 format!(
                     "过程 `{}` 只接受 {} 个参数，实际传入 {} 个",
@@ -3914,36 +5138,52 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     args.len()
                 ),
                 line,
-            ));
+            )
+            .with_number(450));
         }
         // 参数与返回值都要塞进局部表：先按数量预留，省掉逐次扩容的哈希搬迁。
         locals.reserve(procedure.params.len() + 1);
         for (index, param) in procedure.params.iter().enumerate() {
             if param.param_array {
-                // `ParamArray xs()`：把剩下的实参打包成 0 基 Variant 数组。
+                // `ParamArray xs()`：把剩下的实参打包成 0 基 Variant 数组（连每个元素的内容类型一起记）。
                 let mut values = Vec::new();
                 for expr in args.iter().skip(index) {
-                    values.push(self.eval(expr, line)?);
+                    let value = self.eval(expr, line)?;
+                    let narrow = self.narrow_of(Some(expr));
+                    values.push((value, narrow));
                 }
                 locals.insert(
                     param.name.clone(),
-                    Slot::new(Value::array(values), VbType::Variant),
+                    Slot::new(Value::array_with_types(values), VbType::Variant),
                 );
                 continue;
             }
             let slot = match args.get(index) {
-                Some(expr) => self.bind_argument(
-                    expr,
-                    param,
-                    by_value_args.get(index).copied().unwrap_or(false),
-                    line,
-                )?,
+                Some(expr) => {
+                    let slot = self.bind_argument(
+                        expr,
+                        param,
+                        by_value_args.get(index).copied().unwrap_or(false),
+                        line,
+                    )?;
+                    // `ByVal v As Variant` 也要记下内容类型（VB6 实测 `Narrow(i)` 是 2、`Narrow(CSng(1.5))` 是 4）。
+                    // `ByRef` 传进来的就是调用方那个槽，标注已经在它身上了，不能覆盖。
+                    if slot.ty() == VbType::Variant
+                        && !param.is_array
+                        && !(param.by_ref && !by_value_args.get(index).copied().unwrap_or(false))
+                    {
+                        slot.set_narrow(self.narrow_of(Some(expr)));
+                    }
+                    slot
+                }
                 None if param.optional => self.bind_default(param, line)?.omitted_optional(),
                 None => {
+                    // VB6 实测：缺少必填实参是 449（`CallByName(o, "Total", VbMethod, 3)`）。
                     return Err(RuntimeError::new(
                         format!("过程 `{}` 缺少参数 `{}`", procedure.name, param.name),
                         line,
-                    ));
+                    )
+                    .with_number(449));
                 }
             };
             locals.insert(param.name.clone(), slot);
@@ -3971,6 +5211,13 @@ impl<'p, 'o> Runtime<'p, 'o> {
         self.frames.pop();
         outcome?;
 
+        // 返回 `Variant` 的函数：内容类型只有执行完才知道（函数体里 `F = i` 时记在了结果槽上），
+        // 顺手交给 `result_narrow`，`VarType(F())` 才能报 `Integer`。
+        if procedure.ret == VbType::Variant
+            && let Some(slot) = &result
+        {
+            self.result_narrow = slot.narrow_type();
+        }
         Ok(result.map(|slot| slot.value()).unwrap_or(Value::Empty))
     }
 
@@ -4117,16 +5364,19 @@ impl<'p, 'o> Runtime<'p, 'o> {
         name: &str,
         line: usize,
     ) -> Result<Slot, RuntimeError> {
-        let field = {
-            let parent = parent.borrow();
-            parent.field_cell(name).ok_or_else(|| {
-                RuntimeError::new(
-                    format!("类型 `{}` 没有字段 `{name}`", parent.type_name()),
-                    line,
-                )
-            })?
+        let parent = parent.borrow();
+        let field = parent.fields().iter().find(|field| field.name == name);
+        let Some(field) = field else {
+            return Err(RuntimeError::new(
+                format!("类型 `{}` 没有字段 `{name}`", parent.type_name()),
+                line,
+            ));
         };
-        Ok(Slot::from_cell(field.0, field.1))
+        Ok(Slot::from_cell_with_narrow(
+            field.cell(),
+            field.ty,
+            field.narrow(),
+        ))
     }
 
     fn bind_default(&mut self, param: &Param, line: usize) -> Result<Slot, RuntimeError> {
@@ -4411,7 +5661,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         procedure: &'p Procedure,
         values: Vec<Value>,
     ) -> Result<(Value, Vec<Value>), RuntimeError> {
-        self.call_procedure_values_with_params(procedure, values, HashMap::new(), true)
+        self.call_procedure_values_with_params(procedure, values, FastMap::default(), true)
     }
 
     /// 按「已求值的实参」调用过程；`locals` 是预先注入的局部变量（类方法用它注入实例变量）。
@@ -4419,7 +5669,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         &mut self,
         procedure: &'p Procedure,
         values: Vec<Value>,
-        locals: HashMap<String, Slot>,
+        locals: FastMap<String, Slot>,
     ) -> Result<Value, RuntimeError> {
         self.call_procedure_values_with_params(procedure, values, locals, false)
             .map(|(value, _)| value)
@@ -4429,7 +5679,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         &mut self,
         procedure: &'p Procedure,
         values: Vec<Value>,
-        mut locals: HashMap<String, Slot>,
+        mut locals: FastMap<String, Slot>,
         capture_params: bool,
     ) -> Result<(Value, Vec<Value>), RuntimeError> {
         let line = procedure.line;
@@ -4962,6 +6212,15 @@ fn stmt_line(stmt: &Stmt) -> usize {
     }
 }
 
+/// 事件实参按处理过程的形参个数对齐：多余的丢掉、缺少的补 `Empty`
+/// （`WithEvents` 的处理过程可以只接自己关心的前几个参数）。
+fn actions_pad_values(values: &mut Vec<Value>, params: usize) {
+    values.truncate(params);
+    while values.len() < params {
+        values.push(Value::Empty);
+    }
+}
+
 /// 在同一个语句块里查找标签位置。
 fn find_label(stmts: &[Stmt], label: &str) -> Option<usize> {
     stmts
@@ -4976,6 +6235,76 @@ fn flush_file(handle: FileHandle) {
 }
 
 /// 转换函数（`CByte` / `CInt` …）的结果声明类型：`Put #` 用它决定写几个字节。
+/// 数值类型提升（本机 VB6 实测）：Byte+Byte→Byte、Byte+Integer→Integer、Integer+Long→Long、
+/// Integer+Single→Single、Long+Single→Double、Single+Double→Double、Currency 吸收 Single/Double、
+/// Date 吸收所有数值（日期算术）。
+fn promote_numeric(left: VbType, right: VbType) -> Option<VbType> {
+    fn rank(ty: VbType) -> Option<u8> {
+        Some(match ty {
+            VbType::Byte => 0,
+            VbType::Integer | VbType::Boolean => 1,
+            VbType::Long => 2,
+            VbType::LongLong | VbType::LongPtr => 3,
+            VbType::Single => 4,
+            VbType::Double => 5,
+            VbType::Currency => 6,
+            VbType::Date => 7,
+            _ => return None,
+        })
+    }
+    let (left_rank, right_rank) = (rank(left)?, rank(right)?);
+    // Long/LongLong 与 Single 混算退到 Double（Integer + Single 仍是 Single）。
+    let single_with_long = |single: u8, other: u8| single == 4 && (2..=3).contains(&other);
+    if single_with_long(left_rank, right_rank) || single_with_long(right_rank, left_rank) {
+        return Some(VbType::Double);
+    }
+    Some(match left_rank.max(right_rank) {
+        0 => VbType::Byte,
+        1 => VbType::Integer,
+        2 => VbType::Long,
+        3 => VbType::LongLong,
+        4 => VbType::Single,
+        5 => VbType::Double,
+        6 => VbType::Currency,
+        _ => VbType::Date,
+    })
+}
+
+/// VB6 的整数运算溢出（错误号 6）判定的宽度：只有「两个操作数都装得进这个类型、结果却装不进去」时
+/// 才需要去查静态类型确认（本机 VB6 实测：`32767 + 1`、`32767 * 2`、`2147483647 + 1`、
+/// `CByte(200) + CByte(200)` 都报 6；`Dim c As Long: c + c`（30000）不报、`200 + 200` 不报）。
+fn overflow_candidate(left: i64, right: i64, result: i64) -> Option<VbType> {
+    let in_i32 = |value: i64| (i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&value);
+    // 快路径：结果落在 `0..=255` 里就既不会 `Byte` 溢出也不会 `Integer`/`Long` 溢出
+    // （热循环里的计数与累加绝大多数都走这一条，只做一次比较）。
+    if fits_byte(result) {
+        return None;
+    }
+    // `Byte`：两个操作数都装得进 Byte、结果装不进去时给候选（实测 `CByte(200) + CByte(200)` 报 6）。
+    if fits_byte(left) && fits_byte(right) {
+        return Some(VbType::Byte);
+    }
+    // 结果装得进 Integer 就不会溢出。
+    if fits_i16(result) {
+        return None;
+    }
+    if !in_i32(result) && in_i32(left) && in_i32(right) {
+        return Some(VbType::Long);
+    }
+    if fits_i16(left) && fits_i16(right) {
+        return Some(VbType::Integer);
+    }
+    None
+}
+
+fn fits_i16(value: i64) -> bool {
+    i16::try_from(value).is_ok()
+}
+
+fn fits_byte(value: i64) -> bool {
+    u8::try_from(value).is_ok()
+}
+
 fn conversion_type(name: &str) -> Option<VbType> {
     Some(match name {
         "cbyte" => VbType::Byte,
@@ -5221,6 +6550,7 @@ fn objects_identical(left: &Value, right: &Value) -> Result<bool, String> {
         (Value::Dictionary(a), Value::Dictionary(b)) => Rc::ptr_eq(a, b),
         (Value::Class(a), Value::Class(b)) => Rc::ptr_eq(&a.0, &b.0),
         (Value::ComObject(a), Value::ComObject(b)) => a == b,
+        (Value::Picture(a), Value::Picture(b)) => Rc::ptr_eq(a, b),
         _ => return Err("`Is` 只能比较对象与 `Nothing`".into()),
     })
 }
@@ -5429,8 +6759,18 @@ fn apply_binary(
     right: Value,
     line: usize,
     compare_text: bool,
+    overflow: &mut Option<VbType>,
 ) -> Result<Value, RuntimeError> {
     let fail = |message: String| RuntimeError::from_coerce(message, line);
+
+    // VB6 实测：`"x" & 对象` 报 450（对象没有可用的默认属性）。
+    if matches!(op, BinOp::Concat)
+        && (matches!(left, Value::ComObject(_)) || matches!(right, Value::ComObject(_)))
+    {
+        return Err(
+            RuntimeError::new("对象没有可用的默认属性，不能转换为字符串", line).with_number(450),
+        );
+    }
 
     // `Null` 参与算术或比较时结果仍是 `Null`（VB 的传播规则，`&` 例外：当成空串）。
     if matches!(
@@ -5475,9 +6815,10 @@ fn apply_binary(
             BinOp::IntDivide => left.checked_div(*right),
             _ => left.checked_rem(*right),
         };
-        return Ok(Value::Int(
-            computed.ok_or_else(|| fail("数值溢出".into()).with_number(6))?,
-        ));
+        let result = computed.ok_or_else(|| fail("数值溢出".into()).with_number(6))?;
+        // Integer / Long 的溢出由调用方查静态类型确认（这里只记录「可能溢出」）。
+        *overflow = overflow_candidate(*left, *right, result);
+        return Ok(Value::Int(result));
     }
 
     Ok(match op {
@@ -5622,7 +6963,10 @@ fn apply_binary(
                     BinOp::Subtract => left.checked_sub(right),
                     _ => left.checked_add(right),
                 };
-                Value::Int(computed.ok_or_else(|| fail("数值溢出".into()).with_number(6))?)
+                let result = computed.ok_or_else(|| fail("数值溢出".into()).with_number(6))?;
+                // Integer / Long 的溢出由调用方查静态类型确认（这里只记录「可能溢出」）。
+                *overflow = overflow_candidate(left, right, result);
+                Value::Int(result)
             }
         }
     })

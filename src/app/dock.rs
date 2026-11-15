@@ -4,7 +4,12 @@ use super::*;
 
 impl CodeWindow {
     /// 初始化 Dock：优先恢复上次的完整面板布局，没有可用布局时创建默认布局。
-    pub(super) fn setup_dock(&mut self, dock_state: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn setup_dock(
+        &mut self,
+        dock_state: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.register_dock_panels(cx);
 
         if !dock_state.is_empty()
@@ -191,13 +196,7 @@ impl CodeWindow {
                     PanelKind::Search => panel_handle(search.clone()),
                     PanelKind::Ai => panel_handle(ai.clone()),
                 };
-                area.add_panel_view(
-                    handle,
-                    slot_placement(slot),
-                    Some(px(width)),
-                    window,
-                    cx,
-                );
+                area.add_panel_view(handle, slot_placement(slot), Some(px(width)), window, cx);
             }
 
             let output_id = PanelId::from(output.entity_id());
@@ -241,8 +240,7 @@ impl CodeWindow {
             }
 
             if show_output && bottom_visible {
-                if area.has_dock(DockPlacement::Bottom)
-                    && !area.is_dock_open(DockPlacement::Bottom)
+                if area.has_dock(DockPlacement::Bottom) && !area.is_dock_open(DockPlacement::Bottom)
                 {
                     area.toggle_dock(DockPlacement::Bottom, window, cx);
                 }
@@ -638,11 +636,11 @@ impl CodeWindow {
             .left_0()
             .size_full()
             .occlude()
-            .on_drag_move(cx.listener(
-                |this, event: &DragMoveEvent<DragPanel>, _, cx| {
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DragPanel>, _, cx| {
                     this.update_panel_drag_target(event, cx);
-                },
-            ))
+                }),
+            )
             .on_drop(cx.listener(|this, drag: &DragPanel, window, cx| {
                 cx.stop_propagation();
                 this.finish_panel_drag(drag, window, cx);

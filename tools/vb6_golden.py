@@ -10,14 +10,14 @@
 3. 把「表达式 → 期望输出」写成 `src/vb6_golden_data.rs`，供 `src/vb6_golden_tests.rs` 断言。
 
 某个用例在 VB6 里报错（那一行会缺失）时脚本会失败并列出缺失的用例——这类用例不要放进清单。
-改动清单后重跑即可；`VB6` 常量按本机安装路径调整。
+改动清单后重跑即可；VB6 路径用环境变量 `QIDE_VB6` 覆盖（不设时用 `VB6` 常量里的默认路径）。
 """
 
 import os
 import subprocess
 import sys
 
-VB6 = r"C:\Users\89875\Desktop\VB 6.0\Vb6.exe"
+VB6 = os.environ.get("QIDE_VB6") or r"C:\Users\89875\Desktop\VB 6.0\Vb6.exe"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -108,6 +108,7 @@ OUTPUT_FILE = os.path.join(ROOT, "src", "vb6_golden_data.rs")
 BUILD_DIR = os.path.join(ROOT, "target", "vb6-golden")
 
 VBP = """Type=Exe
+Reference=*\\G{420B2830-E718-11CF-893D-00A0C9054228}#1.0#0#C:\\Windows\\SysWOW64\\scrrun.dll#Microsoft Scripting Runtime
 Form=golden.frm
 IconForm="Form1"
 Startup="Form1"

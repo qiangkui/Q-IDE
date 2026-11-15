@@ -46,7 +46,8 @@
 //! `Dim c As New Collection` / `Set d = New Dictionary` / `Set x = Nothing`、
 //! `c.Add 元素[, 键]`、`c.Remove 下标或键`、`c.Count`、`c.Item(下标或键)`；
 //! 字典另有 `d.Add 键, 值`、`d(键) = 值`、`d(键)`、`d.Item(键)`、`d.Exists(键)`、
-//! `d.Keys` / `d.Items`（0 基数组，可 `For Each`）、`d.Remove 键`；键一律大小写不敏感。
+//! `d.Keys` / `d.Items`（0 基数组，可 `For Each`）、`d.Remove 键`；`For Each k In d` 直接给出键、
+//! 按插入顺序（与 VB6 的 `Scripting.Dictionary` 一致）；键一律大小写不敏感。
 //! `Class 名字 … End Class` 里可以写 `Private/Public` 变量、`Sub`/`Function`、`Property Get/Let/Set`，
 //! `Class_Initialize` 就是构造函数、`Class_Terminate` 在最后一个引用消失时执行：
 //! `Dim p As New 类名` / `Set p = New 类名` 建实例，`p.方法 参数`、`p.属性`、`p.属性 = 值`、
@@ -56,13 +57,15 @@
 //! 会回调订阅者的 `源类名_事件名` 方法（订阅表用弱引用，对象被回收后自动失效）。
 //! 类成员字段未标注时默认为 `Private`，方法和属性未标注时默认为 `Public`；显式访问修饰符生效，
 //! 同类成员可以访问私有成员。类可用 `Implements 接口类` 声明接口，并以私有
-//! `接口类_成员名` 方法/属性实现接口；当前没有独立的接口变量类型或编译期接口成员检查。
+//! `接口类_成员名` 方法/属性实现接口；语法检查会报出漏实现/多写的成员与签名不一致的实现
+//! （过程形式、参数、返回类型都要与接口相同，参数名可不同；规则按本机 VB6 实测）。
+//! 当前还没有独立的接口变量类型（不能声明 `Dim x As 接口名` 走接口分派）。
 //! 简化之处：
 //! 类内裸赋值 `Name = v` 不触发同名 `Property Let`（写 `Me.Name = v`）、
 //! `Dim x As 类名` 需要类在同文件里先定义。
-//! 错误处理支持 `On Error Resume Next`、`On Error GoTo 标签`、`On Error GoTo 0`、`GoTo 标签`、
-//! `Err.Raise`/`Err.Clear` 以及 `Err.Number`/`Err.Description`/`Err.Source` 与 `Error(n)`；
-//! `Resume`/`Resume Next` 的恢复点是「出错语句所在的根块语句」。
+//! 错误处理支持 `On Error Resume Next`、`On Error GoTo 标签`、`On Error GoTo 0`、`On Error GoTo -1`、
+//! `GoTo 标签`、`Err.Raise`/`Err.Clear` 以及 `Err.Number`/`Err.Description`/`Err.Source` 与 `Error(n)`；
+//! 执行任何 `On Error` 语句都会清空 `Err`（本机 VB6 实测），`Resume`/`Resume Next` 的恢复点是「出错语句所在的根块语句」。
 //! 与 VB 一致，整数与 `Single` 的赋值超出目标类型范围时报错误号 6（`溢出`），
 //! 不会静默截断；`Variant`/`Double` 不做范围检查。
 //! `CInt`/`CLng` 按银行家舍入并检查目标类型范围（越界错误号 6），`CBool` 与 `If` 条件里的字符串
@@ -121,6 +124,7 @@ pub mod dialog;
 pub mod error;
 pub mod ffi;
 pub mod filelock;
+pub mod hasher;
 pub mod include;
 pub mod lexer;
 pub mod parser;
@@ -1197,6 +1201,55 @@ Debug.Print Len(Err.Description)
     }
 
     #[test]
+    fn any_on_error_statement_clears_err() {
+        // 本机 VB6 实测：`On Error Resume Next` / `GoTo 0` / `GoTo -1` 都会把 `Err` 清空，
+        // 而单纯读取 `Err.Number` 不会清。
+        let source = r#"
+On Error Resume Next
+Dim x As Long
+x = 1 / 0
+Debug.Print Err.Number
+Debug.Print Err.Number
+On Error Resume Next
+Debug.Print Err.Number
+x = 1 / 0
+Debug.Print Err.Number
+On Error GoTo 0
+Debug.Print Err.Number
+"#;
+        assert_eq!(output(source), ["11", "11", "0", "11", "0"]);
+    }
+
+    #[test]
+    fn on_error_goto_minus_one_clears_err_and_disables_the_handler() {
+        let source = r#"
+On Error Resume Next
+Dim x As Long
+x = 1 / 0
+Debug.Print Err.Number
+On Error GoTo -1
+Debug.Print Err.Number
+On Error Resume Next
+x = 1 / 0
+Debug.Print Err.Number
+"#;
+        assert_eq!(output(source), ["11", "0", "11"]);
+
+        let error = run_lines(
+            "Sub Main()\n    On Error Resume Next\n    On Error GoTo -1\n    Dim x As Long\n    x = 1 / 0\nEnd Sub\n",
+        )
+        .unwrap_err();
+        assert!(error.message().contains("除数为零"), "{error}");
+        assert_eq!(error.line(), 5);
+    }
+
+    #[test]
+    fn on_error_goto_rejects_other_negative_labels() {
+        let error = crate::interpreter::parser::parse("On Error GoTo -2\n").unwrap_err();
+        assert!(error.message.contains("负标签只支持"), "{error}");
+    }
+
+    #[test]
     fn file_io_roundtrip() {
         let path = std::env::temp_dir().join("vb_interp_roundtrip.txt");
         let _ = std::fs::remove_file(&path);
@@ -1329,13 +1382,46 @@ Close #1
     }
 
     #[test]
-    fn binary_get_rejects_unsupported_types() {
-        let path = std::env::temp_dir().join("vb_interp_binary_bad.dat");
+    fn binary_io_round_trips_variant_targets() {
+        let path = std::env::temp_dir().join(format!(
+            "vb_interp_binary_variant_{}.dat",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         let display = path.display().to_string();
-        let source = format!("Dim s As String\nOpen \"{display}\" For Binary As #1\nPut #1, , s\n");
+        let source = format!(
+            r#"
+Dim v As Variant
+Dim back As Variant
+v = 42
+Open "{display}" For Binary As #1
+Put #1, , v
+Debug.Print LOF(1)
+Get #1, 1, back
+Debug.Print back
+Debug.Print VarType(back)
+Close #1
+"#
+        );
+        assert_eq!(output(&source), ["4", "42", "2"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn binary_io_rejects_variants_holding_objects() {
+        let path =
+            std::env::temp_dir().join(format!("vb_interp_binary_bad_{}.dat", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let display = path.display().to_string();
+        let source = format!(
+            "Dim v As Variant\nDim c As Collection\nSet c = New Collection\nSet v = c\n\
+             Open \"{display}\" For Binary As #1\nPut #1, , v\n"
+        );
         let error = run_lines(&source).unwrap_err();
-        assert!(error.message().contains("String"), "{error}");
+        assert!(
+            matches!(&error, crate::interpreter::error::Error::Runtime(runtime) if runtime.number == 458),
+            "{error}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1503,11 +1589,19 @@ Debug.Print TimeSerial(13, 30, 0) > 0.5
     }
 
     #[test]
-    fn date_errors_are_reported() {
-        let error = run_lines("Debug.Print DateSerial(2024, 13, 1)\n").unwrap_err();
-        assert!(error.message().contains("月份"), "{error}");
-        let error = run_lines("Debug.Print DateSerial(2023, 2, 29)\n").unwrap_err();
-        assert!(error.message().contains("日期"), "{error}");
+    fn date_serial_normalizes_overflowing_parts() {
+        // VB6 实测：`DateSerial` 的月、日允许溢出，两位数年份按 1930/2000 规则展开。
+        assert_eq!(
+            output(
+                "Debug.Print DateSerial(2024, 13, 1)\n\
+                 Debug.Print DateSerial(2023, 2, 29)\n\
+                 Debug.Print DateSerial(2024, 1, 0)\n\
+                 Debug.Print DateSerial(0, 1, 1)\n"
+            ),
+            ["2025/1/1", "2023/3/1", "2023/12/31", "2000/1/1"]
+        );
+        let error = run_lines("Debug.Print CDate(\"2024-02-30\")\n").unwrap_err();
+        assert!(error.message().contains("无法把字符串"), "{error}");
         let error = run_lines("Debug.Print DateAdd(\"x\", 1, 0)\n").unwrap_err();
         assert!(error.message().contains("间隔"), "{error}");
     }
@@ -2927,11 +3021,11 @@ Debug.Print Join(Filter(Split("apple,banana,avocado", ","), "an"), "|")
             output(source),
             [
                 "4",
-                "Wednesday",
-                "February",
+                "星期四",
+                "二月",
                 "True",
                 "True",
-                "1899-12-30 12:00:00",
+                "12:00:00",
                 "True",
                 "True",
                 "True",
@@ -3147,29 +3241,34 @@ Debug.Print d.Exists("two")
     }
 
     #[test]
-    fn dictionary_keys_items_and_for_each() {
+    fn dictionary_for_each_iterates_keys() {
         let source = r#"
 Dim d As New Dictionary
 d.Add "a", 10
 d.Add "b", 20
 
-Dim total As Long
-Dim v As Variant
-For Each v In d
-    total = total + v
-Next v
-Debug.Print total
-
-Dim k As Variant
 Dim names As String
-For Each k In d.Keys
+Dim k As Variant
+For Each k In d
     names = names & k
 Next k
 Debug.Print names
 
+Dim total As Long
+For Each k In d
+    total = total + d(k)
+Next k
+Debug.Print total
+
+Dim listed As String
+For Each k In d.Keys
+    listed = listed & k
+Next k
+Debug.Print listed
+
 Debug.Print Join(d.Items, ",")
 "#;
-        assert_eq!(output(source), ["30", "ab", "10,20"]);
+        assert_eq!(output(source), ["ab", "30", "ab", "10,20"]);
     }
 
     #[test]

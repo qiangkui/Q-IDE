@@ -937,19 +937,81 @@ fn go_menu(cx: &App, palette: Palette, handle: WeakEntity<CodeWindow>) -> impl I
     })
 }
 
+/// 状态栏「编码」：文字上方弹出编码选择菜单，点一项即按该编码重新读取。
+pub fn encoding_menu(
+    cx: &App,
+    palette: Palette,
+    handle: WeakEntity<CodeWindow>,
+    current: crate::encoding::FileEncoding,
+) -> AnyElement {
+    let trigger = Button::new("status-encoding")
+        .custom(
+            ButtonCustomVariant::new(cx)
+                // 与状态栏的正文同色（不用按钮的次要色），悬停只给底色。
+                .foreground(Hsla::from(rgb(palette.sidebar_text)))
+                .hover(Hsla::from(rgba(palette.hover))),
+        )
+        .xsmall()
+        .compact()
+        .label(format!("编码：{}", current.label()));
+
+    Popover::new("status-encoding-menu")
+        .anchor(Anchor::BottomLeft)
+        .offset(px(2.0))
+        .appearance(false)
+        .trigger(trigger)
+        .content(move |_, _, cx| {
+            let state = cx.entity();
+            let rows = crate::encoding::FileEncoding::ALL
+                .iter()
+                .map(|kind| {
+                    let kind = *kind;
+                    let action = app_action(&handle, move |this, window, cx| {
+                        this.change_encoding_to(kind, window, cx)
+                    });
+                    menu_row(
+                        palette,
+                        &state,
+                        format!("status-encoding-{}", kind.label()),
+                        kind.label(),
+                        kind == current,
+                        false,
+                        Some(action),
+                    )
+                })
+                .collect::<Vec<_>>();
+            menu_panel(palette, state, rows)
+        })
+        .into_any_element()
+}
+
 /// “帮助”菜单。
 fn help_menu(cx: &App, palette: Palette, handle: WeakEntity<CodeWindow>) -> impl IntoElement {
     let about = app_action(&handle, |this, _, cx| this.show_about(cx));
+    let shortcuts = app_action(&handle, |this, window, cx| {
+        this.show_shortcuts_dialog(window, cx)
+    });
 
     menu_popover(cx, palette, "menu-help", "帮助(H)", move |state_menu| {
-        vec![menu_row(
-            palette,
-            state_menu,
-            "help-about",
-            "关于 Q-IDE",
-            false,
-            false,
-            Some(about.clone()),
-        )]
+        vec![
+            menu_row(
+                palette,
+                state_menu,
+                "help-shortcuts",
+                "快捷键一览…（F1）",
+                false,
+                false,
+                Some(shortcuts.clone()),
+            ),
+            menu_row(
+                palette,
+                state_menu,
+                "help-about",
+                "关于 Q-IDE",
+                false,
+                false,
+                Some(about.clone()),
+            ),
+        ]
     })
 }
