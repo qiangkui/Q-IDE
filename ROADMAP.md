@@ -98,7 +98,7 @@
 - 监视求值发生在解释器线程仍停在 `before_line` 里的时候：求值前必须**放开调试锁**，并通过 `Runtime::evaluating` 让表达式内部的语句跳过暂停检查，否则调用脚本过程会再次进入 `before_line` 把自己锁死。条件断点的条件求值走同一条路径（`DebugQuery::Condition`），只是判断真假后接着往下跑而不是停住。
 - 条件断点只在「命中断点且不是单步/暂停请求」时求值；条件本身出错时按「真」处理。编辑代码后断点行号由行号栏装饰反推，条件按行号顺序重新挂（数量不变时一一对应，数量变了只保留行号仍存在的条件），这是有意的启发式，别把它当成精确的行映射。
 - 输入框单行模式下回车只 `cx.propagate()`，对话框里要自己挂 `.on_action(|_: &Enter, ..|)` 才能回车确认。
-- 测试放在 crate 级文件（如 `src/outline_tests.rs`）并在 `src/main.rs` 用 `#[cfg(test)] mod xxx_tests;` 注册；写在模块内的 `#[cfg(test)] mod tests` 会触发 rustc 的宏展开递归上限。
+- 测试放在 crate 级文件（如 `src/outline_tests.rs`）并在 `src/main.rs` 用 `#[cfg(test)] mod xxx_tests;` 注册；写在模块内的 `#[cfg(test)] mod tests` 会触发 rustc 的宏展开递归上限。模块自己的测试要贴在模块旁边时，用 `#[cfg(test)] #[path = "run_tests.rs"] mod tests;`（`cli.rs`、`interpreter/mod.rs` 都这样）：模块路径不变、`use super::*` 照旧，文件本身也不会把主模块撑大。
 - `src/vb6_golden_data.rs` 是**生成文件**：`tools/vb6_golden.py` 的四组常量都带 `#[rustfmt::skip]`，`cargo fmt` 不会把一行一条的用例拆成多行；`parse_data` 的正则也容忍拆行与尾逗号（`\s*,?\s*\)`），这样即便有人手工格式化过，`--check` 也不会误报「清单里有、数据里没有」。
 - 输出面板的重复分组只合并**相邻**的同类错误/警告（`OutputLine::repeat`），复制全部输出时带「（重复 N 次）」，拖选复制仍是原始文本。
 - 脚本路径：`RunOptions::script_path` → 运行时 `script_dir`（`App.Path`）/ `cwd`（相对路径基准）。`cwd` 只在解释器内部随 `ChDir` 变，绝不要改进程 CWD（编辑器、资源管理器、后台验证都会受影响）。没有脚本路径时两者都退回进程目录，保持旧测试/`run` 入口的行为。
