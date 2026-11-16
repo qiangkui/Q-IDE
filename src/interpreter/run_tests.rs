@@ -3333,3 +3333,57 @@ Debug.Print VarType(Yq)
     let error = run_lines("Sub S()\nDefInt A-Z\nEnd Sub\n").unwrap_err();
     assert!(error.message().contains("模块级"), "{error}");
 }
+
+#[test]
+fn module_level_with_events_receives_script_class_events() {
+    // 本机 VB6 实测：模块级 `Dim WithEvents x As 类` 的处理过程叫 `x_事件名`（用类名命名是不触发的）。
+    let source = r#"
+Dim gLog As String
+
+Class Src
+Public Sub Go(ByVal n As Long)
+RaiseEvent Ping(n)
+End Sub
+End Class
+
+Dim WithEvents mSrc As Src
+
+Sub mSrc_Ping(ByVal n As Long)
+gLog = gLog & "var:" & n & ";"
+End Sub
+
+Sub Src_Ping(ByVal n As Long)
+gLog = gLog & "type:" & n & ";"
+End Sub
+
+Set mSrc = New Src
+mSrc.Go 7
+Debug.Print gLog
+Set mSrc = New Src
+mSrc.Go 9
+Debug.Print gLog
+"#;
+    assert_eq!(output(source), ["var:7;", "var:7;var:9;"]);
+
+    // 只写 `<类名>_<事件>` 时也收得到（QIDE 的宽松扩展；VB6 只认变量名那种写法）。
+    let source = r#"
+Dim gLog As String
+
+Class Src
+Public Sub Go()
+RaiseEvent Ping
+End Sub
+End Class
+
+Dim WithEvents mSrc As Src
+
+Sub Src_Ping()
+gLog = gLog & "type;"
+End Sub
+
+Set mSrc = New Src
+mSrc.Go
+Debug.Print gLog
+"#;
+    assert_eq!(output(source), ["type;"]);
+}

@@ -446,6 +446,16 @@ struct ComEventOwner {
     events: com::ComEvents,
 }
 
+/// `WithEvents` 的订阅者：类实例（类字段上的 `WithEvents`）或模块本身（模块级 `Dim WithEvents`）。
+#[derive(Clone)]
+enum EventSink {
+    /// 类实例上订阅：处理过程是同一类里的 `私有过程`，局部变量是那个实例的字段。
+    Instance(Weak<RefCell<VbInstance>>),
+    /// 模块级变量上订阅：处理过程是模块级过程，名字先按 `<变量名>_<事件>` 找（VB6 的写法），
+    /// 找不到再试 `<类名>_<事件>`（与类字段上的约定一致）。
+    Module { var: String },
+}
+
 /// COM 调用的一个实参：命名实参的名字、值、是否按 `ByRef` 传、写回用的变量槽。
 type ComArgument = (Option<String>, Value, bool, Option<Slot>);
 
@@ -496,10 +506,10 @@ pub struct Runtime<'p, 'o> {
     strings: Vec<Vec<u16>>,
     /// 存进结构体/变量后仍要被系统回调的 `AddressOf` 跳板，保持到脚本结束。
     persistent_callbacks: Vec<PersistentCallback>,
-    /// 事件订阅表：源实例 → 订阅它的 `WithEvents` 对象（弱引用，随对象一起消失）。
-    events: HashMap<usize, Vec<Weak<RefCell<VbInstance>>>>,
-    /// `WithEvents` 声明的变量名（标识符已小写）：`Set` 到 COM 对象时挂接事件。
-    com_event_vars: std::collections::HashSet<String>,
+    /// 事件订阅表：源实例 → 订阅者（类实例是弱引用，随对象一起消失；模块见 [`EventSink::Module`]）。
+    events: HashMap<usize, Vec<EventSink>>,
+    /// 模块级 `Dim WithEvents` 声明的变量名（标识符已小写）。
+    with_events_vars: std::collections::HashSet<String>,
     /// 已挂接的 COM 事件连接；`Drop` 时自动 `Unadvise`。
     com_events: Vec<ComEventOwner>,
     /// 正在分派 COM 事件（`事件处理过程里再产生的事件`要留到下一次，避免递归分派）。
@@ -688,7 +698,7 @@ pub fn run_program_with_stats(
         strings: Vec::new(),
         persistent_callbacks: Vec::new(),
         events: HashMap::new(),
-        com_event_vars: program
+        with_events_vars: program
             .main
             .iter()
             .filter_map(|stmt| match stmt {

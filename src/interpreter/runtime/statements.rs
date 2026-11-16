@@ -1191,20 +1191,39 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 let key = Rc::as_ptr(&instance) as usize;
                 let subscribers = self.events.remove(&key).unwrap_or_default();
                 let mut alive = Vec::with_capacity(subscribers.len());
-                for weak in subscribers {
-                    let Some(sink) = weak.upgrade() else {
-                        continue;
-                    };
-                    let sink_class = sink.borrow().key().to_string();
-                    let handler = self
-                        .classes
-                        .get(&sink_class)
-                        .and_then(|def| def.method(&handler_name));
-                    if let Some(handler) = handler {
-                        let locals = Self::instance_locals(&sink);
-                        self.call_procedure_values(handler, values.clone(), locals)?;
+                for subscriber in subscribers {
+                    match subscriber {
+                        EventSink::Instance(weak) => {
+                            let Some(sink) = weak.upgrade() else {
+                                continue;
+                            };
+                            let sink_class = sink.borrow().key().to_string();
+                            let handler = self
+                                .classes
+                                .get(&sink_class)
+                                .and_then(|def| def.method(&handler_name));
+                            if let Some(handler) = handler {
+                                let locals = Self::instance_locals(&sink);
+                                self.call_procedure_values(handler, values.clone(), locals)?;
+                            }
+                            alive.push(EventSink::Instance(weak));
+                        }
+                        EventSink::Module { var } => {
+                            // VB6 的模块级写法是 `<变量名>_<事件>`；QIDE 也接受类字段那套
+                            // `<类名>_<事件>`（见 `docs/脚本语言.md`）。
+                            let handler = [format!("{var}_{name}"), handler_name.clone()]
+                                .into_iter()
+                                .find_map(|candidate| self.procedures.get(&candidate).copied());
+                            if let Some(handler) = handler {
+                                self.call_procedure_values(
+                                    handler,
+                                    values.clone(),
+                                    FastMap::default(),
+                                )?;
+                            }
+                            alive.push(EventSink::Module { var });
+                        }
                     }
-                    alive.push(weak);
                 }
                 self.events.insert(key, alive);
                 Ok(Flow::Normal)
@@ -1725,13 +1744,21 @@ impl<'p, 'o> Runtime<'p, 'o> {
         }
     }
 
-    /// `Set 名字 = COM 对象`：按「模块级 `WithEvents` 变量」或「当前类的 `WithEvents` 字段」挂接事件。
+    /// `Set 名字 = 对象`：按「模块级 `WithEvents` 变量」或「当前类的 `WithEvents` 字段」挂接事件。
+    ///
+    /// 脚本类对象走 `events` 表（处理过程在模块或同类里），COM 对象走 `com_events` 队列。
     pub(super) fn connect_events_for_name(
         &mut self,
         name: &str,
         value: &Value,
         line: usize,
     ) -> Result<(), RuntimeError> {
+        if let Value::Class(source) = value {
+            if self.current_instance().is_none() && self.with_events_vars.contains(name) {
+                Self::register_module_event_sink(&mut self.events, &source.0, name);
+            }
+            return Ok(());
+        }
         let Value::ComObject(object) = value else {
             return Ok(());
         };
@@ -1748,7 +1775,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 }
             }
         }
-        if self.com_event_vars.contains(name) {
+        if self.with_events_vars.contains(name) {
             return self.connect_com_events(object, name, line);
         }
         Ok(())

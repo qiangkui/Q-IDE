@@ -137,25 +137,45 @@ impl<'p, 'o> Runtime<'p, 'o> {
         Ok(Value::Class(ClassRef(instance)))
     }
 
-    /// 把 `sink` 登记为 `source` 的事件订阅者（弱引用，不延长生命周期）。
+    /// 把类实例 `sink` 登记为 `source` 的事件订阅者（弱引用，不延长生命周期）。
     pub(super) fn register_event_sink(
-        events: &mut HashMap<usize, Vec<Weak<RefCell<VbInstance>>>>,
+        events: &mut HashMap<usize, Vec<EventSink>>,
         source: &Rc<RefCell<VbInstance>>,
         sink: &Rc<RefCell<VbInstance>>,
     ) {
         let key = Rc::as_ptr(source) as usize;
         let entry = events.entry(key).or_default();
         let sink_weak = Rc::downgrade(sink);
-        let already =
-            entry
-                .iter()
-                .any(|existing| match (existing.upgrade(), sink_weak.upgrade()) {
-                    (Some(a), Some(b)) => Rc::ptr_eq(&a, &b),
-                    _ => false,
-                });
+        let already = entry.iter().any(|existing| match existing {
+            EventSink::Instance(other) => match (other.upgrade(), sink_weak.upgrade()) {
+                (Some(a), Some(b)) => Rc::ptr_eq(&a, &b),
+                _ => false,
+            },
+            EventSink::Module { .. } => false,
+        });
         if !already {
-            entry.push(sink_weak);
+            entry.push(EventSink::Instance(sink_weak));
         }
+    }
+
+    /// 把模块登记为 `source` 的事件订阅者（模块级 `Dim WithEvents x As 脚本类`）。
+    pub(super) fn register_module_event_sink(
+        events: &mut HashMap<usize, Vec<EventSink>>,
+        source: &Rc<RefCell<VbInstance>>,
+        var: &str,
+    ) {
+        let key = Rc::as_ptr(source) as usize;
+        let entry = events.entry(key).or_default();
+        // 同一个变量重新 `Set` 到另一个实例时不该重复登记。
+        if entry
+            .iter()
+            .any(|existing| matches!(existing, EventSink::Module { var: name } if name == var))
+        {
+            return;
+        }
+        entry.push(EventSink::Module {
+            var: var.to_string(),
+        });
     }
 
     /// 类方法执行时的起始局部变量：实例变量（共享存储）+ `Me`。
