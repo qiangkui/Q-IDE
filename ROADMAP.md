@@ -326,6 +326,27 @@ VB6 路径用环境变量 `QIDE_VB6` 覆盖（默认 `E:\vb\VB 6.0\Vb6.exe`）�
 12. **`AddressOf` 回调的数组/UDT 形参（暂不做）**：`callback_arg` 只把标量/`String` 形参还原成脚本值，
     数组与 UDT 直接报「暂不支持」。VB6 写回调的惯例也是用 `ByVal Long` 接指针再 `CopyMemory`，
     脚本里同样可以这么做（`VarPtr`/`CopyMemory` 与 `Declare` 的 UDT 支持都已有），因此不计划直接支持。
+13. **脚本源码兼容性缺口（本轮用 `qide-run` 逐条实测，按「会不会让真实 VB6 源码直接跑不起来」排序）**：
+   这些都是**语法层完全没有**的东西，不是语义偏差；所以粘贴真实 VB6 代码时最先撞上：
+   - `Attribute VB_Name = "..."` 一行（`.bas` / `.cls` / `.frm` 的第一行必有）现在被当成过程调用，
+     第 1 行就报**错误号 5**。建议把 `Attribute` 行当声明忽略（`VB_UserMemId` 另见下面「默认成员」）。
+   - `Event 名字(ByVal 参数 As 类型)` 声明语句**不存在**（`event` 不在关键字表）：`RaiseEvent` 只能发
+     类里 ad-hoc 的事件名，参数靠同类里 `<类名>_<事件名>` 处理过程的同名形参接收。
+   - 模块级（脚本级）`Dim WithEvents x As 脚本类` **静默无效**：`connect_events_for_name` 只认
+     `Value::ComObject`，脚本类对象走不到 `register_event_sink`，事件一条也不派发、也不报错；
+     而 VB6 里模块级 `WithEvents` 是最常见的订阅写法。
+   - `Static Sub` / `Static Function`（过程内全部局部变量变 Static）解析报「需要变量名」；
+     只有 `Sub` 内的 `Static n As Long` 支持。
+   - `DefInt A-Z` / `DefStr S` 等 `DefType` 声明不存在。
+   - `LSet` / `RSet` 语句不存在（错误号 5）。
+   - 独立定长字符串 `Dim s As String * 8` 解析报错；UDT 成员里的 `String * 4` 是支持的（`Len`/补空格都对）。
+   - 命名实参 `x.M y:=1` 解析报错（VBA 与 COM 调用里很常见）。
+   - `#If ... Then` / `#End If` 条件编译不存在（`#` 直接语法错）。
+   - `Debug.Assert` 不存在（`Debug` 只认 `.Print`）。
+   - `Reset` 语句（关闭全部文件）不存在。
+   - 脚本类的**默认成员**（`Attribute Item.VB_UserMemId = 0` 之后的 `c(3)`）不支持，COM 对象支持。
+   - 小偏差：未初始化动态数组的 `LBound(a)` 报 5，VB6 报 9。
+   - `CVErr` / `IsError` / `Erl` 见第 2 条；`Error$(n)` 正常（错误文案已对齐），`Err.Line` 本就不是 VB6 的东西。
 
 **已决定不做**：模块级 `Public` / `Private` 隔离。`#Include` 是文本展开，整个脚本就是一个模块，
 与 VB6 单模块内的语义一致（同一模块里的过程互相可见）；需要真正隔离的只有类成员，那部分已实现
