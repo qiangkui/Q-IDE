@@ -200,10 +200,45 @@ pub(crate) fn selection_text(lines: &[OutputLine], selection: TextSelection) -> 
 /// 渲染时回填的几何信息，用来把鼠标位置换算成文本位置。
 #[derive(Default)]
 struct OutputGeometry {
-    /// 每行正文的排版结果，顺序与可见行一致。
+    /// 这一段 `layouts` / `rows` 从第几行开始（视口裁剪后不再是 0）。
+    start: usize,
+    /// 上一帧「可见行」总数：和这一帧对不上就说明内容变了，要整篇重排一次。
+    count: usize,
+    /// 行距（行高 + 行间空隙），实测得来；0 表示还没量到，这一帧先整篇渲染。
+    pitch: f32,
+    /// 每行正文的排版结果，顺序与 `start` 起的可见行一致。
     layouts: Vec<TextLayout>,
     /// 每行在窗口中的矩形，顺序同上。
     rows: Vec<Bounds<Pixels>>,
+}
+
+/// 视口之外多渲染几行，滚动时不会露出空白。
+const OVERSCAN_ROWS: usize = 8;
+
+/// 视口裁剪：按行距、滚动偏移与视口高度算出这一帧真正要建元素的行区间。
+///
+/// 输出日志每行都是单行文本（不折行），行距固定，所以可以直接算，不需要先排版。
+/// 返回 `(first, last)`；`first..last` 之外的行用上下两块留白撑出高度，
+/// 这样滚动条长度和拖动位置都不受影响。
+pub(crate) fn visible_window(
+    count: usize,
+    pitch: f32,
+    scrolled: f32,
+    viewport: f32,
+) -> (usize, usize) {
+    if count == 0 {
+        return (0, 0);
+    }
+    // 还没量到行距 / 不知道视口高度：先整篇渲染一次，下一帧就有数据了。
+    if pitch <= 0.0 || viewport <= 0.0 {
+        return (0, count);
+    }
+    let scrolled = scrolled.max(0.0);
+    let first_visible = (scrolled / pitch) as usize;
+    let shown = (viewport / pitch).ceil() as usize + 1;
+    let first = first_visible.saturating_sub(OVERSCAN_ROWS);
+    let last = (first_visible + shown + OVERSCAN_ROWS).min(count);
+    (first.min(count), last)
 }
 
 /// 输出面板的过滤条件。
@@ -514,23 +549,32 @@ impl OutputLog {
     pub fn position_at(&self, position: Point<Pixels>) -> Option<TextPosition> {
         let visible = self.visible.len();
         let geometry = self.geometry.borrow();
-        if visible == 0 || geometry.layouts.len() != visible || geometry.rows.len() != visible {
+        // 视口裁剪之后 `rows` / `layouts` 只覆盖 `start` 起的一段窗口。
+        if visible == 0 || geometry.count != visible || geometry.rows.is_empty() {
             return None;
         }
+        let start = geometry.start;
 
-        // 先按 y 找到所在行：落在行间空隙里归到下面一行，超出末尾时归到最后一行。
-        let mut index = visible - 1;
-        for (line, row) in geometry.rows.iter().enumerate() {
-            if position.y <= row.bottom() {
-                index = line;
-                break;
+        // 先按 y 找到所在行：落在行间空隙里归到下面一行；在窗口上方取第一行，
+        // 在窗口下方取最后一行（拖动选区时靠自动滚动把窗口带过去）。
+        let mut index = start + geometry.rows.len() - 1;
+        if position.y < geometry.rows[0].top() {
+            index = start;
+        } else {
+            for (offset, row) in geometry.rows.iter().enumerate() {
+                if position.y <= row.bottom() {
+                    index = start + offset;
+                    break;
+                }
             }
         }
 
         let text = &self.visible_line(index)?.text;
-        let byte = geometry.layouts[index]
-            .index_for_position(position)
-            .unwrap_or_else(|byte| byte);
+        let byte = geometry
+            .layouts
+            .get(index.saturating_sub(start))
+            .and_then(|layout| layout.index_for_position(position).ok())
+            .unwrap_or(0);
         Some(TextPosition::new(index, clamp_byte(text, byte)))
     }
 
@@ -857,9 +901,23 @@ fn log_body(
     let highlight = Hsla::from(rgb(palette.selection));
 
     let count = log.visible_len();
-    let mut layouts = Vec::with_capacity(count);
-    let mut rows = Vec::with_capacity(count);
-    for index in 0..count {
+    // 视口裁剪：只建视口附近的行。内容变了（行数对不上）时先整篇渲染一次来量行距，
+    // 之后按滚动偏移裁，拖动分割条这种连续重绘才不会每帧重建上千行。
+    let (first, last) = {
+        let geometry = log.geometry.borrow();
+        if geometry.count == count {
+            let scrolled: f32 = log.scroll.offset().y.into();
+            let viewport: f32 = log.scroll.bounds().size.height.into();
+            visible_window(count, geometry.pitch, scrolled, viewport)
+        } else {
+            (0, count)
+        }
+    };
+    let pitch = log.geometry.borrow().pitch;
+
+    let mut layouts = Vec::with_capacity(last.saturating_sub(first));
+    let mut rows = Vec::with_capacity(last.saturating_sub(first));
+    for index in first..last {
         let Some(line) = log.visible_line(index) else {
             continue;
         };
@@ -896,8 +954,28 @@ fn log_body(
             .into_any_element(),
         );
     }
-    log.geometry.borrow_mut().layouts = layouts;
+    {
+        let mut geometry = log.geometry.borrow_mut();
+        geometry.start = first;
+        geometry.count = count;
+        geometry.layouts = layouts;
+    }
+    // 上下留白：被裁掉的行用空白撑住高度，滚动条与滚动位置都不受影响。
+    let top_pad = (first > 0).then(|| {
+        div()
+            .flex_shrink_0()
+            .h(px(first as f32 * pitch))
+            .into_any_element()
+    });
+    let bottom_pad = (last < count).then(|| {
+        div()
+            .flex_shrink_0()
+            .h(px((count - last) as f32 * pitch))
+            .into_any_element()
+    });
     let rows_sink = log.geometry.clone();
+    let sink_start = first;
+    let sink_rows = rows.len();
 
     let on_mouse_down = {
         let entity = entity.clone();
@@ -981,10 +1059,20 @@ fn log_body(
                 .child(
                     v_flex()
                         .gap_1()
-                        .on_children_prepainted(move |rows, _window, _cx| {
-                            rows_sink.borrow_mut().rows = rows;
+                        .on_children_prepainted(move |children, _window, _cx| {
+                            // 子元素里可能带着上下留白：只留真正的行，并把行距量下来。
+                            let top = usize::from(sink_start > 0);
+                            let end = (top + sink_rows).min(children.len());
+                            let rows = children.get(top..end).unwrap_or_default().to_vec();
+                            let mut geometry = rows_sink.borrow_mut();
+                            if rows.len() >= 2 {
+                                geometry.pitch = f32::from(rows[1].top() - rows[0].top());
+                            }
+                            geometry.rows = rows;
                         })
-                        .children(rows),
+                        .children(top_pad)
+                        .children(rows)
+                        .children(bottom_pad),
                 ),
         )
         // 滚动条浮在日志区上方，不占正文宽度。

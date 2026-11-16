@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::output::{
     OutputFilter, OutputLevel, OutputLine, TextPosition, TextSelection, can_group, display_text,
-    line_number_prefix, selection_range, selection_text,
+    line_number_prefix, selection_range, selection_text, visible_window,
 };
 
 fn lines(texts: &[&str]) -> Vec<OutputLine> {
@@ -205,4 +205,26 @@ fn error_lines_parse_their_line_number() {
     assert_eq!(line_number_prefix("脚本执行结束"), None);
     assert_eq!(line_number_prefix("第 行错误"), None);
     assert_eq!(line_number_prefix("第 12行错误"), None);
+}
+
+/// 视口裁剪：只渲染滚动位置附近的行，别每帧都建上千个元素。
+#[test]
+fn visible_window_covers_the_viewport_plus_overscan() {
+    // 行距 20px、视口 200px：可见 10 行 + 1 行余量，上下各留 8 行余量。
+    assert_eq!(visible_window(1000, 20.0, 0.0, 200.0), (0, 19));
+    // 滚到第 100 行：从 100-8 行起，到 100+11+8 行止。
+    assert_eq!(visible_window(1000, 20.0, 2000.0, 200.0), (92, 119));
+    // 滚到底：末尾夹住，不会越界。
+    assert_eq!(visible_window(1000, 20.0, 19980.0, 200.0), (991, 1000));
+}
+
+#[test]
+fn visible_window_renders_everything_before_it_can_measure() {
+    // 还没量到行距（0）或不知道视口高度时，先整篇渲染一次。
+    assert_eq!(visible_window(50, 0.0, 0.0, 200.0), (0, 50));
+    assert_eq!(visible_window(50, 20.0, 0.0, 0.0), (0, 50));
+    // 没有内容时是空区间。
+    assert_eq!(visible_window(0, 20.0, 0.0, 200.0), (0, 0));
+    // 内容比视口少：全部渲染。
+    assert_eq!(visible_window(3, 20.0, 0.0, 200.0), (0, 3));
 }
