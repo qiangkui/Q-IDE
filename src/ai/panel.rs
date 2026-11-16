@@ -960,6 +960,7 @@ impl Focusable for AiPanel {
 
 impl Render for AiPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _span = crate::ui_profile::span("ai-panel");
         let palette = Palette::for_theme(cx);
         let chat_font = chat_font_size(cx);
         let panel_id = PanelId::from(cx.entity().entity_id());

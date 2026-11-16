@@ -421,6 +421,7 @@ impl Focusable for EditorPanel {
 
 impl Render for EditorPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _span = crate::ui_profile::span("editor-pane");
         let panel = cx.entity().downgrade();
         let on_context_menu: OpenContextMenuAction = Rc::new(move |position, _window, cx| {
             let _ = panel.update(cx, |panel, cx| panel.set_context_menu(Some(position), cx));
@@ -962,6 +963,7 @@ impl Focusable for ExplorerPanel {
 
 impl Render for ExplorerPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _span = crate::ui_profile::span("explorer");
         let app = self.app.clone();
         let add_folder = {
             let app = app.clone();
@@ -1350,6 +1352,7 @@ impl Focusable for OutlinePanel {
 
 impl Render for OutlinePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _span = crate::ui_profile::span("outline");
         let panel = cx.entity();
         let toggle_section: outline::ToggleSectionAction = {
             let panel = panel.clone();
@@ -1849,6 +1852,7 @@ impl Focusable for SearchPanel {
 
 impl Render for SearchPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _span = crate::ui_profile::span("search");
         let app = self.app.clone();
         let panel = cx.entity();
         let toggle_option: search::ToggleOptionAction = {
@@ -2187,6 +2191,7 @@ impl Focusable for OutputPanel {
 
 impl Render for OutputPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _span = crate::ui_profile::span("output");
         let palette = Palette::for_theme(cx);
         let active_tab = self.active_tab;
         let empty = self.log.read(cx).is_empty();

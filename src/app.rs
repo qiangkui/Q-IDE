@@ -308,6 +308,11 @@ pub struct CodeWindow {
     last_auto_save: Instant,
     /// 当前文本里的语法错误数量（编辑器诊断只报第一处，所以是 0 或 1）。
     error_count: usize,
+    /// 状态栏「N 行 · M 字符」的缓存：`(文件下标, 内容字节数, 行数, 字符数)`。
+    ///
+    /// gpui 是即时模式，`render` 每帧都会跑一遍；这两个数只能扫全文得到，
+    /// 所以按「文件 + 字节数」缓存，拖动分割条这种连续重绘才不会每帧扫一遍。
+    status_counts: (usize, usize, usize, usize),
     /// 正在运行的脚本的中断标志。
     script_interrupt: Option<Arc<AtomicBool>>,
     /// 新建文件的目标目录：最近点过的文件夹，或最近打开文件所在的目录。
@@ -531,6 +536,7 @@ impl CodeWindow {
             checked_source: None,
             last_auto_save: Instant::now(),
             error_count: 0,
+            status_counts: (usize::MAX, 0, 0, 0),
             script_interrupt: None,
             new_file_target: None,
             panel_visibility: None,

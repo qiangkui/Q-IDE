@@ -53,6 +53,7 @@ mod syntax;
 mod terminal;
 mod theme;
 mod title_bar;
+mod ui_profile;
 mod window_frame;
 mod workspace;
 

@@ -107,16 +107,30 @@ impl CodeWindow {
 
     /// 状态栏。
     pub(super) fn status_bar(
-        &self,
+        &mut self,
         cx: &mut Context<Self>,
         palette: Palette,
         settings: &AppSettings,
     ) -> AnyElement {
-        let (line_count, char_count) = self
+        let _span = crate::ui_profile::span("status-bar");
+        // 「N 行 · M 字符」要扫全文，按「文件 + 字节数」缓存：拖动分割条时每帧都会走到这里。
+        let (line_count, char_count) = match self
             .active_file
-            .and_then(|index| self.contents.get(index))
-            .map(|content| (content.lines().count().max(1), content.chars().count()))
-            .unwrap_or((0, 0));
+            .and_then(|index| self.contents.get(index).map(|content| (index, content)))
+        {
+            Some((index, content)) => {
+                if self.status_counts.0 != index || self.status_counts.1 != content.len() {
+                    self.status_counts = (
+                        index,
+                        content.len(),
+                        content.lines().count().max(1),
+                        content.chars().count(),
+                    );
+                }
+                (self.status_counts.2, self.status_counts.3)
+            }
+            None => (0, 0),
+        };
         let file_name = self
             .active_file
             .and_then(|index| self.open_files.get(index))
@@ -187,11 +201,12 @@ impl CodeWindow {
 
 impl Render for CodeWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _span = crate::ui_profile::span("frame");
         let palette = Palette::for_theme(cx);
         let settings = self.settings.read(cx).clone();
         let appearance = settings.appearance.clone();
 
-        div()
+        let root = div()
             .id("code-window")
             .relative()
             .v_flex()
@@ -326,6 +341,9 @@ impl Render for CodeWindow {
             )
             .when(appearance.show_status_bar, |this| {
                 this.child(self.status_bar(cx, palette, &settings))
-            })
+            });
+        // 一帧到这里结束：开着 `QIDE_UI_PROFILE` 时把慢帧写进 `ui-profile.log`。
+        crate::ui_profile::end_frame();
+        root
     }
 }
