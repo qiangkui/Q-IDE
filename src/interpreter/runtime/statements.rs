@@ -128,28 +128,14 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 static_,
                 line,
             } => {
+                // `Static Sub` / `Static Function` 里的局部变量全是静态的。
+                let static_ = *static_ || self.current_procedure_is_static();
                 for item in items {
                     let (value, slot_ty) = self.declared_value(item, *line)?;
-                    if *static_ {
-                        let slot = self.static_slot(&item.name, value, slot_ty, *line)?;
-                        let frame = self.frames.last_mut().ok_or_else(|| {
-                            RuntimeError::new(
-                                format!("`Static` 只能用在过程内部（`{}`）", item.name),
-                                *line,
-                            )
-                        })?;
-                        if let Some(existing) = frame.locals.get(item.name.as_str()) {
-                            if existing.declared_at == *line {
-                                continue;
-                            }
-                            return Err(RuntimeError::new(
-                                format!("变量 `{}` 重复声明", item.name),
-                                *line,
-                            ));
+                    if static_ {
+                        if !self.bind_static_local(&item.name, value, slot_ty, *line, None)? {
+                            continue;
                         }
-                        frame
-                            .locals
-                            .insert(std::borrow::Cow::Owned(item.name.clone()), slot);
                     } else if !self.declare_slot(&item.name, value.clone(), slot_ty, *line)? {
                         // 同一条 `Dim` 又跑了一遍（循环体里）：变量保留，初值重新算。
                         if item.initializer.is_some() {
@@ -1030,6 +1016,57 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     };
                     flush_file(handle);
                 }
+                Ok(Flow::Normal)
+            }
+            Stmt::ResetFiles { .. } => {
+                for (_, handle) in self.files.drain() {
+                    flush_file(handle);
+                }
+                Ok(Flow::Normal)
+            }
+            Stmt::Nop { .. } => Ok(Flow::Normal),
+            Stmt::StringAlign {
+                target,
+                value,
+                left,
+                line,
+            } => {
+                let Some(slot) = self.find_slot(target) else {
+                    return Err(RuntimeError::new(format!("未定义的变量 `{target}`"), *line));
+                };
+                // VB6 实测：结果长度取变量**当前**长度——不足补空格、超出截掉右侧，
+                // 当前是空串就还是空串（不会因为要放 `"ab"` 而变长）。
+                let current = slot.value();
+                let mut chars: Vec<char> = match (&current, slot.ty()) {
+                    (Value::Str(text), _) => text.chars().collect(),
+                    (Value::Empty, VbType::Str | VbType::Variant) => Vec::new(),
+                    _ => {
+                        return Err(RuntimeError::new(
+                            format!(
+                                "`LSet` / `RSet` 只支持字符串变量（VB6 里对 `{target}` 这种声明是编译错误）"
+                            ),
+                            *line,
+                        ));
+                    }
+                };
+                let width = chars.len();
+                let text = self.eval(value, *line)?.to_display();
+                let source: Vec<char> = text.chars().collect();
+                let keep = source.len().min(width);
+                if *left {
+                    chars[..keep].copy_from_slice(&source[..keep]);
+                    for ch in chars.iter_mut().skip(keep) {
+                        *ch = ' ';
+                    }
+                } else {
+                    let start = width - keep;
+                    chars[start..].copy_from_slice(&source[..keep]);
+                    for ch in chars.iter_mut().take(start) {
+                        *ch = ' ';
+                    }
+                }
+                slot.set(Value::Str(chars.into_iter().collect()))
+                    .map_err(|message| RuntimeError::new(message, *line))?;
                 Ok(Flow::Normal)
             }
             Stmt::PrintFile {

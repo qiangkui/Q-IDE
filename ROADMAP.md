@@ -253,6 +253,7 @@ VB6 路径用环境变量 `QIDE_VB6` 覆盖（默认 `E:\vb\VB 6.0\Vb6.exe`）�
 | 调试：暂停时改变量值 | 原来暂停只能看变量、求值监视表达式，改不了值。`DebugControl` 的请求体从「一条表达式」扩成`RequestKind::{Evaluate, Assign}`，新增 `request_assign(变量名, 新值表达式)`；`DebugQuery` 多一个 `Assign`，解释器侧 `debug_assign` 先求值右侧、再用 `set_var` 写回（**声明类型转换生效**：`Long` 变量收到 `1.5` 变成 2），然后回读一次给出新值与类型。变量名不存在、类型不匹配都返回可读错误。赋值成功后 `pause_and_wait` 会**再取一次快照**并让 `pause_epoch` 加一，界面那套「暂停变化才刷新」的逻辑自动把变量面板、监视结果更新成新值。界面：运行菜单「设置变量值…」（暂停时才可用，光标停在某个名字上会预填 `名字 = `），命令面板 `run.set-variable`，输入框按**第一个** `=` 切分（值里可以再写 `=`）。测试：`assigning_a_variable_while_paused`（改完脚本读到新值 + 快照已刷新）、`assignment_coerces_to_the_declared_type`、`assigning_an_unknown_variable_reports_an_error` |
 | 大纲里边看边改变量 | 「设置变量值」原本只有菜单里那个输入框（要自己敲 `名字 = 值`）。现在**双击代码大纲里变量的「值：…」行**就能改：变量名与当前值都已知，弹窗只输新值（预填当前值），回车后走同一条 `request_assign` 通道；该行改成正文色 + 悬停高亮 + 手型光标，明确「可写」；没暂停时这一行不存在，变量保持只读。实现走 `outline::EditVariableAction`（`SectionContext` → `value_row` 的双击事件）→ `OutlinePanel` 转给 `CodeWindow::edit_variable_dialog` / `assign_variable_value`（与菜单入口共用一份赋值逻辑），快捷键一览的「鼠标操作」也补了这条 |
 | 调试：按调用栈切帧 | 原来调用栈只出现在状态栏那一行文字里，变量列表永远是最内层。现在 `DebugSnapshot` 多一个 `frame`（`call_stack` 下标，0 是模块），`DebugControl::select_frame` 让界面切层：解释器线程醒来后按这一层重取快照、`pause_epoch` 加一，变量列表 / 编辑器高亮 / 「运行到光标处」就都跟着走。求值与赋值也按层：`DebugQuery` 的 `Snapshot` / `Evaluate` / `Assign` 都带 `frame`，运行时用 `with_debug_frame`（临时 `split_off` 更深的帧、事后再接回去）让那一层成为栈顶，于是「看外层看到了什么、改外层改的是哪一份」都对得上，`Static` 与模块变量不受影响。界面：代码大纲新增「调用栈」一节（**只在暂停时出现**），从模块到最内层一行一层带行号，选中的那层用选中底色，点一下即切层；agent 状态文本里若看的是外层会注明「实际停住的是第 N 层」。3 条新测试（切层后的变量/行号/过程名、外层赋值不影响内层、没暂停或层号越界时拒绝） |
+| 真实 VB6 源码兼容批次（`Attribute` / `LSet`·`RSet` / `DefType` / `Static Sub` / `Debug.Assert` / `Reset`） | 盘点「粘贴真实 VB6 代码为什么跑不起来」时用 `qide-run` 逐条实测，补齐了语法层缺失的一批语句，语义一律以本机 VB6 为准：①`Attribute VB_Name = "..."`（每个 `.bas`/`.cls` 的第一行）原来被当成过程调用、第 1 行就报错误号 5，现在语句与类体两处都整行跳过；②`LSet` / `RSet` 语句原来不存在（错误号 5）：按 VB6 实测规则实现——结果长度取变量**当前**长度，不足补空格、超出截掉右侧，当前是空串就还是空串，`Variant` 里装着字符串也行、数字先转文本，非字符串目标给一条明确错误（VB6 里是编译错误）；③`DefInt A-Z` 等 `DefType` 原来不存在：解析成字母范围表存进 `Program::def_types`，隐式变量按它取类型并做声明式转换（本机实测 `A = 40000` 报 6、`VarType(B)` 是 2、`C = 1.5` 变 2、`D = "text"` 报 13），后写的范围覆盖先写的，`VarType`/`TypeName` 对隐式变量也按这个类型回答；④`Static Sub`/`Static Function` 原来解析报「需要变量名」：`Procedure::static_locals` 让过程里**所有**局部变量（含隐式变量）跨调用保留，`lookup_slot`/`find_slot` 也会查当前过程的 `Static` 表（否则隐式静态变量下一次调用读不到）；⑤`Debug.Assert` 只解析不求值（本机实测编译后的 exe 里它是空操作，`Assert 1 = 2` 之后照常执行）；⑥补上 `Reset`（关闭全部文件，与不带参数的 `Close` 同一路径）。另外两处配套：`Stmt::Nop`（被忽略的编译期指令占位）与 `test` 侧 6 条新用例；黄金清单新增 `lset_rset`（10 行输出逐条对 VB6）与 `debug_assert` 两段整脚本，`--scripts-only` 重生成后共 96 段 |
 | `Print #` 行尾改 CRLF + 文件语句进黄金 | 补文件类内置函数的 oracle 时发现 **`Print #` 写的是 `\n`，VB6 写 `\r\n`**（本机实测 `Print #1, "hello from script"` 之后 `FileLen` 是 19 而不是 18，`Width` 强制折行同理），会让读回去的字节数、`FileLen`、外部工具看到的换行全都不对——已改成 CRLF，4 条相关单测的期望值同步（`7`/`19`/`\r\n`）。同时新增整脚本黄金用例 `file_statements`（`Print #`/`FileLen`/`GetAttr`/`EOF`/`Line Input #`/`FileCopy`/`Name … As …`/`Dir`/`FileDateTime`/`Kill` 各走一遍，只说相对路径、只打印与目录无关的值），黄金脚本测试改用**临时目录**跑（`RunOptions::script_path`），不再有把测试文件写进仓库根目录的风险。覆盖率报告补 `COVERED_ALIASES`（`Name x As y` 语句即 `rename`），现在**真缺口为零**：剩下的都是单元测试覆盖或`ENVIRONMENT_DEPENDENT` 白名单里的 |
 | `FileAttr` / `Input(n, #f)` | 两个文件函数原来没有。现按本机 VB6 实测实现：`FileAttr(n, 1)` 返回打开模式码（Input 1 / Output 2 / Random 4 / Append 8 / Binary 32——`FileWriter` 因此多记一个 `mode`），**先查文件号**（没打开报 52，`returntype` 不是 1 才报 5）；`Input(n, #f)` 按 UTF-8 字符逐个读（`read_char` 按首字节定长度），剩下的字符不够 `n` 个报 **62**，`For Binary` 上不报错、返回空串，`For Output`/`Append` 报 **54**。解析器补了表达式位置的 `Input(...)`（含 `#文件号` 的写法），语句形式的 `Input #` / `Line Input #` 不变。新增黄金脚本 `file_attr_input`（13 行输出含 52/52/54 三个错误号），覆盖率报告再无真缺口 |
 | 搜索支持 GBK/UTF-16 源码 | 搜索与跨文件替换原来只认 UTF-8（`String::from_utf8` 失败就计入 skipped），中文 VB6 工程大量是 GBK，等于整片搜不到。`read_text` 改用与打开文件同一套探测（`encoding::decode`）：UTF-8 直接搜，GBK / 带 BOM 的 UTF-16 解码后照常搜；「二进制」判断改成「没有 BOM 且前 8 KiB 有 0 字节」，否则 UTF-16 正文里的 0 字节会被误判。**替换写回按每个文件原来的编码**（`read_text_with_encoding` 同时给回编码，`encoding::encode` 写回），不然把 GBK 源码写成 UTF-8 会直接毁文件。新增 4 条测试（GBK 可搜、UTF-16 可搜、GBK 文件替换后仍是 GBK、UTF-8 BOM 文件替换后 BOM 仍在） |
@@ -326,26 +327,22 @@ VB6 路径用环境变量 `QIDE_VB6` 覆盖（默认 `E:\vb\VB 6.0\Vb6.exe`）�
 12. **`AddressOf` 回调的数组/UDT 形参（暂不做）**：`callback_arg` 只把标量/`String` 形参还原成脚本值，
     数组与 UDT 直接报「暂不支持」。VB6 写回调的惯例也是用 `ByVal Long` 接指针再 `CopyMemory`，
     脚本里同样可以这么做（`VarPtr`/`CopyMemory` 与 `Declare` 的 UDT 支持都已有），因此不计划直接支持。
-13. **脚本源码兼容性缺口（本轮用 `qide-run` 逐条实测，按「会不会让真实 VB6 源码直接跑不起来」排序）**：
-   这些都是**语法层完全没有**的东西，不是语义偏差；所以粘贴真实 VB6 代码时最先撞上：
-   - `Attribute VB_Name = "..."` 一行（`.bas` / `.cls` / `.frm` 的第一行必有）现在被当成过程调用，
-     第 1 行就报**错误号 5**。建议把 `Attribute` 行当声明忽略（`VB_UserMemId` 另见下面「默认成员」）。
+13. **脚本源码兼容性缺口（`qide-run` 逐条实测，按「会不会让真实 VB6 源码直接跑不起来」排序）**：
+   第一批已做掉（`Attribute` / `LSet`·`RSet` / `DefType` / `Static Sub` / `Debug.Assert` / `Reset`，见上表）。
+   剩下的都是**语法层完全没有**的东西，不是语义偏差，粘贴真实 VB6 代码时仍会撞上：
    - `Event 名字(ByVal 参数 As 类型)` 声明语句**不存在**（`event` 不在关键字表）：`RaiseEvent` 只能发
-     类里 ad-hoc 的事件名，参数靠同类里 `<类名>_<事件名>` 处理过程的同名形参接收。
+     类里 ad-hoc 的事件名，参数靠同类里 `<类名>_<事件名>` 处理过程的同名形参接收。实现时要顺带决定
+     模块级订阅的处理过程命名（VB6 用 `<WithEvents 变量名>_<事件名>`，QIDE 类内用的是 `<类名>_<事件名>`）。
    - 模块级（脚本级）`Dim WithEvents x As 脚本类` **静默无效**：`connect_events_for_name` 只认
      `Value::ComObject`，脚本类对象走不到 `register_event_sink`，事件一条也不派发、也不报错；
-     而 VB6 里模块级 `WithEvents` 是最常见的订阅写法。
-   - `Static Sub` / `Static Function`（过程内全部局部变量变 Static）解析报「需要变量名」；
-     只有 `Sub` 内的 `Static n As Long` 支持。
-   - `DefInt A-Z` / `DefStr S` 等 `DefType` 声明不存在。
-   - `LSet` / `RSet` 语句不存在（错误号 5）。
+     而 VB6 里模块级 `WithEvents` 是最常见的订阅写法。这条是「无报错的错」，优先级最高。
    - 独立定长字符串 `Dim s As String * 8` 解析报错；UDT 成员里的 `String * 4` 是支持的（`Len`/补空格都对）。
    - 命名实参 `x.M y:=1` 解析报错（VBA 与 COM 调用里很常见）。
    - `#If ... Then` / `#End If` 条件编译不存在（`#` 直接语法错）。
-   - `Debug.Assert` 不存在（`Debug` 只认 `.Print`）。
-   - `Reset` 语句（关闭全部文件）不存在。
-   - 脚本类的**默认成员**（`Attribute Item.VB_UserMemId = 0` 之后的 `c(3)`）不支持，COM 对象支持。
-   - 小偏差：未初始化动态数组的 `LBound(a)` 报 5，VB6 报 9。
+   - 脚本类的**默认成员**（`Attribute Item.VB_UserMemId = 0` 之后的 `c(3)`）不支持，COM 对象支持；
+     属性行本身现在会被忽略，但不产生默认成员。
+   - 小偏差：未初始化动态数组的 `LBound(a)` 报 5，VB6 报 9；读取从未出现过的名字一律报「未定义的变量」
+     （VB6 会当场建一个空变量；QIDE 为能抓拼写错误保留报错，`DefInt` 只影响 `VarType` 与赋值转换）。
    - `CVErr` / `IsError` / `Erl` 见第 2 条；`Error$(n)` 正常（错误文案已对齐），`Err.Line` 本就不是 VB6 的东西。
 
 **已决定不做**：模块级 `Public` / `Private` 隔离。`#Include` 是文本展开，整个脚本就是一个模块，

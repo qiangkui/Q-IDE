@@ -1960,4 +1960,36 @@ Debug.Print Err.Number
 Close #h
 Kill \"ga.txt\"
 Kill \"ga.dat\"", " 8\n 1\n[abc]\n[d]\n 0\n 62\n 32\n 0\n 0\n 4\n 52\n 52\n 54"),
+    ("lset_rset", "", "Dim ss As String
+ss = \"abc\"
+LSet ss = \"x\"
+Debug.Print \"[\" & ss & \"]\" & Len(ss)
+ss = \"abc\"
+RSet ss = \"x\"
+Debug.Print \"[\" & ss & \"]\" & Len(ss)
+ss = \"abc\"
+LSet ss = \"wxyzuvw\"
+Debug.Print \"[\" & ss & \"]\"
+ss = \"abc\"
+RSet ss = \"wxyzuvw\"
+Debug.Print \"[\" & ss & \"]\"
+ss = \"\"
+LSet ss = \"ab\"
+Debug.Print \"[\" & ss & \"]\" & Len(ss)
+ss = \"abc\"
+RSet ss = Left$(\"abcdef\", 2)
+Debug.Print \"[\" & ss & \"]\"
+Dim vv As Variant
+vv = \"abcd\"
+LSet vv = \"x\"
+Debug.Print \"[\" & vv & \"]\"
+Dim tt As String
+tt = \"zz\"
+RSet tt = 5
+Debug.Print \"[\" & tt & \"]\"", "[x  ]3\n[  x]3\n[wxy]\n[wxy]\n[]0\n[ ab]\n[x   ]\n[ 5]"),
+    ("debug_assert", "", "Debug.Assert 1 = 2
+Debug.Print \"after assert\"
+Dim n4 As Long
+Debug.Assert n4 = 1
+Debug.Print n4", "after assert\n 0"),
 ];

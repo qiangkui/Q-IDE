@@ -583,6 +583,12 @@ impl Checker {
                     self.check_expr(arg, names, *line);
                 }
             }
+            Stmt::StringAlign { value, line, .. } => {
+                self.check_expr(value, names, *line);
+            }
+            // `Reset`（关闭全部文件）与解析阶段就跳过的编译期指令（`Attribute` / `Debug.Assert` /
+            // `DefInt`）没有子表达式要检查。
+            Stmt::ResetFiles { .. } | Stmt::Nop { .. } => {}
             Stmt::LockFile {
                 number,
                 start,

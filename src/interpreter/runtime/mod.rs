@@ -469,6 +469,8 @@ pub struct Runtime<'p, 'o> {
     option_explicit: bool,
     /// `Option Compare Text`：字符串比较忽略大小写。
     option_compare_text: bool,
+    /// `DefInt A-Z` 之类的隐式类型范围（字母已转小写）。
+    def_types: Vec<(char, char, VbType)>,
     /// 是否允许 `MsgBox` / `InputBox` 弹窗（headless 宿主为 `false`）。
     allow_ui: bool,
     /// `With` 嵌套栈。
@@ -664,6 +666,7 @@ pub fn run_program_with_stats(
         statics: FastMap::default(),
         option_explicit: program.option_explicit,
         option_compare_text: program.option_compare_text,
+        def_types: program.def_types.clone(),
         allow_ui: options.allow_ui,
         with_stack: Vec::new(),
         module_error: None,

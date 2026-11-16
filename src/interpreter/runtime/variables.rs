@@ -29,6 +29,9 @@ impl<'p, 'o> Runtime<'p, 'o> {
         {
             return Some(slot.clone());
         }
+        if let Some(slot) = self.static_of_current(name) {
+            return Some(slot.clone());
+        }
         self.globals.get(name).cloned()
     }
 
@@ -39,7 +42,21 @@ impl<'p, 'o> Runtime<'p, 'o> {
         {
             return Some(slot);
         }
+        if let Some(slot) = self.static_of_current(name) {
+            return Some(slot);
+        }
         self.globals.get(name)
+    }
+
+    /// 当前过程的 `Static` 局部（`Static n As Long` 与 `Static Sub` 里的隐式变量）。
+    ///
+    /// 过程体里没有对应的 `Dim` 时也要找得到——隐式变量只可能在上一次调用里建过。
+    fn static_of_current(&self, name: &str) -> Option<&Slot> {
+        if self.statics.is_empty() {
+            return None;
+        }
+        let procedure = self.frames.last().and_then(|frame| frame.procedure)?;
+        self.statics.get(procedure)?.get(name)
     }
 
     /// 当前作用域：模块级写全局表，过程内写栈顶帧。
@@ -122,6 +139,10 @@ impl<'p, 'o> Runtime<'p, 'o> {
         ty: VbType,
         line: usize,
     ) -> Result<bool, RuntimeError> {
+        // `Static Sub` 里的声明也全是静态的，和 VB6 实测一致。
+        if self.current_procedure_is_static() {
+            return self.bind_static_local(name, value, ty, line, None);
+        }
         let scope = self.scope_mut();
         if let Some(existing) = scope.get(name) {
             if existing.declared_at == line {
@@ -133,6 +154,36 @@ impl<'p, 'o> Runtime<'p, 'o> {
             std::borrow::Cow::Owned(name.to_string()),
             Slot::new(value, ty).at_line(line),
         );
+        Ok(true)
+    }
+
+    /// 把变量绑成当前过程的 `Static` 局部：首次进入时创建，之后复用同一份单元。
+    ///
+    /// 返回是否新建了绑定（同一条 `Dim` 在循环体里重复执行时不再算重复声明）。
+    pub(super) fn bind_static_local(
+        &mut self,
+        name: &str,
+        value: Value,
+        ty: VbType,
+        line: usize,
+        narrow: Option<VbType>,
+    ) -> Result<bool, RuntimeError> {
+        let slot = self.static_slot(name, value, ty, line)?;
+        if narrow.is_some() {
+            slot.set_narrow(narrow);
+        }
+        let frame = self.frames.last_mut().ok_or_else(|| {
+            RuntimeError::new(format!("`Static` 只能用在过程内部（`{name}`）"), line)
+        })?;
+        if let Some(existing) = frame.locals.get(name) {
+            if existing.declared_at == line {
+                return Ok(false);
+            }
+            return Err(RuntimeError::new(format!("变量 `{name}` 重复声明"), line));
+        }
+        frame
+            .locals
+            .insert(std::borrow::Cow::Owned(name.to_string()), slot);
         Ok(true)
     }
 
@@ -162,6 +213,33 @@ impl<'p, 'o> Runtime<'p, 'o> {
         Ok(slot)
     }
 
+    /// 隐式变量的声明类型：默认 `Variant`，被 `DefInt A-Z` 之类的范围覆盖时取那个类型。
+    pub(super) fn implicit_type(&self, name: &str) -> VbType {
+        if self.def_types.is_empty() {
+            return VbType::Variant;
+        }
+        let Some(first) = name.chars().next() else {
+            return VbType::Variant;
+        };
+        let first = first.to_ascii_lowercase();
+        // 后写的范围覆盖先写的（`DefInt A-Z` 之后再 `DefStr S`）。
+        self.def_types
+            .iter()
+            .rev()
+            .find(|(from, to, _)| first >= *from && first <= *to)
+            .map(|(_, _, ty)| *ty)
+            .unwrap_or(VbType::Variant)
+    }
+
+    /// 当前过程是不是 `Static Sub` / `Static Function`（局部变量跨调用保留）。
+    pub(super) fn current_procedure_is_static(&self) -> bool {
+        self.frames
+            .last()
+            .and_then(|frame| frame.procedure)
+            .and_then(|name| self.procedures.get(name))
+            .is_some_and(|procedure| procedure.static_locals)
+    }
+
     pub(super) fn set_var(
         &mut self,
         name: &str,
@@ -178,8 +256,23 @@ impl<'p, 'o> Runtime<'p, 'o> {
                         line,
                     ));
                 }
+                let ty = self.implicit_type(name);
                 let narrow = self.narrow_of(from);
-                let slot = Slot::new(value.copy_value(), VbType::Variant);
+                let value = if ty == VbType::Variant {
+                    value.copy_value()
+                } else {
+                    // `DefInt A-Z` 之后的隐式变量就是 Integer：赋值要按声明类型转换，
+                    // 与 VB6 实测一致（`A = 40000` 报 6、`D = "text"` 报 13）。
+                    value
+                        .coerce(ty)
+                        .map_err(|message| RuntimeError::from_coerce(message, line))?
+                };
+                let slot = if self.current_procedure_is_static() {
+                    self.bind_static_local(name, value, ty, line, narrow)?;
+                    return Ok(());
+                } else {
+                    Slot::new(value, ty)
+                };
                 slot.set_narrow(narrow);
                 self.scope_mut()
                     .insert(std::borrow::Cow::Owned(name.to_string()), slot);

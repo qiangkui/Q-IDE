@@ -37,6 +37,9 @@ pub(super) fn stmt_line(stmt: &Stmt) -> usize {
         | Stmt::MidAssign { line, .. }
         | Stmt::RaiseEvent { line, .. }
         | Stmt::LockFile { line, .. }
+        | Stmt::StringAlign { line, .. }
+        | Stmt::ResetFiles { line }
+        | Stmt::Nop { line }
         | Stmt::Set { line, .. }
         | Stmt::CallMethod { line, .. }
         | Stmt::Call { line, .. }

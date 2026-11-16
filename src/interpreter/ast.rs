@@ -18,6 +18,11 @@ pub struct Program {
     pub option_explicit: bool,
     /// `Option Compare Text`：字符串比较忽略大小写。
     pub option_compare_text: bool,
+    /// `DefInt A-Z` 之类的隐式类型声明：`(起始字母, 结束字母, 类型)`，字母已转小写。
+    ///
+    /// VB6 的 `DefType` 只影响**隐式**变量（`Option Explicit` 下不存在隐式变量），
+    /// 后写的范围覆盖先写的（`DefInt A-Z` 后再 `DefStr S`，字母 `s` 就是 String）。
+    pub def_types: Vec<(char, char, VbType)>,
 }
 
 /// `Class 名字 ... End Class`：实例变量 + 成员过程（`Property Get/Let` 也在 `methods` 里）。
@@ -114,6 +119,8 @@ pub struct Procedure {
     pub is_set: bool,
     /// 类成员显式声明为 `Private`。
     pub is_private: bool,
+    /// `Static Sub` / `Static Function`：过程内的局部变量（含隐式变量）跨调用保留。
+    pub static_locals: bool,
     pub ret: VbType,
     pub line: usize,
 }
@@ -648,6 +655,22 @@ pub enum Stmt {
     },
     /// `Stop`，中断执行。
     Halt {
+        line: usize,
+    },
+    /// `LSet 变量 = 值` / `RSet 变量 = 值`：按变量**当前长度**对齐（不足补空格、超出截掉右侧）。
+    StringAlign {
+        target: String,
+        value: Expr,
+        /// `true` 是 `LSet`（左对齐），`false` 是 `RSet`（右对齐）。
+        left: bool,
+        line: usize,
+    },
+    /// `Reset`：关闭所有已打开的文件。
+    ResetFiles {
+        line: usize,
+    },
+    /// 编译期指令被忽略后的占位（`Attribute ...`、`Debug.Assert ...`、`DefInt A-Z`）。
+    Nop {
         line: usize,
     },
 }

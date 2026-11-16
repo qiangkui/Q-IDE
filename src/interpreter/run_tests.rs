@@ -3155,3 +3155,181 @@ MessageBoxA 0, AddressOf Never, "t", 0
     .unwrap_err();
     assert!(error.message().contains("只能传给"), "{error}");
 }
+
+#[test]
+fn attribute_lines_are_ignored() {
+    // 真实 VB6 的 `.bas` / `.cls` 第一行就是 `Attribute VB_Name = "..."`。
+    let source = r#"
+Attribute VB_Name = "M"
+Option Explicit
+Dim g As Long
+g = 1
+Debug.Print g
+"#;
+    assert_eq!(output(source), ["1"]);
+
+    // 类体里的属性行（`VB_UserMemId` 等）同样跳过。
+    let source = r#"
+Class C
+Attribute VB_Exposed = False
+Attribute Item.VB_UserMemId = 0
+Public v As Long
+End Class
+Dim c As New C
+c.v = 3
+Debug.Print c.v
+"#;
+    assert_eq!(output(source), ["3"]);
+}
+
+#[test]
+fn debug_assert_is_skipped_like_a_compiled_exe() {
+    // VB6 编译成 exe 后 `Debug.Assert` 是空操作，条件本身不产生副作用。
+    let source = r#"
+Dim g As Long
+Debug.Assert g = 1
+Debug.Print g
+Debug.Assert 1 = 2
+Debug.Print "after"
+"#;
+    assert_eq!(output(source), ["0", "after"]);
+
+    // 条件写错了仍然是语法错误（不是静默跳过）。
+    let error = run_lines("Debug.Assert 1 +\n").unwrap_err();
+    assert!(error.message().contains("表达式"), "{error}");
+}
+
+#[test]
+fn lset_and_rset_align_to_the_current_width() {
+    // 期望值逐条来自本机 VB6 实测（见 `tools/vb6_probe.py --script`）。
+    let source = r#"
+Dim s As String
+s = "abc"
+LSet s = "x"
+Debug.Print "[" & s & "]" & Len(s)
+s = "abc"
+RSet s = "x"
+Debug.Print "[" & s & "]" & Len(s)
+s = "abc"
+LSet s = "wxyzuvw"
+Debug.Print "[" & s & "]"
+s = "abc"
+RSet s = "wxyzuvw"
+Debug.Print "[" & s & "]"
+s = ""
+LSet s = "ab"
+Debug.Print "[" & s & "]" & Len(s)
+"#;
+    assert_eq!(
+        output(source),
+        ["[x  ]3", "[  x]3", "[wxy]", "[wxy]", "[]0"]
+    );
+
+    // `Variant` 里装着字符串时同样按当前长度对齐；数字先转成文本。
+    let source = r#"
+Dim v As Variant
+v = "abcd"
+LSet v = "x"
+Debug.Print "[" & v & "]"
+Dim t As String
+t = "zz"
+LSet t = 5
+Debug.Print "[" & t & "]"
+"#;
+    assert_eq!(output(source), ["[x   ]", "[5 ]"]);
+
+    // 非字符串变量在 VB6 里是编译错误，这里退化成一条明确的运行时错误。
+    let error = run_lines("Dim n As Long\nLSet n = \"x\"\n").unwrap_err();
+    assert!(error.message().contains("只支持字符串变量"), "{error}");
+}
+
+#[test]
+fn reset_closes_every_open_file() {
+    let directory = std::env::temp_dir().join("qide-reset-test");
+    std::fs::create_dir_all(&directory).expect("建临时目录");
+    let path = directory.join("reset.txt");
+    let _ = std::fs::remove_file(&path);
+    let source = format!(
+        "Open \"{}\" For Output As #1\nPrint #1, \"x\"\nReset\nOn Error Resume Next\nDim n As Long\nn = FileAttr(1, 1)\nDebug.Print Err.Number\n",
+        path.display()
+    );
+    assert_eq!(output(&source), ["52"]);
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("文件应已写出"),
+        "x\r\n"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn static_procedures_keep_locals_between_calls() {
+    // 本机 VB6 实测：`Static Sub` 里的 `Dim` 与隐式变量都跨调用保留（1-1、2-2、F2 是 1 和 2）。
+    let source = r#"
+Static Sub Counter()
+Dim n2 As Long
+n2 = n2 + 1
+m2 = n2 * 10
+Debug.Print n2 & "-" & m2
+End Sub
+Counter
+Counter
+
+Static Function Next2() As Long
+Dim n3 As Long
+n3 = n3 + 1
+Next2 = n3
+End Function
+Debug.Print Next2() & "-" & Next2()
+
+Sub Plain()
+Dim n4 As Long
+n4 = n4 + 1
+Debug.Print "plain " & n4
+End Sub
+Plain
+Plain
+"#;
+    assert_eq!(
+        output(source),
+        ["1-10", "2-20", "1-2", "plain 1", "plain 1"]
+    );
+}
+
+#[test]
+fn def_type_declarations_set_implicit_variable_types() {
+    // 本机 VB6 实测（`DefInt A-Z` 之后）：`A = 40000` 报 6、`VarType(B)` 是 2、
+    // `C = 1.5` 变成 2、`D = "text"` 报 13。
+    let source = r#"
+DefInt A-Z
+On Error Resume Next
+A = 40000
+Debug.Print "A"; Err.Number
+Err.Clear
+B = 32767
+Debug.Print VarType(B); TypeName(B)
+C = 1.5
+Debug.Print VarType(C); C
+D = "text"
+Debug.Print "D"; Err.Number
+Debug.Print VarType(U)
+"#;
+    assert_eq!(output(source), ["A6", "2Integer", "22", "D13", "2"]);
+
+    // 后写的范围覆盖先写的；`Option Explicit` 下隐式变量仍然不允许。
+    let source = r#"
+DefInt A-Z
+DefStr S
+Sx = 12
+Debug.Print VarType(Sx); "["; Sx; "]"
+Yq = 1
+Debug.Print VarType(Yq)
+"#;
+    assert_eq!(output(source), ["8[12]", "2"]);
+
+    let error = run_lines("Option Explicit\nDefInt A-Z\nA = 1\n").unwrap_err();
+    assert!(error.message().contains("Option Explicit"), "{error}");
+
+    // VB6 实测：`Deftype` 只允许写在模块级、过程声明之前。
+    let error = run_lines("Sub S()\nDefInt A-Z\nEnd Sub\n").unwrap_err();
+    assert!(error.message().contains("模块级"), "{error}");
+}

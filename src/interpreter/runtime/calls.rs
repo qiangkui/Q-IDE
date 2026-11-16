@@ -566,6 +566,21 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     Value::Str(ty.name().to_string())
                 });
             }
+            // 隐式变量（`DefInt A-Z` 之后）没有声明语句，静态推断看不到它，改看槽上的声明类型；
+            // 槽还没建出来时（第一次读取就在这里）按 `DefType` 推。
+            if let Expr::Var(variable) = expr {
+                let ty = self
+                    .find_slot(variable)
+                    .map(|slot| slot.ty())
+                    .unwrap_or_else(|| self.implicit_type(variable));
+                if !matches!(ty, VbType::Variant | VbType::Any | VbType::Object) {
+                    return Ok(if name == "vartype" {
+                        Value::Int(builtins::vartype_of(ty))
+                    } else {
+                        Value::Str(ty.name().to_string())
+                    });
+                }
+            }
             // 调用/成员表达式的内容类型只有求值后才知道（返回 `Variant` 的函数、`IIf`/`Choose`/`Switch`、
             // `Collection.Item`），求值时会把类型记进 `result_narrow`
             // （本机 VB6 实测：`IIf(True, i, s)` 是 2、`IIf(False, i, s)` 是 4、`VarType(c.Item(1))` 是 2）。

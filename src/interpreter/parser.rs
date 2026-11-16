@@ -23,6 +23,8 @@ pub fn parse_mapped(source: &str, lines: &[usize]) -> Result<Program, ParseError
         option_explicit: false,
         option_base: 0,
         option_compare_text: false,
+        def_types: Vec::new(),
+        in_procedure: false,
         declared_types,
         enum_values: HashMap::new(),
     }
@@ -141,6 +143,8 @@ pub fn parse_expression(source: &str) -> Result<Expr, ParseError> {
         option_explicit: false,
         option_base: 0,
         option_compare_text: false,
+        def_types: Vec::new(),
+        in_procedure: false,
         declared_types: DeclaredTypes::default(),
         enum_values: HashMap::new(),
     };
@@ -241,6 +245,10 @@ struct Parser {
     option_base: i64,
     /// `Option Compare Text`：字符串比较忽略大小写。
     option_compare_text: bool,
+    /// `DefInt A-Z` 之类的隐式类型范围（字母已转小写）。
+    def_types: Vec<(char, char, VbType)>,
+    /// 是否正在解析过程体（`DefType` 只允许写在模块级）。
+    in_procedure: bool,
     /// 全文的 `Type` / `Enum` / `Class` 声明名，供 `As 类型名` 与 `Implements` 查表。
     declared_types: DeclaredTypes,
     /// 已解析枚举成员，供后续枚举常量表达式引用。
@@ -323,6 +331,85 @@ impl Parser {
 
     fn at_ident_pair(&self, first: &str, second: Kw) -> bool {
         self.at_ident(first) && matches!(self.peek_at(1), TokenKind::Kw(k) if *k == second)
+    }
+
+    /// 跳过整个语句（止于换行、语句分隔冒号或文件末尾）。
+    fn skip_to_line_end(&mut self) {
+        while !self.at_statement_end() && !self.at_eof() {
+            self.advance();
+        }
+    }
+
+    /// 当前 token 是不是 `DefInt` / `DefStr` 这类隐式类型声明。
+    fn at_def_type(&self) -> bool {
+        matches!(self.peek(), TokenKind::Ident(name) if Self::def_type_of(name).is_some())
+    }
+
+    fn def_type_of(name: &str) -> Option<VbType> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "defbool" => VbType::Boolean,
+            "defbyte" => VbType::Byte,
+            "defcur" => VbType::Currency,
+            "defdate" => VbType::Date,
+            "defdbl" => VbType::Double,
+            "defint" => VbType::Integer,
+            "deflng" | "deflnglng" | "deflngptr" => VbType::Long,
+            "defobj" => VbType::Object,
+            "defsng" => VbType::Single,
+            "defstr" => VbType::Str,
+            // `DefDec` 在 VB6 里对应 `Decimal`，QIDE 没有这个变体，按 Variant 处理。
+            "defdec" | "defvar" => VbType::Variant,
+            _ => return None,
+        })
+    }
+
+    /// `DefInt A-Z` / `DefStr S, T-U`：返回若干段字母范围。
+    fn parse_def_type(&mut self) -> Result<Vec<(char, char, VbType)>, ParseError> {
+        let line = self.line();
+        let TokenKind::Ident(name) = self.peek().clone() else {
+            return Err(ParseError::new("需要 `DefInt` 之类的声明", line));
+        };
+        let ty = Self::def_type_of(&name)
+            .ok_or_else(|| ParseError::new(format!("未知的类型声明 `{name}`"), line))?;
+        self.advance();
+        let mut ranges = Vec::new();
+        loop {
+            let from = self.expect_letter(&name)?;
+            let to = if self.eat_op(Op::Minus) {
+                self.expect_letter(&name)?
+            } else {
+                from
+            };
+            if from > to {
+                return Err(ParseError::new(
+                    format!("`{name}` 的字母范围写反了：`{from}-{to}`"),
+                    line,
+                ));
+            }
+            ranges.push((from, to, ty));
+            if !self.eat_op(Op::Comma) {
+                break;
+            }
+        }
+        self.eat_line_end();
+        Ok(ranges)
+    }
+
+    /// `DefInt` 后面那一串字母里的一个（大小写都接受，转成小写）。
+    fn expect_letter(&mut self, context: &str) -> Result<char, ParseError> {
+        let line = self.line();
+        if let TokenKind::Ident(text) = self.peek().clone()
+            && text.chars().count() == 1
+            && let Some(ch) = text.chars().next()
+            && ch.is_ascii_alphabetic()
+        {
+            self.advance();
+            return Ok(ch.to_ascii_lowercase());
+        }
+        Err(ParseError::new(
+            format!("`{context}` 后面需要字母或字母范围（如 `A-Z`）"),
+            line,
+        ))
     }
 
     fn eat_kw(&mut self, kw: Kw) -> bool {
@@ -440,12 +527,14 @@ impl Parser {
                 continue;
             }
 
-            // 允许 `Public` / `Private` / `Global` 修饰。
+            // 允许 `Public` / `Private` / `Global` / `Static` 修饰（`Static` 只对过程有效）。
             let mut has_modifier = false;
+            let mut static_proc = false;
             while matches!(
                 self.peek(),
-                TokenKind::Kw(Kw::Public | Kw::Private | Kw::Global)
+                TokenKind::Kw(Kw::Public | Kw::Private | Kw::Global | Kw::Static)
             ) {
+                static_proc |= matches!(self.peek(), TokenKind::Kw(Kw::Static));
                 self.advance();
                 has_modifier = true;
             }
@@ -461,13 +550,19 @@ impl Parser {
                     program.declares.push(self.parse_declare()?);
                 }
                 TokenKind::Kw(Kw::Sub) => {
-                    program.procedures.push(self.parse_procedure(false)?);
+                    let mut procedure = self.parse_procedure(false)?;
+                    procedure.static_locals = static_proc;
+                    program.procedures.push(procedure);
                 }
                 TokenKind::Kw(Kw::Function) => {
-                    program.procedures.push(self.parse_procedure(true)?);
+                    let mut procedure = self.parse_procedure(true)?;
+                    procedure.static_locals = static_proc;
+                    program.procedures.push(procedure);
                 }
                 TokenKind::Kw(Kw::Property) => {
-                    program.procedures.push(self.parse_property()?);
+                    let mut procedure = self.parse_property()?;
+                    procedure.static_locals = static_proc;
+                    program.procedures.push(procedure);
                 }
                 TokenKind::Kw(Kw::Enum) => {
                     program.enums.push(self.parse_enum()?);
@@ -489,6 +584,7 @@ impl Parser {
         }
         program.option_explicit = self.option_explicit;
         program.option_compare_text = self.option_compare_text;
+        program.def_types = self.def_types.clone();
         check_type_cycles(&program.types)?;
         Ok(program)
     }
@@ -578,6 +674,11 @@ impl Parser {
                 self.advance();
                 self.advance();
                 break;
+            }
+            // 类体里的 `Attribute 成员.VB_UserMemId = 0` 之类同样跳过。
+            if self.at_ident("attribute") {
+                self.skip_to_line_end();
+                continue;
             }
             if self.eat_kw(Kw::Implements) {
                 let interface_display = self.token().spelling().to_string();
@@ -843,7 +944,10 @@ impl Parser {
             VbType::Variant
         };
         self.eat_line_end();
-        let body = self.parse_block(&[Stop::EndSub, Stop::EndFunction])?;
+        self.in_procedure = true;
+        let body = self.parse_block(&[Stop::EndSub, Stop::EndFunction]);
+        self.in_procedure = false;
+        let body = body?;
         self.expect_kw(Kw::End, "过程缺少 `End Sub` / `End Function`")?;
         match self.peek() {
             TokenKind::Kw(Kw::Sub | Kw::Function) => {
@@ -865,6 +969,7 @@ impl Parser {
             is_let: false,
             is_set: false,
             is_private: false,
+            static_locals: false,
             ret,
             line,
         })
@@ -905,7 +1010,10 @@ impl Parser {
                     .unwrap_or(VbType::Variant)
             };
             self.eat_line_end();
-            let body = self.parse_block(&[Stop::EndProperty])?;
+            self.in_procedure = true;
+            let body = self.parse_block(&[Stop::EndProperty]);
+            self.in_procedure = false;
+            let body = body?;
             self.expect_property_end("`Property Get` 缺少 `End Property`")?;
             return Ok(Procedure {
                 name,
@@ -916,6 +1024,7 @@ impl Parser {
                 is_let: false,
                 is_set: false,
                 is_private: false,
+                static_locals: false,
                 ret,
                 line,
             });
@@ -931,7 +1040,10 @@ impl Parser {
             ));
         }
         self.eat_line_end();
-        let body = self.parse_block(&[Stop::EndProperty])?;
+        self.in_procedure = true;
+        let body = self.parse_block(&[Stop::EndProperty]);
+        self.in_procedure = false;
+        let body = body?;
         self.expect_property_end(if is_set {
             "`Property Set` 缺少 `End Property`"
         } else {
@@ -946,6 +1058,7 @@ impl Parser {
             is_let: true,
             is_set,
             is_private: false,
+            static_locals: false,
             ret: VbType::Variant,
             line,
         })
@@ -1196,6 +1309,48 @@ impl Parser {
             self.advance();
             return Ok(Stmt::Label(name, line));
         }
+        // 源码文件头部的属性行（`Attribute VB_Name = "模块1"`）：VB6 的 `.bas` / `.cls` 第一行就是它，
+        // 对脚本执行没有意义，直接跳过整行，别让它把真实工程代码卡在第一步。
+        if self.at_ident("attribute") {
+            self.skip_to_line_end();
+            return Ok(Stmt::Nop { line });
+        }
+        // `DefInt A-Z` / `DefStr S` 等：只影响隐式变量的类型。
+        if self.at_def_type() {
+            if self.in_procedure {
+                // VB6 实测：「Deftype 语句必须预先声明」，只允许写在模块级、过程声明之前。
+                return Err(ParseError::new(
+                    "`DefInt` 等声明必须写在模块级、过程声明之前",
+                    line,
+                ));
+            }
+            let ranges = self.parse_def_type()?;
+            self.def_types.extend(ranges);
+            return Ok(Stmt::Nop { line });
+        }
+        // `LSet 变量 = 值` / `RSet 变量 = 值`（`LSet` / `RSet` 是 VB6 关键字，不会和变量重名）。
+        if (self.at_ident("lset") || self.at_ident("rset"))
+            && matches!(self.peek_at(1), TokenKind::Ident(_))
+        {
+            let left = self.at_ident("lset");
+            self.advance();
+            let target = self.expect_ident("变量名")?;
+            self.expect_op(Op::Eq, "`LSet` / `RSet` 需要 `=`")?;
+            let value = self.parse_expr()?;
+            return Ok(Stmt::StringAlign {
+                target,
+                value,
+                left,
+                line,
+            });
+        }
+        // `Reset`：关闭全部已打开的文件（后面不带参数；`Reset = 1` 之类照旧按变量赋值处理）。
+        if self.at_ident("reset")
+            && matches!(self.peek_at(1), TokenKind::Newline | TokenKind::Colon)
+        {
+            self.advance();
+            return Ok(Stmt::ResetFiles { line });
+        }
         if self.eat_kw(Kw::On) {
             return self.parse_on_error(line);
         }
@@ -1385,7 +1540,15 @@ impl Parser {
         }
         if self.eat_kw(Kw::Debug) {
             self.expect_op(Op::Dot, "`Debug` 后需要 `.`")?;
-            self.expect_kw(Kw::Print, "只支持 `Debug.Print`")?;
+            // `Debug.Assert 条件`：编译成 exe 后是空操作（只在 VB6 IDE 里会停下来），
+            // 这里同样跳过——但条件表达式本身仍要能解析，写错了照样报语法错误。
+            if self.at_ident("assert") {
+                self.advance();
+                self.parse_expr()?;
+                self.eat_line_end();
+                return Ok(Stmt::Nop { line });
+            }
+            self.expect_kw(Kw::Print, "只支持 `Debug.Print` 与 `Debug.Assert`")?;
             return self.parse_print(line);
         }
         if self.eat_kw(Kw::If) {
