@@ -25,5 +25,14 @@ regex = "1"
 # 上游补全菜单将类型标签样式写死；本地补丁用于缩小字号并取消斜体。
 gpui-component = { path = "vendor/gpui-component" }
 
+# 调试构建也要能跑得动界面：gpui 的排版/绘制依赖全是未优化的 Rust 时，
+# 一帧要 30ms 以上（拖分割条会明显跟不上手）。这里只把依赖全开优化，
+# 本仓库自己的代码留 opt-level = 1，仍然保留完整调试信息与断点。
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
 [build-dependencies]
 embed-resource = "3.0.12"

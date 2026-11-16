@@ -309,11 +309,10 @@ impl Render for CodeWindow {
                 editor.update(cx, |editor, cx| editor.focus(window, cx));
                 this.toggle_breakpoint(cx);
             }))
-            .child(title_bar::render(
-                palette,
-                window.is_maximized(),
-                self.menu_bar(cx, palette),
-            ))
+            .child(title_bar::render(palette, window.is_maximized(), {
+                let _span = crate::ui_profile::span("menu-bar");
+                self.menu_bar(cx, palette)
+            }))
             .child(
                 h_flex()
                     .items_stretch()
@@ -322,7 +321,10 @@ impl Render for CodeWindow {
                     .px(px(ui_theme::PANE_GAP))
                     .pt(px(ui_theme::CONTENT_TOP_GAP))
                     .pb(px(ui_theme::STATUS_BAR_GAP))
-                    .child(self.activity_bar(cx, &appearance))
+                    .child({
+                        let _span = crate::ui_profile::span("activity-bar");
+                        self.activity_bar(cx, &appearance)
+                    })
                     // 左面板自身还会向内缩 PANEL_GAP/2，这里的间隔只补一半，
                     // 活动栏与面板之间的可见间距才和其他面板之间一致。
                     .child(div().w(px(ui_theme::PANEL_GAP / 2.0)).flex_shrink_0())

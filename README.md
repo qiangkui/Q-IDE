@@ -149,6 +149,16 @@ qide-run check demo.vb --json      # 只做语法与语义检查，不执行
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+## 构建与运行
+
+```powershell
+cargo run --release          # 平时使用、判断界面性能，都跑这个
+cargo run                    # 开发调试：依赖已全优化、本仓库代码 opt-level = 1
+```
+
+`Cargo.toml` 里给 dev profile 配了 `opt-level = 1`（本仓库）+ `[profile.dev.package."*"] opt-level = 3`（依赖）：
+gpui 的排版与绘制如果不优化，一帧要 30ms 以上，拖动分割条会明显跟不上手（release 构建没有这个问题）。
+
 ## 环境要求
 
 | 项目 | 要求 |

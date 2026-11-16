@@ -599,6 +599,7 @@ impl CodeWindow {
 
         this.sync_settings(window, cx);
         this.spawn_auto_save_timer(window, cx);
+        this.spawn_resize_probe(window, cx);
         this.start_agent_server(window, cx);
         // 窗口关闭前检查未保存修改。
         let close_handle = cx.weak_entity();

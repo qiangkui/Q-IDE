@@ -564,6 +564,42 @@ impl CodeWindow {
         self.apply_dock_visibility(window, cx);
     }
 
+    /// 拖分割条卡顿的**复现探针**：`QIDE_RESIZE_PROBE=1` 启动时自动连续改左栏宽度，
+    /// 每帧一次（和拖动分割条走同一条 `set_dock_size` + 重绘路径），配合
+    /// `QIDE_UI_PROFILE=1` 就能把每一帧的真实耗时写进 `ui-profile.log`。
+    ///
+    /// 设成 `notify` 时只重绘、不改尺寸：用来区分「重排很贵」还是「每次重绘都贵」。
+    pub(super) fn spawn_resize_probe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mode) = crate::ui_profile::probe_mode() else {
+            return;
+        };
+        let resize = mode != "notify";
+        cx.spawn_in(window, async move |this, cx| {
+            for step in 0..180u32 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(8))
+                    .await;
+                if this
+                    .update_in(cx, |this, window, cx| {
+                        if resize {
+                            // 240→400 来回摆，幅度和真实拖动接近。
+                            let phase = (step % 40) as f32 / 39.0;
+                            let width = px(240.0 + phase * 160.0);
+                            this.dock_area.update(cx, |area, cx| {
+                                area.set_dock_size(DockPlacement::Left, width, window, cx)
+                            });
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     /// 拖动结束后关闭自定义指示层；Dock 没有公开“拖动取消”事件，用轻量轮询收尾。
     pub(super) fn watch_panel_drag(&mut self, cx: &mut Context<Self>) {
         if self.panel_drag_watch {

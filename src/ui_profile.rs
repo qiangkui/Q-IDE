@@ -12,8 +12,13 @@ use std::io::Write as _;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-/// 超过这个耗时的帧才记一笔（16 ms 是一帧的预算，留一半余量给系统）。
-const SLOW_FRAME: f64 = 8.0;
+/// 单段 `render` 超过这个耗时就记一笔。
+const SLOW_SPAN: f64 = 8.0;
+/// 帧间隔（两次重绘之间）超过这个值就算「这一帧画得太慢」：60 Hz 是 16.7 ms，
+/// 20 ms 相当于掉到 50 fps 以下，拖动时能明显感到跟手性变差。
+const SLOW_PERIOD: f64 = 20.0;
+/// 间隔超过这个值基本是空闲（没在连续重绘），不用记。
+const IDLE_PERIOD: f64 = 200.0;
 /// 日志文件的上限，超过就清空重写。
 const MAX_LOG_BYTES: u64 = 512 * 1024;
 
@@ -44,14 +49,15 @@ thread_local! {
     static FRAME: RefCell<Frame> = RefCell::new(Frame::default());
 }
 
-/// 是否开着采样（`QIDE_UI_PROFILE=1`）。
+/// 是否开着采样（`QIDE_UI_PROFILE=1`，或者开了拖动复现探针）。
 pub fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("QIDE_UI_PROFILE").is_some_and(|value| {
-            let text = value.to_string_lossy();
-            text == "1" || text.eq_ignore_ascii_case("true")
-        })
+        probe_enabled()
+            || std::env::var_os("QIDE_UI_PROFILE").is_some_and(|value| {
+                let text = value.to_string_lossy();
+                text == "1" || text.eq_ignore_ascii_case("true")
+            })
     })
 }
 
@@ -73,6 +79,20 @@ impl Drop for Span {
     }
 }
 
+/// 复现探针的模式（`QIDE_RESIZE_PROBE`）：`1` 改尺寸、`notify` 只重绘、其它值不开。
+pub fn probe_mode() -> Option<&'static str> {
+    match std::env::var("QIDE_RESIZE_PROBE") {
+        Ok(value) if value == "1" || value.eq_ignore_ascii_case("true") => Some("resize"),
+        Ok(value) if value.eq_ignore_ascii_case("notify") => Some("notify"),
+        _ => None,
+    }
+}
+
+/// 是否开着「拖动分割条」的复现探针。
+pub fn probe_enabled() -> bool {
+    probe_mode().is_some()
+}
+
 /// 一帧的统计结果（纯数据，方便单测）。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FrameReport {
@@ -83,10 +103,11 @@ pub struct FrameReport {
 }
 
 impl FrameReport {
-    /// 是否值得写进日志：只要有一段自己就超阈值。整帧间隔不算数——
-    /// 空闲时两次重绘之间本来就可能隔很久。
+    /// 是否值得写进日志：有单段 `render` 超阈值，或者这一帧本身画得慢
+    /// （连续重绘时间隔超过 `SLOW_PERIOD`；空闲间隔不算）。
     pub fn is_slow(&self) -> bool {
-        self.spans.iter().any(|(_, ms)| *ms >= SLOW_FRAME)
+        let busy = self.gap_ms >= SLOW_PERIOD && self.gap_ms <= IDLE_PERIOD;
+        busy || self.spans.iter().any(|(_, ms)| *ms >= SLOW_SPAN)
     }
 
     /// 写进日志的一行：帧间隔 + 各段耗时（从大到小）。
@@ -176,13 +197,22 @@ mod tests {
             gap_ms: 16.0,
             spans: vec![("output", 1.2)],
         };
-        assert!(!quick.is_slow(), "各段都很快时不该记录");
+        assert!(!quick.is_slow(), "各段都很快、间隔也正常时不该记录");
 
         let heavy_span = FrameReport {
             gap_ms: 16.0,
             spans: vec![("search", 9.0)],
         };
         assert!(heavy_span.is_slow(), "单段超阈值就要记录");
+
+        let slow_period = FrameReport {
+            gap_ms: 33.0,
+            spans: vec![("frame", 4.0)],
+        };
+        assert!(
+            slow_period.is_slow(),
+            "各段都小但整帧 33ms（掉到 30fps）也要记录：开销在排版/绘制里"
+        );
 
         let idle_gap = FrameReport {
             gap_ms: 800.0,
