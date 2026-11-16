@@ -27,6 +27,9 @@ pub fn render(
     info: StatusInfo<'_>,
     on_toggle_output: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     encoding_menu: Option<AnyElement>,
+    output_open: bool,
+    ai_open: bool,
+    on_toggle_ai: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     let file_name = info.file_name.unwrap_or("未打开文件").to_string();
 
@@ -103,14 +106,40 @@ pub fn render(
             h_flex()
                 .items_center()
                 .gap_1()
-                .child(
-                    Button::new("status-output")
+                // 输出面板（含终端页）的显示/隐藏开关：只画图标，打开时用选中底色标出来。
+                .child({
+                    let output_button = Button::new("status-output")
                         .ghost()
                         .xsmall()
                         .icon(IconName::SquareTerminal)
-                        .label(format!("输出 {}", info.output_lines))
-                        .on_click(on_toggle_output),
-                ),
+                        .tooltip(format!(
+                            "输出 / 终端面板（{} 行，点击显示或隐藏）",
+                            info.output_lines
+                        ))
+                        .selected(output_open)
+                        .on_click(on_toggle_output);
+                    highlight_if_open(output_button, output_open, palette)
+                })
+                // AI 面板开关放在最右边（贴着右边界），同样只画图标。
+                .child({
+                    let ai_button = Button::new("status-ai")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Bot)
+                        .tooltip("AI 编程面板（打开 / 收起）")
+                        .selected(ai_open)
+                        .on_click(on_toggle_ai);
+                    highlight_if_open(ai_button, ai_open, palette)
+                }),
         )
         .into_any_element()
+}
+
+/// 面板开着时给状态栏上的开关加一层选中底色（关掉后恢复透明）。
+fn highlight_if_open(button: Button, open: bool, palette: Palette) -> Button {
+    if open {
+        button.bg(rgba(palette.activity_bar_selected))
+    } else {
+        button
+    }
 }

@@ -135,7 +135,8 @@ fn scan(source: &str) -> Vec<(Range<usize>, &'static str)> {
                 at_line_start = false;
             }
             c if c.is_ascii_digit()
-                || (c == '&' && matches!(bytes.get(index + 1), Some(b'h' | b'H' | b'o' | b'O'))) =>
+                || (c == '&'
+                    && matches!(bytes.get(index + 1), Some(b'h' | b'H' | b'o' | b'O'))) =>
             {
                 let start = index;
                 if c == '&' {
@@ -289,7 +290,8 @@ mod tests {
 
     #[test]
     fn scans_vb_script_tokens() {
-        let source = "' 注释\nDim total As Long\ntotal = Mid(\"abc\", 1, 2) & 0\nDebug.Print total\n";
+        let source =
+            "' 注释\nDim total As Long\ntotal = Mid(\"abc\", 1, 2) & 0\nDebug.Print total\n";
         let kinds = names(source);
         assert!(kinds.contains(&"comment"));
         assert!(kinds.contains(&"string"));

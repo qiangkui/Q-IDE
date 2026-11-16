@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    # 解释器依赖 Win32 / COM，界面依赖 gpui 的 Windows 后端，因此只在 Windows 上跑。
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # 黄金数据是**生成物**：清单（tools/vb6_golden_*.txt）改了却忘记重跑
+      # `python tools/vb6_golden.py` 时，测试仍会用旧数据通过。这一步只比对文件、不启动 VB6。
+      - name: Golden data in sync
+        run: |
+          python -X utf8 tools/vb6_golden.py --check
+          python -X utf8 tools/bench.py --help > $null
+
+      - name: Build
+        run: cargo build --all-targets
+
+      # 黄金数据（814 条表达式 + 76 条错误号 + 7 条近似 + 94 段脚本）已经提交，
+      # 不需要装 VB6；需要 COM 服务器的 16 条测试默认 #[ignore]。
+      - name: Test
+        run: cargo test
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # 代码风格：`cargo fmt --check` 已全绿，`src/vb6_golden_data.rs` 是生成文件、
+      # 带 `#[rustfmt::skip]`，重新生成后不会被格式化工具改动。
+      - name: Format
+        run: cargo fmt --all -- --check

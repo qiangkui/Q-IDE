@@ -1,6 +1,6 @@
 //! 编辑器文本命令（移动行、切换注释）的纯逻辑测试。
 
-use crate::editing::{comment_token, move_lines, toggle_comment, TextEdit};
+use crate::editing::{TextEdit, comment_token, move_lines, toggle_comment};
 
 fn moved(text: &str, selection: std::ops::Range<usize>, up: bool) -> TextEdit {
     move_lines(text, selection, up).expect("应当可以移动")
@@ -65,7 +65,10 @@ fn selection_ending_at_a_line_start_does_not_include_that_line() {
 fn adding_comments_uses_indent_and_skips_empty_lines() {
     let text = "Sub Main()\n    MsgBox \"hi\"\n\nEnd Sub\n";
     let edit = toggle_comment(text, 0..text.len(), "'").expect("应当加注释");
-    assert_eq!(edit.text, "' Sub Main()\n    ' MsgBox \"hi\"\n\n' End Sub\n");
+    assert_eq!(
+        edit.text,
+        "' Sub Main()\n    ' MsgBox \"hi\"\n\n' End Sub\n"
+    );
     // 空行不变，选区仍然覆盖同样的范围。
     assert_eq!(&edit.text[edit.selection.clone()], edit.text.as_str());
 }

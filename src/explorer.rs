@@ -5,6 +5,7 @@
 //! 标题栏最右侧的关闭按钮收起整个面板（等同取消勾选「视图 → 资源管理器」）。
 //! 展开状态与根项列表都由 [`ExplorerModel`] 保存，并随布局写盘，下次启动时恢复。
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,8 +37,8 @@ pub type ClosePanelAction = Rc<dyn Fn(&mut Window, &mut App)>;
 pub type PanelCommand = Rc<dyn Fn(&mut Window, &mut App)>;
 /// 树条目右键回调：条目 id、是否文件夹、是否根项、鼠标位置。
 pub type ExplorerMenuAction = Rc<dyn Fn(String, bool, bool, Point<Pixels>, &mut Window, &mut App)>;
-/// 把条目拖到某个目录上：源路径、目标目录。
-pub type ExplorerMoveAction = Rc<dyn Fn(&str, &str, &mut Window, &mut App)>;
+/// 把条目拖到某个目录上：源路径（多选时是整批）、目标目录。
+pub type ExplorerMoveAction = Rc<dyn Fn(&[String], &str, &mut Window, &mut App)>;
 /// 点击条目左侧圆点，或选择模式下点击条目：进入选择模式并选中，或切换选中状态。
 pub type ExplorerSelectAction = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 /// `Ctrl+点击` / `Shift+点击` 条目：切换选中，或把上一次点击到这一行的范围一起选中。
@@ -46,12 +47,23 @@ pub type ExplorerModifierSelectAction = Rc<dyn Fn(&str, bool, &mut Window, &mut 
 pub type ExplorerRowClickAction = Rc<dyn Fn(&str, &mut App)>;
 /// 开始拖动条目：把正在拖的路径告诉主窗口（用于「拖出窗口复制路径」）。
 pub type ExplorerDragBeginAction = Rc<dyn Fn(&str, &mut App)>;
+/// 框选开始：参数是按下位置（窗口坐标）。
+pub type BandBeginAction = Rc<dyn Fn(Point<Pixels>, &mut Window, &mut App)>;
+/// 框选移动：参数是当前位置与左键是否仍按下。
+pub type BandMoveAction = Rc<dyn Fn(Point<Pixels>, bool, &mut App)>;
+/// 框选扫过某一行：参数是树的可见下标与当前位置。
+pub type BandHoverAction = Rc<dyn Fn(usize, Point<Pixels>, &mut App)>;
+/// 框选结束（左键松开）。
+pub type BandEndAction = Rc<dyn Fn(&mut App)>;
 
 /// 拖动资源管理器条目时携带的数据。
 #[derive(Clone)]
 pub struct ExplorerDrag {
+    /// 正在被拖的那一行（预览、拖到标签栏打开、拖出窗口复制路径都用它）。
     pub path: String,
     pub is_dir: bool,
+    /// 随行拖动的条目（选择模式下是整批选中项，单选时只有主条目）。
+    pub items: Vec<(String, bool)>,
 }
 
 /// 「把条目拖出窗口 = 复制路径」的状态。
@@ -186,6 +198,35 @@ pub fn can_move_into(source: &str, target_dir: &str, source_is_dir: bool) -> boo
     Path::new(source).parent() != Some(target)
 }
 
+/// 一次拖动落到 `target_dir` 上时真正要搬的条目。
+///
+/// 起点是 [`can_move_into`] 的规则（不能拖进自己、不能把文件夹拖进自己的子目录、不能原地不动），
+/// 再多一条：**父目录也在这一批里时跳过子项**——搬父目录时子项已经跟着走了，
+/// 再搬一次会报「找不到文件」。
+pub fn move_targets(items: &[(String, bool)], target_dir: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    for (index, (path, is_dir)) in items.iter().enumerate() {
+        if !can_move_into(path, target_dir, *is_dir) {
+            continue;
+        }
+        let covered = items
+            .iter()
+            .enumerate()
+            .any(|(other, (parent, parent_is_dir))| {
+                other != index && *parent_is_dir && is_within(path, parent)
+            });
+        if !covered {
+            targets.push(path.clone());
+        }
+    }
+    targets
+}
+
+/// `path` 是否就是 `dir` 或在它下面（`C:\a` 不算 `C:\ab` 的子项）。
+fn is_within(path: &str, dir: &str) -> bool {
+    crate::workspace::reprefix_path(path, dir, "").is_some()
+}
+
 /// 资源管理器的一个根项：用户添加的磁盘文件夹。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Root(PathBuf);
@@ -305,6 +346,83 @@ impl ExplorerSelection {
             self.active = false;
         }
     }
+}
+
+/// 框选（rubber band）状态：在树的空白处按住左键拖动时记录起点与扫过的行。
+///
+/// 行的命中由每一行的 `on_mouse_move` 报告——树是虚拟列表，行高与滚动偏移都交给组件，
+/// 自己算坐标容易和实际布局错位。最终选中范围取扫过下标的最小值与最大值之间的可见行。
+#[derive(Clone, Debug, PartialEq)]
+pub struct BandDrag {
+    start: Option<Point<Pixels>>,
+    current: Point<Pixels>,
+    covered: Vec<usize>,
+}
+
+impl Default for BandDrag {
+    fn default() -> Self {
+        Self {
+            start: None,
+            current: Point {
+                x: px(0.0),
+                y: px(0.0),
+            },
+            covered: Vec::new(),
+        }
+    }
+}
+
+impl BandDrag {
+    pub fn is_active(&self) -> bool {
+        self.start.is_some()
+    }
+
+    /// 画框用的两个角（起点、当前点）；没有在框选时返回 `None`。
+    pub fn rect(&self) -> Option<(Point<Pixels>, Point<Pixels>)> {
+        self.start.map(|start| (start, self.current))
+    }
+
+    pub fn begin(&mut self, position: Point<Pixels>) {
+        self.start = Some(position);
+        self.current = position;
+        self.covered.clear();
+    }
+
+    /// 指针移动：返回位置是否变化（决定要不要重绘）。
+    pub fn move_to(&mut self, position: Point<Pixels>) -> bool {
+        if self.start.is_none() || self.current == position {
+            return false;
+        }
+        self.current = position;
+        true
+    }
+
+    /// 指针扫过某一行：返回是否是新行（决定要不要重绘）。
+    pub fn cover(&mut self, index: usize) -> bool {
+        if self.start.is_none() || self.covered.contains(&index) {
+            return false;
+        }
+        self.covered.push(index);
+        true
+    }
+
+    /// 结束框选：返回扫过的行下标；没有开始过（或已经结束）时返回 `None`。
+    pub fn finish(&mut self) -> Option<Vec<usize>> {
+        self.start.take()?;
+        Some(std::mem::take(&mut self.covered))
+    }
+
+    pub fn cancel(&mut self) {
+        self.start = None;
+        self.covered.clear();
+    }
+}
+
+/// 框选扫过的行下标 → 选中范围（最小..最大）。没扫到行时返回 `None`。
+pub fn band_range(covered: &[usize]) -> Option<(usize, usize)> {
+    let low = *covered.iter().min()?;
+    let high = *covered.iter().max()?;
+    Some((low, high))
 }
 
 /// 资源管理器的数据模型：根项列表 + 各文件夹的展开状态。
@@ -476,6 +594,12 @@ pub struct ExplorerActions {
     pub delete_selected: PanelCommand,
     /// 退出选择模式。
     pub cancel_selection: PanelCommand,
+    /// 当前的框选状态（画框用）；没有在框选时是 `None`。
+    pub band: Option<BandDrag>,
+    pub on_band_begin: BandBeginAction,
+    pub on_band_move: BandMoveAction,
+    pub on_band_hover: BandHoverAction,
+    pub on_band_end: BandEndAction,
     /// 树里没有任何根项时显示提示文字。
     pub is_empty: bool,
 }
@@ -508,6 +632,35 @@ fn header_icon_button(
         .on_click(move |_, window, cx| on_click(window, cx))
 }
 
+/// 框选矩形：半透明底 + 1px 边。坐标是窗口坐标，绘制时与自身 bounds 求交。
+fn band_overlay(start: Point<Pixels>, current: Point<Pixels>, palette: Palette) -> AnyElement {
+    let fill = rgb(palette.command).alpha(0.22);
+    let border = rgb(palette.command);
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _cx| {
+            let rect = Bounds::from_corners(
+                point(start.x.min(current.x), start.y.min(current.y)),
+                point(start.x.max(current.x), start.y.max(current.y)),
+            )
+            .intersect(&bounds);
+            if rect.size.width > px(0.0) && rect.size.height > px(0.0) {
+                window.paint_quad(quad(
+                    rect,
+                    px(0.0),
+                    fill,
+                    px(1.0),
+                    border,
+                    BorderStyle::Solid,
+                ));
+            }
+        },
+    )
+    .absolute()
+    .inset_0()
+    .into_any_element()
+}
+
 /// 渲染资源管理器。
 pub fn render(
     tree: &Entity<TreeState>,
@@ -537,11 +690,27 @@ pub fn render(
         on_row_click,
         delete_selected,
         cancel_selection,
+        band,
+        on_band_begin,
+        on_band_move,
+        on_band_hover,
+        on_band_end,
         is_empty,
     } = actions;
 
     let selection_active = selection.is_active();
     let selected_count = selection.len();
+    // 选择模式下拖动其中一行等于拖动整批选中项（顺序按路径排序，避免哈希表顺序每次不同）。
+    let selected_drag_items: Vec<(String, bool)> = if selection_active {
+        let mut items: Vec<(String, bool)> = selection
+            .paths()
+            .map(|path| (path.clone(), Path::new(path).is_dir()))
+            .collect();
+        items.sort_by(|left, right| left.0.cmp(&right.0));
+        items
+    } else {
+        Vec::new()
+    };
 
     let add_button = header_icon_button(
         "explorer-add-folder",
@@ -604,6 +773,11 @@ pub fn render(
             .child(close_button)
     };
 
+    // 框选：行在按下时打标记，容器据此区分「按在条目上」与「按在空白处」。
+    let band_row_pressed = Rc::new(Cell::new(false));
+    let band_row_flag = band_row_pressed.clone();
+    let band_tree_bounds: Rc<RefCell<Option<Bounds<Pixels>>>> = Rc::new(RefCell::new(None));
+
     let body = if is_empty {
         v_flex()
             .p(px(12.0))
@@ -622,7 +796,7 @@ pub fn render(
             )
             .into_any_element()
     } else {
-        component_tree::tree(tree, move |_, entry, selected, _, _| {
+        component_tree::tree(tree, move |index, entry, selected, _, _| {
             let is_folder = entry.is_folder();
             let is_root = entry.is_root();
             let id = entry.item().id.to_string();
@@ -793,19 +967,43 @@ pub fn render(
                 .selected(highlighted)
                 .child(row);
 
+            // 按在这一行上：告诉容器「不是空白处」，不要同时开始框选。
+            let row_pressed = band_row_flag.clone();
+            let item = item.on_mouse_down(MouseButton::Left, move |_, _, _| {
+                row_pressed.set(true);
+            });
+            // 框选期间指针经过这一行：记下这一行（最终取扫过下标的最小..最大）。
+            let hover = on_band_hover.clone();
+            let item = item.on_mouse_move(move |event, _window, cx| {
+                hover(index, event.position, cx);
+            });
+
             // 拖动条目：数据里带上路径，拖到目录或标签栏上时用。
+            // 选择模式下拖其中一个选中项＝拖整批（没选中的行只拖自己）。
             let drag_path = id.clone();
             let drag_label = entry.item().label.clone();
+            let drag_items = if is_selected && !is_root && selection_active {
+                let mut items = selected_drag_items.clone();
+                if !items.iter().any(|(path, _)| *path == drag_path) {
+                    items.push((drag_path.clone(), is_folder));
+                }
+                items
+            } else {
+                vec![(drag_path.clone(), is_folder)]
+            };
             let drag_begin = on_item_drag.clone();
             let item = item.on_drag(
                 ExplorerDrag {
                     path: drag_path,
                     is_dir: is_folder,
+                    items: drag_items,
                 },
                 move |drag: &ExplorerDrag, _, _, cx| {
                     // 拖动真正开始（越过阈值）时才知道路径，借此支持「拖出窗口复制路径」。
                     drag_begin(&drag.path, cx);
-                    let label = if drag.is_dir {
+                    let label = if drag.items.len() > 1 {
+                        format!("{} 个项目", drag.items.len())
+                    } else if drag.is_dir {
                         format!("{}/", drag_label)
                     } else {
                         drag_label.to_string()
@@ -820,7 +1018,7 @@ pub fn render(
                 let move_action = on_move.clone();
                 let dragged = id.clone();
                 item.drag_over::<ExplorerDrag>(move |style, drag, _, _| {
-                    if can_move_into(&drag.path, &dragged, drag.is_dir) {
+                    if !move_targets(&drag.items, &dragged).is_empty() {
                         style.bg(rgba(palette.selection))
                     } else {
                         style
@@ -828,9 +1026,9 @@ pub fn render(
                 })
                 .on_drop(move |drag: &ExplorerDrag, window, cx| {
                     cx.stop_propagation();
-                    if can_move_into(&drag.path, &target, drag.is_dir) {
-                        let source = drag.path.clone();
-                        move_action(&source, &target, window, cx);
+                    let sources = move_targets(&drag.items, &target);
+                    if !sources.is_empty() {
+                        move_action(&sources, &target, window, cx);
                     }
                 })
             } else {
@@ -903,6 +1101,60 @@ pub fn render(
         })
         .into_any_element()
     };
+
+    // 框选容器：空白处按下开始，移动时画框，松开时选中扫过的行。
+    let band_rect = band.as_ref().and_then(BandDrag::rect);
+    let mut body = div()
+        .relative()
+        .size_full()
+        .on_children_prepainted({
+            let bounds = band_tree_bounds.clone();
+            move |children, _window, _cx| {
+                if let Some(first) = children.first() {
+                    *bounds.borrow_mut() = Some(*first);
+                }
+            }
+        })
+        .child(body);
+    if !is_empty {
+        body = body
+            .on_mouse_down(MouseButton::Left, {
+                let pressed = band_row_pressed.clone();
+                let bounds = band_tree_bounds.clone();
+                let begin = on_band_begin.clone();
+                move |event, window, cx| {
+                    // 按在条目上时由行自己的处理负责，不当成空白处。
+                    if pressed.replace(false) {
+                        return;
+                    }
+                    // 右侧是滚动条，按在那里是在拖滚动条。
+                    let on_scrollbar = (*bounds.borrow()).is_some_and(|bounds| {
+                        event.position.x >= bounds.origin.x + bounds.size.width - px(16.0)
+                    });
+                    if on_scrollbar {
+                        return;
+                    }
+                    begin(event.position, window, cx);
+                }
+            })
+            .on_mouse_move({
+                let moved = on_band_move.clone();
+                move |event, _window, cx| {
+                    moved(
+                        event.position,
+                        event.pressed_button == Some(MouseButton::Left),
+                        cx,
+                    );
+                }
+            })
+            .on_mouse_up(MouseButton::Left, {
+                let end = on_band_end.clone();
+                move |_, _window, cx| end(cx)
+            });
+    }
+    if let Some((start, current)) = band_rect {
+        body = body.child(band_overlay(start, current, palette));
+    }
 
     let mut panel = v_flex()
         .h_full()

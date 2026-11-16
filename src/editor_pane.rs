@@ -350,10 +350,13 @@ fn tab_strip(
                     this.hover(move |style| style.bg(rgba(palette.hover)))
                 })
                 .on_click(move |_, window, cx| activate(index, window, cx))
-                .on_mouse_up(MouseButton::Right, move |event: &MouseUpEvent, window, cx| {
-                    cx.stop_propagation();
-                    tab_menu(index, event.position, window, cx);
-                })
+                .on_mouse_up(
+                    MouseButton::Right,
+                    move |event: &MouseUpEvent, window, cx| {
+                        cx.stop_propagation();
+                        tab_menu(index, event.position, window, cx);
+                    },
+                )
                 .child(
                     Icon::new(IconName::File)
                         .xsmall()

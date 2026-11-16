@@ -391,7 +391,17 @@ impl Checker {
                 }
                 self.check_expr(value, names, *line);
             }
-            Stmt::AssignWithMember { value, line, .. } => self.check_expr(value, names, *line),
+            Stmt::AssignWithMember {
+                indices,
+                value,
+                line,
+                ..
+            } => {
+                for index in indices {
+                    self.check_expr(index, names, *line);
+                }
+                self.check_expr(value, names, *line);
+            }
             Stmt::WithCall { args, line, .. } => {
                 for arg in args {
                     self.check_expr(arg, names, *line);
@@ -651,6 +661,7 @@ impl Checker {
                     self.check_expr(value, names, *line);
                 }
             }
+            Stmt::Eval { expr, line } => self.check_expr(expr, names, *line),
             Stmt::Exit { .. }
             | Stmt::Label(..)
             | Stmt::Goto(..)
@@ -685,6 +696,7 @@ impl Checker {
             // `With` 里的 `.X`：主体是隐藏的，无法静态判断。
             Expr::WithMember { .. } => {}
             Expr::NamedArg { value, .. } => self.check_expr(value, names, line),
+            Expr::OmittedArg => {}
             Expr::TypeOf { expr, .. } => self.check_expr(expr, names, line),
             Expr::Call { name, args } => {
                 self.check_call(name, names, line);

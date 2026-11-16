@@ -153,10 +153,7 @@ fn the_keyword_filter_ignores_case_and_surrounding_spaces() {
         only_errors: false,
     };
     assert!(filter.is_active());
-    assert!(filter.matches(&line_at(
-        OutputLevel::Info,
-        "第 3 行运行时错误: 类型不匹配"
-    )));
+    assert!(filter.matches(&line_at(OutputLevel::Info, "第 3 行运行时错误: 类型不匹配")));
     assert!(!filter.matches(&line_at(OutputLevel::Info, "脚本执行结束")));
 }
 
@@ -200,10 +197,12 @@ fn display_text_appends_the_repeat_count() {
 
 #[test]
 fn error_lines_parse_their_line_number() {
-    assert_eq!(line_number_prefix("第 12 行运行时错误: 类型不匹配"), Some(12));
+    assert_eq!(
+        line_number_prefix("第 12 行运行时错误: 类型不匹配"),
+        Some(12)
+    );
     assert_eq!(line_number_prefix("第 3 行语法错误: 缺少 `Then`"), Some(3));
     assert_eq!(line_number_prefix("脚本执行结束"), None);
     assert_eq!(line_number_prefix("第 行错误"), None);
     assert_eq!(line_number_prefix("第 12行错误"), None);
 }
-

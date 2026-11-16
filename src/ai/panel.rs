@@ -248,11 +248,7 @@ impl AiPanel {
                 Some("还没配置 API 密钥：请到「设置 → AI」里填写 DeepSeek 的 API 密钥".to_string());
             return None;
         };
-        Some((
-            endpoint,
-            settings.ai.effective_model().to_string(),
-            api_key,
-        ))
+        Some((endpoint, settings.ai.effective_model().to_string(), api_key))
     }
 
     /// 发一轮请求：先占一条空的助手消息，流式文本往里追加。
@@ -708,7 +704,11 @@ impl AiPanel {
             .filter(|id| !answered.contains(id))
             .collect();
         for id in missing {
-            self.push_tool_result(&id, "用户停止了本次执行。".to_string(), "已停止".to_string());
+            self.push_tool_result(
+                &id,
+                "用户停止了本次执行。".to_string(),
+                "已停止".to_string(),
+            );
         }
     }
 
@@ -1055,9 +1055,7 @@ impl Render for AiPanel {
                 .map(|(index, entry)| match entry.message.role {
                     Role::Tool => tool_row(entry, &palette, chat_font),
                     // 只调用工具、没有正文的助手消息不必占一个空气泡。
-                    Role::Assistant
-                        if !self.pending && entry.message.content.trim().is_empty() =>
-                    {
+                    Role::Assistant if !self.pending && entry.message.content.trim().is_empty() => {
                         div().into_any_element()
                     }
                     _ => self.message_bubble(index, &entry.message, &palette, &*cx),
@@ -1111,7 +1109,11 @@ impl Render for AiPanel {
             input = input.border_color(rgb(palette.sidebar_text));
         }
         let escape = close_panel.clone();
-        let send_label = if self.pending { "思考中…" } else { "发送" };
+        let send_label = if self.pending {
+            "思考中…"
+        } else {
+            "发送"
+        };
         let stop_button = Button::new("ai-stop")
             .ghost()
             .xsmall()
@@ -1152,7 +1154,11 @@ impl Render for AiPanel {
             .xsmall()
             .label(approval_label)
             .text_color(footer_text)
-            .child(Icon::new(IconName::ChevronDown).xsmall().text_color(footer_text))
+            .child(
+                Icon::new(IconName::ChevronDown)
+                    .xsmall()
+                    .text_color(footer_text),
+            )
             .tooltip("AI 写入文件、运行或推进脚本前是否先询问")
             // 底栏在面板最下面，菜单要往上弹：BottomLeft = 开在触发按钮上方、左对齐。
             .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
@@ -1160,14 +1166,12 @@ impl Render for AiPanel {
                 for (value, label) in AiApproval::OPTIONS {
                     let value = *value;
                     let checked = AiApproval::from_str(value) == approval;
-                    menu = menu.item(
-                        PopupMenuItem::new(*label)
-                            .checked(checked)
-                            .on_click(move |_, _, cx| {
-                                let mode = AiApproval::from_str(value);
-                                SettingsStore::update(cx, |settings| settings.ai.approval = mode);
-                            }),
-                    );
+                    menu = menu.item(PopupMenuItem::new(*label).checked(checked).on_click(
+                        move |_, _, cx| {
+                            let mode = AiApproval::from_str(value);
+                            SettingsStore::update(cx, |settings| settings.ai.approval = mode);
+                        },
+                    ));
                 }
                 menu
             });
@@ -1177,23 +1181,23 @@ impl Render for AiPanel {
             .xsmall()
             .label(round_limit.short_label())
             .text_color(footer_text)
-            .child(Icon::new(IconName::ChevronDown).xsmall().text_color(footer_text))
+            .child(
+                Icon::new(IconName::ChevronDown)
+                    .xsmall()
+                    .text_color(footer_text),
+            )
             .tooltip("AI 一次提问最多连续执行多少轮工具调用")
             .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
                 let mut menu = menu;
                 for (value, label) in AiRoundLimit::OPTIONS {
                     let value = *value;
                     let checked = AiRoundLimit::from_str(value) == round_limit;
-                    menu = menu.item(
-                        PopupMenuItem::new(*label)
-                            .checked(checked)
-                            .on_click(move |_, _, cx| {
-                                let limit = AiRoundLimit::from_str(value);
-                                SettingsStore::update(cx, |settings| {
-                                    settings.ai.round_limit = limit
-                                });
-                            }),
-                    );
+                    menu = menu.item(PopupMenuItem::new(*label).checked(checked).on_click(
+                        move |_, _, cx| {
+                            let limit = AiRoundLimit::from_str(value);
+                            SettingsStore::update(cx, |settings| settings.ai.round_limit = limit);
+                        },
+                    ));
                 }
                 menu
             });
@@ -1203,7 +1207,11 @@ impl Render for AiPanel {
             .xsmall()
             .label(model_label)
             .text_color(footer_text)
-            .child(Icon::new(IconName::ChevronDown).xsmall().text_color(footer_text))
+            .child(
+                Icon::new(IconName::ChevronDown)
+                    .xsmall()
+                    .text_color(footer_text),
+            )
             .tooltip("当前使用的 AI 模型（DeepSeek）")
             .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, cx| {
                 let current = SettingsStore::snapshot(cx).ai.effective_model().to_string();
@@ -1218,14 +1226,12 @@ impl Render for AiPanel {
                 for (value, label) in entries {
                     let checked = value == current;
                     let picked = value.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(label)
-                            .checked(checked)
-                            .on_click(move |_, _, cx| {
-                                let picked = picked.clone();
-                                SettingsStore::update(cx, |settings| settings.ai.model = picked);
-                            }),
-                    );
+                    menu = menu.item(PopupMenuItem::new(label).checked(checked).on_click(
+                        move |_, _, cx| {
+                            let picked = picked.clone();
+                            SettingsStore::update(cx, |settings| settings.ai.model = picked);
+                        },
+                    ));
                 }
                 menu
             });
@@ -1288,10 +1294,7 @@ fn placeholder(palette: Palette, font_size: Pixels) -> impl IntoElement {
 
 /// 工具调用的一行活动记录。
 fn tool_row(entry: &ChatEntry, palette: &Palette, font_size: Pixels) -> AnyElement {
-    let note = entry
-        .note
-        .clone()
-        .unwrap_or_else(|| "工具调用".to_string());
+    let note = entry.note.clone().unwrap_or_else(|| "工具调用".to_string());
     h_flex()
         .w_full()
         .items_center()

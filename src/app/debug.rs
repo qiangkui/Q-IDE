@@ -202,6 +202,7 @@ impl CodeWindow {
                                     session.paused = state.0;
                                     session.snapshot = snapshot;
                                     session.watch_request = None;
+                                    session.assign_request = None;
                                     if state.0 {
                                         // 每次暂停都重新求值：变量可能已经变了。
                                         session.watch_queue = (0..this.watches.len()).collect();
@@ -224,30 +225,66 @@ impl CodeWindow {
                                 }
                                 if matched {
                                     this.show_debug_line(current_line.flatten(), cx);
+                                    // 「出错时中断」停下时把错误写进输出：脚本还没结束，
+                                    // 否则用户只看到停住、不知道原因。
+                                    let reason = this
+                                        .debug
+                                        .as_ref()
+                                        .and_then(|session| session.snapshot.as_ref())
+                                        .and_then(|snapshot| {
+                                            snapshot.error.as_ref().map(|error| {
+                                                format!("调试中断：第 {} 行 {error}", snapshot.line)
+                                            })
+                                        });
+                                    if let Some(reason) = reason {
+                                        this.output().warning(cx, reason);
+                                    }
                                 }
                             }
                             if let Some(outcome) = outcome {
+                                let outcome_id = outcome.id;
+                                // 监视表达式的结果。
                                 let mut applied = false;
                                 if let Some(session) = &mut this.debug
                                     && Arc::ptr_eq(control, &session.control)
                                     && session
                                         .watch_request
-                                        .is_some_and(|(id, _)| id == outcome.id)
+                                        .is_some_and(|(id, _)| id == outcome_id)
                                 {
                                     if let Some((_, index)) = session.watch_request.take()
                                         && let Some(slot) = this.watch_states.get_mut(index)
                                     {
-                                        *slot = match outcome.result {
+                                        *slot = match &outcome.result {
                                             Ok(value) => WatchState::Ready {
-                                                value: value.value,
-                                                ty: value.ty,
+                                                value: value.value.clone(),
+                                                ty: value.ty.clone(),
                                             },
-                                            Err(message) => WatchState::Failed(message),
+                                            Err(message) => WatchState::Failed(message.clone()),
                                         };
                                     }
                                     applied = true;
                                 }
                                 dirty |= applied;
+                                // 「设置变量值」的结果：报一句结果，变量面板已经靠新的快照刷新过了。
+                                let mut handled = None;
+                                if let Some(session) = &mut this.debug
+                                    && Arc::ptr_eq(control, &session.control)
+                                    && session.assign_request == Some(outcome_id)
+                                {
+                                    session.assign_request = None;
+                                    handled = Some(outcome.result);
+                                }
+                                if let Some(result) = handled {
+                                    match result {
+                                        Ok(value) => this.output().success(
+                                            cx,
+                                            format!("已设置变量：{} = {}", value.value, value.ty),
+                                        ),
+                                        Err(message) => this
+                                            .output()
+                                            .error(cx, format!("设置变量失败：{message}")),
+                                    }
+                                }
                             }
                             // 一条求值完成后接着发下一条。
                             dirty |= this.pump_watch_requests();
@@ -332,6 +369,7 @@ impl CodeWindow {
         self.run_to = run_to;
         let control = Arc::new(DebugControl::new(breakpoints));
         control.set_breakpoint_conditions(self.active_breakpoint_conditions());
+        control.set_break_on_error(self.break_on_error);
         if pause_first {
             control.pause();
         }
@@ -343,6 +381,7 @@ impl CodeWindow {
             snapshot: None,
             watch_queue: VecDeque::new(),
             watch_request: None,
+            assign_request: None,
         });
 
         let (sender, receiver) = mpsc::channel::<ScriptEvent>();
@@ -406,7 +445,7 @@ impl CodeWindow {
         }
     }
 
-    /// 单步：没有会话时启动调试并停在第一条语句。
+    /// 单步（逐语句）：没有会话时启动调试并停在第一条语句。
     pub(crate) fn debug_step(&mut self, cx: &mut Context<Self>) {
         match &self.debug {
             Some(session) => {
@@ -415,6 +454,192 @@ impl CodeWindow {
             }
             None => self.begin_debug(true, cx),
         }
+    }
+
+    /// 开关「出错时中断」：调试会话遇到没有处理的错误时先停在出错行。
+    pub(crate) fn toggle_break_on_error(&mut self, cx: &mut Context<Self>) {
+        self.break_on_error = !self.break_on_error;
+        if let Some(session) = &self.debug {
+            session.control.set_break_on_error(self.break_on_error);
+        }
+        let state = if self.break_on_error { "开" } else { "关" };
+        self.output().command(cx, format!("> 出错时中断：{state}"));
+        cx.notify();
+    }
+
+    /// 单步跳过（逐过程）：进入被调过程不拦，等回到当前层再停。
+    pub(crate) fn debug_step_over(&mut self, cx: &mut Context<Self>) {
+        match &self.debug {
+            Some(session) => {
+                session.control.step_over();
+                self.output().command(cx, "> 单步跳过");
+            }
+            None => self.begin_debug(true, cx),
+        }
+    }
+
+    /// 跳出过程：一路跑到调用者里再停。
+    pub(crate) fn debug_step_out(&mut self, cx: &mut Context<Self>) {
+        match &self.debug {
+            Some(session) => {
+                session.control.step_out();
+                self.output().command(cx, "> 跳出过程");
+            }
+            None => self.begin_debug(true, cx),
+        }
+    }
+
+    /// 界面点了「调用栈」里的某一层：切过去看那一层的变量。
+    ///
+    /// 只是发请求：解释器线程醒来后重新取快照，轮询那边靠 `pause_epoch` 变化刷新面板。
+    pub(crate) fn debug_select_frame(&mut self, frame: usize, cx: &mut Context<Self>) {
+        let Some(session) = &self.debug else {
+            return;
+        };
+        if session.control.select_frame(frame) {
+            cx.notify();
+        }
+    }
+
+    /// 「设置变量值…」对话框：输入 `变量名 = 新值`（暂停时才能用）。
+    pub(crate) fn set_variable_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        if self.debug.as_ref().is_none_or(|session| !session.paused) {
+            self.output()
+                .warning(cx, "「设置变量值」只能在脚本暂停时用");
+            return;
+        }
+        // 光标停在某个名字上时先填进 `名字 = `，省得手输。
+        let current = {
+            let editor = self.editor.read(cx);
+            let text = editor.text();
+            let offset = editor.cursor().min(text.len());
+            Self::word_at(text, offset)
+                .map(|word| format!("{word} = "))
+                .unwrap_or_default()
+        };
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("变量名 = 新值，例如 total = 42")
+                .default_value(current)
+        });
+        let handle = cx.entity().downgrade();
+        let apply: DialogCallback = {
+            let field = input.clone();
+            Rc::new(move |window, cx| {
+                let text = field.read(cx).value().to_string();
+                let _ = handle.update(cx, |this, cx| this.assign_variable(&text, cx));
+                window.close_dialog(cx);
+            })
+        };
+        show_input_dialog(
+            window,
+            cx,
+            InputDialogSpec {
+                id_prefix: "assign",
+                title: "设置变量值",
+                description: Some("只支持变量名（局部 / 模块 / Static）；右侧是新值的表达式。"),
+                confirm: "设置",
+            },
+            input,
+            apply,
+        );
+    }
+
+    /// 大论点中双击变量值打开它：变量名已知，只输入新值。
+    pub(crate) fn edit_variable_dialog(
+        &mut self,
+        name: &str,
+        current: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        if self.debug.as_ref().is_none_or(|session| !session.paused) {
+            self.output()
+                .warning(cx, "「设置变量值」只能在脚本暂停时用");
+            return;
+        }
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("新值，例如 42")
+                .default_value(current.to_string())
+        });
+        let handle = cx.entity().downgrade();
+        let target = name.to_string();
+        let apply: DialogCallback = {
+            let field = input.clone();
+            Rc::new(move |window, cx| {
+                let text = field.read(cx).value().to_string();
+                let target = target.clone();
+                let _ = handle.update(cx, |this, cx| {
+                    this.assign_variable_value(&target, &text, cx);
+                });
+                window.close_dialog(cx);
+            })
+        };
+        show_input_dialog(
+            window,
+            cx,
+            InputDialogSpec {
+                id_prefix: "assign-value",
+                title: "设置变量值",
+                description: Some("右侧按表达式求值，再按变量声明类型转换后写回。"),
+                confirm: "设置",
+            },
+            input,
+            apply,
+        );
+    }
+
+    /// 给指定变量赋值（变量名已知，`value` 是新值的表达式文本）。
+    pub(crate) fn assign_variable_value(
+        &mut self,
+        target: &str,
+        value: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let target = target.trim().to_string();
+        let value = value.trim().to_string();
+        if target.is_empty() || value.is_empty() {
+            self.output().error(cx, "新值不能为空");
+            return;
+        }
+        let Some(session) = &mut self.debug else {
+            self.output().warning(cx, "还没有调试会话");
+            return;
+        };
+        match session.control.request_assign(&target, &value) {
+            Some(id) => {
+                session.assign_request = Some(id);
+                self.output()
+                    .command(cx, format!("> 设置 {target} = {value}"));
+            }
+            None => self
+                .output()
+                .warning(cx, "「设置变量值」只能在脚本暂停时用"),
+        }
+    }
+
+    /// 解析 `变量名 = 新值` 并排队交给解释器线程（`=` 只按**第一个**切，值里可以再写 `=`）。
+    pub(crate) fn assign_variable(&mut self, text: &str, cx: &mut Context<Self>) {
+        let Some((target, value)) = text.split_once('=') else {
+            self.output()
+                .error(cx, "要写成 `变量名 = 新值`，例如 `total = 42`");
+            return;
+        };
+        let target = target.trim().to_string();
+        let value = value.trim().to_string();
+        if target.is_empty() || value.is_empty() {
+            self.output()
+                .error(cx, "要写成 `变量名 = 新值`，例如 `total = 42`");
+            return;
+        }
+        self.assign_variable_value(&target, &value, cx);
     }
 
     /// 打开「添加监视」对话框：暂停时输入的表达式会在每次暂停时求值。

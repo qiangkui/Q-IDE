@@ -125,7 +125,12 @@ pub fn toggle_comment(text: &str, selection: Range<usize>, token: &str) -> Optio
     let starts = line_starts(text);
     let (first, last) = selected_lines(&starts, &selection, text.len());
     let lines: Vec<(usize, usize)> = (first..=last)
-        .map(|index| (starts[index], starts.get(index + 1).copied().unwrap_or(text.len())))
+        .map(|index| {
+            (
+                starts[index],
+                starts.get(index + 1).copied().unwrap_or(text.len()),
+            )
+        })
         .collect();
 
     let indent_len = |line: &str| line.len() - line.trim_start_matches([' ', '\t']).len();
@@ -159,7 +164,11 @@ pub fn toggle_comment(text: &str, selection: Range<usize>, token: &str) -> Optio
         let empty = line.trim().is_empty();
         let new_line = if all_commented && !empty {
             let rest = &line[indent + token.len()..];
-            format!("{}{}", &line[..indent], rest.strip_prefix(' ').unwrap_or(rest))
+            format!(
+                "{}{}",
+                &line[..indent],
+                rest.strip_prefix(' ').unwrap_or(rest)
+            )
         } else if !all_commented && !empty {
             format!("{}{}{}", &line[..indent], marker, &line[indent..])
         } else {

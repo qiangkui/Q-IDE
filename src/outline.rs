@@ -17,9 +17,9 @@ use gpui_kit::prelude::{
 };
 use gpui_kit::*;
 
-use crate::panel_drag::PanelDragPreview;
-use crate::interpreter::ast::{ClassDef, Program, Procedure, Stmt};
+use crate::interpreter::ast::{ClassDef, Procedure, Program, Stmt};
 use crate::interpreter::debug::{DebugSnapshot, DebugVariable};
+use crate::panel_drag::PanelDragPreview;
 use crate::theme::{self as ui_theme, Palette};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -43,6 +43,7 @@ pub struct OutlineModel {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum OutlineSection {
+    CallStack,
     Breakpoints,
     Watch,
     Procedures,
@@ -54,7 +55,8 @@ pub enum OutlineSection {
 }
 
 impl OutlineSection {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
+        Self::CallStack,
         Self::Breakpoints,
         Self::Watch,
         Self::Procedures,
@@ -67,6 +69,7 @@ impl OutlineSection {
 
     fn title(self) -> &'static str {
         match self {
+            Self::CallStack => "调用栈",
             Self::Breakpoints => "断点",
             Self::Watch => "监视",
             Self::Procedures => "过程与函数",
@@ -80,8 +83,8 @@ impl OutlineSection {
 
     fn symbols(self, model: &OutlineModel) -> &[OutlineSymbol] {
         match self {
-            // 监视与断点不来自源码，由 `OutlineRender` 里的对应字段提供。
-            Self::Breakpoints | Self::Watch => &[],
+            // 调用栈、监视与断点不来自源码，由 `OutlineRender` 里的对应字段提供。
+            Self::CallStack | Self::Breakpoints | Self::Watch => &[],
             Self::Procedures => &model.procedures,
             Self::Variables => &model.variables,
             Self::Types => &model.types,
@@ -99,10 +102,7 @@ pub fn matches_filter(symbol: &OutlineSymbol, query: &str) -> bool {
 }
 
 /// 按过滤框内容筛选符号，保持原有顺序。
-pub fn filter_symbols<'a>(
-    symbols: &'a [OutlineSymbol],
-    query: &str,
-) -> Vec<&'a OutlineSymbol> {
+pub fn filter_symbols<'a>(symbols: &'a [OutlineSymbol], query: &str) -> Vec<&'a OutlineSymbol> {
     symbols
         .iter()
         .filter(|symbol| matches_filter(symbol, query))
@@ -261,12 +261,18 @@ impl OutlineModel {
         collect_variables(&program.main, "模块", &mut model.variables);
         if let Some(map) = map.filter(|map| map.has_includes() && !include_included) {
             // 大纲是「当前文件」的大纲：被包含文件的符号不列出（行号也属于另一个文件）。
-            model.procedures.retain(|symbol| map.is_main_line(symbol.line));
-            model.variables.retain(|symbol| map.is_main_line(symbol.line));
+            model
+                .procedures
+                .retain(|symbol| map.is_main_line(symbol.line));
+            model
+                .variables
+                .retain(|symbol| map.is_main_line(symbol.line));
             model.types.retain(|symbol| map.is_main_line(symbol.line));
             model.classes.retain(|symbol| map.is_main_line(symbol.line));
             model.enums.retain(|symbol| map.is_main_line(symbol.line));
-            model.declares.retain(|symbol| map.is_main_line(symbol.line));
+            model
+                .declares
+                .retain(|symbol| map.is_main_line(symbol.line));
         }
         sort_symbols(&mut model);
         model
@@ -387,9 +393,9 @@ fn collect_variables(stmts: &[Stmt], owner: &str, variables: &mut Vec<OutlineSym
                 });
                 collect_variables(body, owner, variables);
             }
-            Stmt::With { body, .. }
-            | Stmt::DoLoop { body, .. }
-            | Stmt::While { body, .. } => collect_variables(body, owner, variables),
+            Stmt::With { body, .. } | Stmt::DoLoop { body, .. } | Stmt::While { body, .. } => {
+                collect_variables(body, owner, variables)
+            }
             Stmt::If {
                 branches,
                 otherwise,
@@ -470,7 +476,13 @@ fn scan_incomplete_source(source: &str) -> OutlineModel {
         }
 
         if let Some(rest) = strip_word(statement, "function") {
-            enter_named_scope(&mut scopes, &mut model.procedures, rest, "Function", line_number);
+            enter_named_scope(
+                &mut scopes,
+                &mut model.procedures,
+                rest,
+                "Function",
+                line_number,
+            );
             continue;
         }
         if let Some(rest) = strip_word(statement, "sub") {
@@ -645,16 +657,16 @@ pub(crate) fn strip_word<'a>(text: &'a str, word: &str) -> Option<&'a str> {
 }
 
 pub(crate) fn matches_ignore_ascii_case(value: &str, options: &[&str]) -> bool {
-    options.iter().any(|option| value.eq_ignore_ascii_case(option))
+    options
+        .iter()
+        .any(|option| value.eq_ignore_ascii_case(option))
 }
 
 pub(crate) fn first_identifier(text: &str) -> Option<String> {
     let text = text.trim_start();
     let end = text
         .char_indices()
-        .find_map(|(index, ch)| {
-            (!(ch.is_alphanumeric() || ch == '_')).then_some(index)
-        })
+        .find_map(|(index, ch)| (!(ch.is_alphanumeric() || ch == '_')).then_some(index))
         .unwrap_or(text.len());
     (end > 0).then(|| text[..end].to_string())
 }
@@ -691,10 +703,15 @@ impl<'a> DebugView<'a> {
 /// `line` 是光标所在行（1 基）：优先选当前过程里的局部变量/参数，其次是模块变量，
 /// 最后才是过程、API 声明、类型、类、枚举。`p.Bump` 这种成员调用会退而匹配
 /// `类名.Bump`。
-pub fn definition<'a>(model: &'a OutlineModel, name: &str, line: usize) -> Option<&'a OutlineSymbol> {
+pub fn definition<'a>(
+    model: &'a OutlineModel,
+    name: &str,
+    line: usize,
+) -> Option<&'a OutlineSymbol> {
     let matches = |symbol: &&OutlineSymbol| symbol.name.eq_ignore_ascii_case(name);
-    let in_current_scope =
-        |symbol: &&OutlineSymbol| matches(symbol) && Some(symbol.scope.as_str()) == enclosing_scope(model, line).as_deref();
+    let in_current_scope = |symbol: &&OutlineSymbol| {
+        matches(symbol) && Some(symbol.scope.as_str()) == enclosing_scope(model, line).as_deref()
+    };
 
     if let Some(symbol) = model.variables.iter().find(in_current_scope) {
         return Some(symbol);
@@ -821,6 +838,10 @@ pub struct OutlineRender<'a> {
     pub breakpoints: &'a [BreakpointEntry],
     /// 过滤框内容；空串表示不过滤。
     pub filter: &'a str,
+    /// 暂停时双击变量行里那行「值」：改这个变量（参数是变量名与当前值的显示文本）。
+    pub edit_variable: EditVariableAction,
+    /// 点「调用栈」里的某一层：切过去看那一层的变量。
+    pub select_frame: SelectFrameAction,
     pub toggle_section: ToggleSectionAction,
     pub toggle_scope: ToggleScopeAction,
     pub close_panel: ClosePanelAction,
@@ -836,12 +857,18 @@ struct SectionContext<'a> {
     breakpoints: &'a [BreakpointEntry],
     /// 正在过滤：符号分区强制展开、空分区隐藏。
     filtering: bool,
+    edit_variable: EditVariableAction,
+    select_frame: SelectFrameAction,
     toggle_section: ToggleSectionAction,
     toggle_scope: ToggleScopeAction,
     go_to_line: GoToLineAction,
 }
 
 pub type DragStartAction = Rc<dyn Fn(&mut App)>;
+/// 暂停时编辑一个变量的值：`(变量名, 当前值的显示文本)`。
+pub type EditVariableAction = Rc<dyn Fn(&str, &str, &mut Window, &mut App)>;
+/// 点「调用栈」里的一层：`call_stack` 的下标（0 是模块/最外层）。
+pub type SelectFrameAction = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 
 pub fn render(
     props: OutlineRender<'_>,
@@ -858,6 +885,8 @@ pub fn render(
         expanded_scopes,
         vb_supported,
         debug,
+        edit_variable,
+        select_frame,
         watches,
         breakpoints,
         filter,
@@ -874,6 +903,8 @@ pub fn render(
         watches,
         breakpoints,
         filtering,
+        edit_variable,
+        select_frame,
         toggle_section,
         toggle_scope,
         go_to_line,
@@ -882,6 +913,18 @@ pub fn render(
     let sections = OutlineSection::ALL.into_iter().filter_map(|section| {
         let collapsed = collapsed_sections.contains(&section);
         match section {
+            // 调用栈只在暂停时有内容，平时整节收起来。
+            OutlineSection::CallStack => {
+                let debug = context.debug.filter(|debug| debug.paused)?;
+                let snapshot = debug.snapshot?;
+                Some(render_section(
+                    section,
+                    &[],
+                    snapshot.call_stack.len(),
+                    collapsed,
+                    &context,
+                ))
+            }
             OutlineSection::Watch => Some(render_section(
                 section,
                 &[],
@@ -907,7 +950,13 @@ pub fn render(
                         return None;
                     }
                     // 过滤时强制展开，否则匹配项还藏在折叠的分区里。
-                    Some(render_section(section, &filtered, filtered.len(), false, &context))
+                    Some(render_section(
+                        section,
+                        &filtered,
+                        filtered.len(),
+                        false,
+                        &context,
+                    ))
                 } else {
                     Some(render_section(
                         section,
@@ -1012,7 +1061,9 @@ fn render_section(
     ));
 
     if !collapsed {
-        if section == OutlineSection::Watch {
+        if section == OutlineSection::CallStack {
+            group = render_call_stack_rows(group, context);
+        } else if section == OutlineSection::Watch {
             group = render_watch_rows(group, context);
         } else if section == OutlineSection::Breakpoints {
             group = render_breakpoint_rows(group, context);
@@ -1035,9 +1086,7 @@ fn render_section(
                     continue;
                 }
                 for (index, symbol) in items.into_iter().enumerate() {
-                    let variable = context
-                        .debug
-                        .and_then(|debug| debug.variable_of(symbol));
+                    let variable = context.debug.and_then(|debug| debug.variable_of(symbol));
                     group = group.child(symbol_row(
                         format!("outline-symbol-{section:?}-{scope_index}-{index}"),
                         symbol,
@@ -1052,6 +1101,7 @@ fn render_section(
                             variable,
                             32.0,
                             palette,
+                            context.edit_variable.clone(),
                         ));
                     }
                 }
@@ -1182,6 +1232,57 @@ fn scope_header(
                 .text_color(rgb(palette.muted_text))
                 .child(count.to_string()),
         )
+}
+
+/// 「调用栈」一节的内容：从最外层（模块）到最内层，一行一层。
+///
+/// 点某一行就切到那一层看变量；选中的那一层加底色，编辑器的高亮也跟着跳到它的行。
+fn render_call_stack_rows(mut group: Div, context: &SectionContext<'_>) -> Div {
+    let palette = context.palette;
+    let Some(snapshot) = context
+        .debug
+        .filter(|debug| debug.paused)
+        .and_then(|debug| debug.snapshot)
+    else {
+        return group;
+    };
+
+    for (index, frame) in snapshot.call_stack.iter().enumerate() {
+        let selected = index == snapshot.frame;
+        let select_frame = context.select_frame.clone();
+        group = group.child(
+            h_flex()
+                .id(format!("outline-frame-{index}"))
+                .w_full()
+                .min_h(px(24.0))
+                .pl(px(24.0))
+                .pr(px(8.0))
+                .gap_2()
+                .items_center()
+                .cursor(CursorStyle::PointingHand)
+                .hover(move |this| this.bg(rgba(palette.hover)))
+                .when(selected, |this| this.bg(rgba(palette.selection)))
+                .on_click(move |_, window, cx| select_frame(index, window, cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(rgb(palette.sidebar_text))
+                        .child(frame.procedure.clone()),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .whitespace_nowrap()
+                        .text_xs()
+                        .text_color(rgb(palette.muted_text))
+                        .child(format!("第 {} 行", frame.line)),
+                ),
+        );
+    }
+    group
 }
 
 /// 「断点」一节的内容：每条断点一行（行号 + 源码），条件断点再挂一行条件。
@@ -1390,13 +1491,18 @@ fn symbol_row(
         )
 }
 
-/// 调试暂停时变量下方的那一行：值与声明类型，用淡色（禁用态）显示。
+/// 调试暂停时变量下方的那一行：值与声明类型。
+///
+/// **双击这一行**就能改这个变量的值（只在暂停时存在，平时不渲染）。
 fn value_row(
     id: String,
     variable: &DebugVariable,
     indent: f32,
     palette: Palette,
+    edit_variable: EditVariableAction,
 ) -> impl IntoElement {
+    let name = variable.name.clone();
+    let current = variable.value.clone();
     h_flex()
         .id(id)
         .w_full()
@@ -1405,13 +1511,25 @@ fn value_row(
         .pr(px(8.0))
         .gap_1()
         .items_center()
+        .cursor(CursorStyle::PointingHand)
+        .hover(move |this| this.bg(rgba(palette.hover)))
+        .on_mouse_down(
+            MouseButton::Left,
+            move |event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+                if event.click_count < 2 {
+                    return;
+                }
+                cx.stop_propagation();
+                edit_variable(&name, &current, window, cx);
+            },
+        )
         .child(
             div()
                 .flex_1()
                 .min_w_0()
                 .truncate()
                 .text_xs()
-                .text_color(rgb(palette.muted_text))
+                .text_color(rgb(palette.sidebar_text))
                 .child(format!("值：{}", variable.value)),
         )
         .child(

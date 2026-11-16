@@ -98,6 +98,8 @@ pub struct Slot {
     ///
     /// 用 `Rc<Cell<_>>` 而不是 `Cell`：`Slot` 是克隆出去用的（`find_slot` 返回克隆），
     /// 存储共享、标注也必须共享，否则写在克隆上的类型就丢了。
+    /// 注意：**不能**改成「按需分配」（`RefCell<Option<Rc<..>>>`）——克隆后两边各自的 `None`
+    /// 会让「先克隆、再在克隆上记类型」的路径丢标注，`VarType`/`Get`/`Put` 的窄类型用例会挂。
     narrow: Rc<std::cell::Cell<Option<VbType>>>,
 }
 
@@ -208,12 +210,18 @@ impl Slot {
 }
 
 #[derive(Default)]
-struct Frame {
-    locals: FastMap<String, Slot>,
+struct Frame<'p> {
+    /// 局部变量表。键用 `Cow<'p, str>`：形参名借自 AST（`Borrowed`，每次调用不分配）；
+    /// `Dim` / `Const` / 隐式声明的名字来自语句本身、活不过 `'p`，只能 `Owned`；
+    /// 类方法调用时从实例字段搬过来的名字同样是 `Owned`。
+    locals: FastMap<std::borrow::Cow<'p, str>, Slot>,
     /// 函数返回值所在的槽（函数名即返回值）。
     result: Option<Slot>,
     /// 当前过程名，`Static` 局部变量按它归档。
-    procedure: Option<String>,
+    ///
+    /// 借用 AST 里的名字（`&'p str`）：每次调用都会 push 一个 `Frame`，用 `String` 就是每次调用
+    /// 一次分配 + 拷贝；过程名在整次运行里不会变，借出去就够了。
+    procedure: Option<&'p str>,
     /// 调用这一帧的那条语句所在行（1 基）：用来拼调用栈。
     call_line: usize,
     /// 当前 `On Error` 处理方式。
@@ -275,6 +283,8 @@ enum FileHandle {
 /// 文本输出文件（`For Output` / `For Append`）。
 struct FileWriter {
     sink: BufWriter<File>,
+    /// `Open` 时的模式码（`Output` 2 / `Append` 8），`FileAttr(n, 1)` 要原样报出去。
+    mode: i64,
     /// `Width #n, w`：`Print #` 的自动换行宽度；0 表示不换行。
     width: usize,
     /// 当前行已经写了多少字符（`;` 续行和 `,` 分区都靠它定位）。
@@ -282,9 +292,10 @@ struct FileWriter {
 }
 
 impl FileWriter {
-    fn new(file: File) -> Self {
+    fn new(file: File, mode: i64) -> Self {
         Self {
             sink: BufWriter::new(file),
+            mode,
             width: 0,
             column: 0,
         }
@@ -296,17 +307,19 @@ impl FileWriter {
 
     /// 写入一段文本：按 `Width #` 自动换行、`!suppress_newline` 时补换行，并跟踪列位置。
     fn write_line(&mut self, text: &str, suppress_newline: bool) -> std::io::Result<()> {
+        // 行尾是 **CRLF**：本机 VB6 实测 `Print #1, "hello from script"` 之后 `FileLen` 是 19
+        // （17 个字符 + `\r\n`）。用 `\n` 的话读回去的字节数、以及外部工具看到的换行全都不对。
         let mut line = String::new();
         for ch in text.chars() {
             if self.width > 0 && self.column >= self.width {
-                line.push('\n');
+                line.push_str("\r\n");
                 self.column = 0;
             }
             line.push(ch);
             self.column += 1;
         }
         if !suppress_newline {
-            line.push('\n');
+            line.push_str("\r\n");
             self.column = 0;
         }
         self.sink.write_all(line.as_bytes())
@@ -428,11 +441,11 @@ pub struct Runtime<'p, 'o> {
     /// `Class ... End Class` 定义。
     classes: HashMap<String, &'p ClassDef>,
     /// 模块级变量，所有过程都能看到。
-    globals: FastMap<String, Slot>,
+    globals: FastMap<std::borrow::Cow<'p, str>, Slot>,
     /// 过程调用栈，只保存当前过程的局部变量。
-    frames: Vec<Frame>,
-    /// `Static` 局部变量：过程合 → 变量。
-    statics: FastMap<String, FastMap<String, Slot>>,
+    frames: Vec<Frame<'p>>,
+    /// `Static` 局部变量：过程名 → 变量（过程名借用 AST，不复制）。
+    statics: FastMap<&'p str, FastMap<String, Slot>>,
     /// `Option Explicit`：未声明变量直接报错。
     option_explicit: bool,
     /// `Option Compare Text`：字符串比较忽略大小写。
@@ -468,6 +481,8 @@ pub struct Runtime<'p, 'o> {
     com_event_vars: std::collections::HashSet<String>,
     /// 已挂接的 COM 事件连接；`Drop` 时自动 `Unadvise`。
     com_events: Vec<ComEventOwner>,
+    /// 正在分派 COM 事件（`事件处理过程里再产生的事件`要留到下一次，避免递归分派）。
+    pumping_events: bool,
     /// 调试控制器；普通运行时为 `None`。
     debug: Option<Arc<DebugControl>>,
     /// 是否累计执行频次统计（`--stats`）。
@@ -591,7 +606,7 @@ pub fn run_program_with_stats(
     let mut globals = FastMap::default();
     for def in &program.enums {
         for (name, value) in &def.members {
-            if globals.contains_key(name) {
+            if globals.contains_key(name.as_str()) {
                 return (
                     Err(RuntimeError::new(
                         format!("枚举 `{}` 的成员 `{name}` 与前面的定义重名", def.display),
@@ -601,7 +616,7 @@ pub fn run_program_with_stats(
                 );
             }
             globals.insert(
-                name.clone(),
+                std::borrow::Cow::Borrowed(name.as_str()),
                 Slot::constant(Value::Int(*value), VbType::Long),
             );
         }
@@ -663,6 +678,7 @@ pub fn run_program_with_stats(
             .map(|item| item.name.clone())
             .collect(),
         com_events: Vec::new(),
+        pumping_events: false,
         debug,
         evaluating: false,
         command_line: options.command_line.clone(),
@@ -749,7 +765,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
     }
 
     /// 当前作用域：模块级写全局表，过程内写栈顶帧。
-    fn scope_mut(&mut self) -> &mut FastMap<String, Slot> {
+    fn scope_mut(&mut self) -> &mut FastMap<std::borrow::Cow<'p, str>, Slot> {
         match self.frames.last_mut() {
             Some(frame) => &mut frame.locals,
             None => &mut self.globals,
@@ -830,7 +846,10 @@ impl<'p, 'o> Runtime<'p, 'o> {
             }
             return Err(RuntimeError::new(format!("变量 `{name}` 重复声明"), line));
         }
-        scope.insert(name.to_string(), Slot::new(value, ty).at_line(line));
+        scope.insert(
+            std::borrow::Cow::Owned(name.to_string()),
+            Slot::new(value, ty).at_line(line),
+        );
         Ok(true)
     }
 
@@ -845,11 +864,11 @@ impl<'p, 'o> Runtime<'p, 'o> {
         let procedure = self
             .frames
             .last()
-            .and_then(|frame| frame.procedure.clone())
+            .and_then(|frame| frame.procedure)
             .ok_or_else(|| {
                 RuntimeError::new(format!("`Static` 只能用在过程内部（`{name}`）"), line)
             })?;
-        if let Some(slot) = self.statics.get(&procedure).and_then(|vars| vars.get(name)) {
+        if let Some(slot) = self.statics.get(procedure).and_then(|vars| vars.get(name)) {
             return Ok(slot.clone());
         }
         let slot = Slot::new(value, ty);
@@ -879,7 +898,8 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 let narrow = self.narrow_of(from);
                 let slot = Slot::new(value.copy_value(), VbType::Variant);
                 slot.set_narrow(narrow);
-                self.scope_mut().insert(name.to_string(), slot);
+                self.scope_mut()
+                    .insert(std::borrow::Cow::Owned(name.to_string()), slot);
                 Ok(())
             }
         }
@@ -955,31 +975,129 @@ impl<'p, 'o> Runtime<'p, 'o> {
         let Some(control) = self.debug.clone() else {
             return Ok(());
         };
+        let depth = self.frames.len();
         let mut query = |request: DebugQuery<'_>| match request {
-            DebugQuery::Snapshot => DebugReply::Snapshot(self.debug_snapshot(line)),
-            DebugQuery::Evaluate(expression) => {
-                DebugReply::Value(self.debug_evaluate(expression, line))
+            DebugQuery::Snapshot(frame) => DebugReply::Snapshot(self.debug_snapshot(line, frame)),
+            DebugQuery::Evaluate { frame, expression } => {
+                DebugReply::Value(self.debug_evaluate(frame, expression, line))
             }
             DebugQuery::Condition(expression) => {
                 DebugReply::Condition(self.debug_condition(expression, line))
             }
+            DebugQuery::Assign {
+                frame,
+                target,
+                value,
+            } => DebugReply::Value(self.debug_assign(frame, target, value, line)),
         };
-        if control.before_line(line, &mut query) == DebugSignal::Stop {
+        if control.before_line(line, depth, &mut query) == DebugSignal::Stop {
             return Err(RuntimeError::new(debug::STOPPED_MESSAGE, line));
         }
         Ok(())
     }
 
-    /// 在暂停处求值一条监视表达式，给出显示文本与类型名。
-    fn debug_evaluate(&mut self, expression: &str, line: usize) -> Result<DebugValue, String> {
-        let value = self.debug_eval_value(expression, line)?;
-        Ok(DebugValue {
-            value: value.debug_preview(DEBUG_VALUE_CHARS),
-            ty: value.type_name(),
+    /// 「出错时中断」：没有 `On Error` 处理时，先把这条错误交给调试器停一下。
+    ///
+    /// 用户在暂停中点了「停止」就换成 [`debug::STOPPED_MESSAGE`] 收场；点「继续」则照常抛错。
+    fn debug_break_on_error(&mut self, error: &RuntimeError) -> Result<(), RuntimeError> {
+        if self.evaluating || self.debug.is_none() {
+            return Ok(());
+        }
+        let Some(control) = self.debug.clone() else {
+            return Ok(());
+        };
+        if !control.break_on_error() {
+            return Ok(());
+        }
+        let line = error.line;
+        let depth = self.frames.len();
+        let message = error.message.to_string();
+        let mut query = |request: DebugQuery<'_>| match request {
+            DebugQuery::Snapshot(frame) => DebugReply::Snapshot(self.debug_snapshot(line, frame)),
+            DebugQuery::Evaluate { frame, expression } => {
+                DebugReply::Value(self.debug_evaluate(frame, expression, line))
+            }
+            DebugQuery::Condition(expression) => {
+                DebugReply::Condition(self.debug_condition(expression, line))
+            }
+            DebugQuery::Assign {
+                frame,
+                target,
+                value,
+            } => DebugReply::Value(self.debug_assign(frame, target, value, line)),
+        };
+        if control.before_error(line, &message, depth, &mut query) == DebugSignal::Stop {
+            return Err(RuntimeError::new(debug::STOPPED_MESSAGE, line));
+        }
+        Ok(())
+    }
+
+    /// 暂停期间给变量赋值（界面的「设置变量值…」）：先求值右侧，再写回同名变量。
+    ///
+    /// `frame` 是要赋值的那一层调用栈（0 = 模块/最外层）：外层过程里的局部变量也能改。
+    /// 只支持变量名（模块级、过程内的局部变量与 `Static`），不支持字段/数组元素——
+    /// 那两种写法在暂停时用监视表达式读就够了，写回去要额外处理字段槽与下标越界。
+    fn debug_assign(
+        &mut self,
+        frame: usize,
+        target: &str,
+        value: &str,
+        line: usize,
+    ) -> Result<DebugValue, String> {
+        let target = target.trim();
+        if target.is_empty() {
+            return Err("变量名不能为空".to_string());
+        }
+        let target = target.to_string();
+        let value = value.to_string();
+        self.with_debug_frame(frame, move |runtime| {
+            runtime.debug_assign_here(&target, &value, line)
         })
     }
 
-    /// 求值条件断点的条件。
+    /// 已站到目标调用层上：求值右侧并写回，再回读一次（类型转换已经生效）。
+    fn debug_assign_here(
+        &mut self,
+        target: &str,
+        value: &str,
+        line: usize,
+    ) -> Result<DebugValue, String> {
+        if self.find_slot(target).is_none() {
+            return Err(format!("没有名为 `{target}` 的变量"));
+        }
+        let value = self.debug_eval_value(value, line)?;
+        self.set_var(target, value, line, None)
+            .map_err(|error| error.message.to_string())?;
+        // 回读一次：`set_var` 会按变量声明类型做转换（`Long` 收到 1.5 会变成 2）。
+        match self.lookup_slot(target).map(|slot| slot.value()) {
+            Some(value) => Ok(DebugValue {
+                value: value.debug_preview(DEBUG_VALUE_CHARS),
+                ty: value.type_name(),
+            }),
+            None => Err(format!("没有名为 `{target}` 的变量")),
+        }
+    }
+
+    /// 在暂停处求值一条监视表达式，给出显示文本与类型名。
+    ///
+    /// `frame` 是要站到哪一层调用栈上去求值（0 = 模块/最外层）。
+    fn debug_evaluate(
+        &mut self,
+        frame: usize,
+        expression: &str,
+        line: usize,
+    ) -> Result<DebugValue, String> {
+        let expression = expression.to_string();
+        self.with_debug_frame(frame, move |runtime| {
+            let value = runtime.debug_eval_value(&expression, line)?;
+            Ok(DebugValue {
+                value: value.debug_preview(DEBUG_VALUE_CHARS),
+                ty: value.type_name(),
+            })
+        })
+    }
+
+    /// 求值条件断点的条件（总在最内层求值：它就是正在执行的那一层）。
     fn debug_condition(&mut self, expression: &str, line: usize) -> Result<bool, String> {
         let value = self.debug_eval_value(expression, line)?;
         value.to_bool()
@@ -995,28 +1113,53 @@ impl<'p, 'o> Runtime<'p, 'o> {
         outcome.map_err(|error| error.message.to_string())
     }
 
-    fn debug_snapshot(&self, line: usize) -> DebugSnapshot {
+    /// 站在指定调用层上做一件事：先临时把更深的帧摘下来，事后再原样放回去。
+    ///
+    /// 变量查找（`find_slot`/`lookup_slot`/`scope_mut`）认的都是栈顶帧，
+    /// 「看外层过程的变量」最快的就是让那一层暂时成为栈顶。
+    fn with_debug_frame<R>(&mut self, frame: usize, action: impl FnOnce(&mut Self) -> R) -> R {
+        let frame = frame.min(self.frames.len());
+        let deeper = self.frames.split_off(frame);
+        let outcome = action(self);
+        // 求值出错时可能留下半层帧，先截回目标层再放回外层，别把栈弄乱。
+        if self.frames.len() > frame {
+            self.frames.truncate(frame);
+        }
+        self.frames.extend(deeper);
+        outcome
+    }
+
+    /// 取指定调用层（`call_stack` 下标，0 = 模块/最外层）的变量与位置快照。
+    fn debug_snapshot(&self, line: usize, frame: usize) -> DebugSnapshot {
+        let depth = self.frames.len();
+        let frame = frame.min(depth);
+        // 选中的那一层；`None` 表示模块级（`frames` 里没有对应项）。
+        let selected = if frame > 0 {
+            self.frames.get(frame - 1)
+        } else {
+            None
+        };
+        let procedure = match selected {
+            Some(inner) => inner
+                .procedure
+                .map(str::to_string)
+                .unwrap_or_else(|| "过程".to_string()),
+            None => "模块".to_string(),
+        };
         let mut variables = Vec::new();
         for (name, slot) in &self.globals {
             variables.push(DebugVariable {
                 scope: "模块".to_string(),
-                name: name.clone(),
+                name: name.to_string(),
                 ty: slot.ty().name().to_string(),
                 value: slot.value().debug_preview(DEBUG_VALUE_CHARS),
             });
         }
-        let procedure = match self.frames.last() {
-            Some(frame) => frame
-                .procedure
-                .clone()
-                .unwrap_or_else(|| "过程".to_string()),
-            None => "模块".to_string(),
-        };
-        if let Some(frame) = self.frames.last() {
-            for (name, slot) in &frame.locals {
+        if let Some(selected) = selected {
+            for (name, slot) in &selected.locals {
                 variables.push(DebugVariable {
                     scope: procedure.clone(),
-                    name: name.clone(),
+                    name: name.to_string(),
                     ty: slot.ty().name().to_string(),
                     value: slot.value().debug_preview(DEBUG_VALUE_CHARS),
                 });
@@ -1031,15 +1174,15 @@ impl<'p, 'o> Runtime<'p, 'o> {
         // 调用栈：从内往外走，每一层的行号由它的调用者给出。
         let mut call_stack = Vec::new();
         let mut caller_line = line;
-        for frame in self.frames.iter().rev() {
+        for inner in self.frames.iter().rev() {
             call_stack.push(debug::CallFrame {
-                procedure: frame
+                procedure: inner
                     .procedure
-                    .clone()
+                    .map(str::to_string)
                     .unwrap_or_else(|| "过程".to_string()),
                 line: caller_line,
             });
-            caller_line = frame.call_line;
+            caller_line = inner.call_line;
         }
         call_stack.push(debug::CallFrame {
             procedure: "模块".to_string(),
@@ -1047,11 +1190,17 @@ impl<'p, 'o> Runtime<'p, 'o> {
         });
         call_stack.reverse();
 
+        // 选中的那一层不是最内层时，快照里的行号换成它的调用处：
+        // 编辑器的高亮与「运行到光标处」都跟着这一行走。
+        let frame_line = call_stack.get(frame).map_or(line, |selected| selected.line);
+
         DebugSnapshot {
-            line,
+            line: frame_line,
             procedure,
             variables,
             call_stack,
+            frame,
+            error: None,
         }
     }
 
@@ -1069,7 +1218,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         let mut gosub_returns = Vec::new();
         while index < stmts.len() {
             // COM 事件在语句边界分派：回调里只排队，避免重入解释器。
-            self.drain_com_events()?;
+            self.pump_com_events()?;
             match self.exec(&stmts[index]) {
                 Ok(Flow::Normal) => index += 1,
                 Ok(Flow::Goto(label)) => match find_label(stmts, &label) {
@@ -1141,7 +1290,15 @@ impl<'p, 'o> Runtime<'p, 'o> {
                         }
                     }
                     // 嵌套块里遇到 `On Error GoTo`：交给根块统一跳转。
-                    _ => return Err(error),
+                    Some(ErrorMode::Goto(_)) => return Err(error),
+                    // 没有人处理：脚本本来要中止。调试器开着「出错时中断」时先停在出错行，
+                    // 让用户看一眼变量再决定继续（继续后照样抛错、脚本结束）。
+                    None | Some(ErrorMode::Disabled) => {
+                        if is_root {
+                            self.debug_break_on_error(&error)?;
+                        }
+                        return Err(error);
+                    }
                 },
             }
         }
@@ -1178,7 +1335,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                                 *line,
                             )
                         })?;
-                        if let Some(existing) = frame.locals.get(&item.name) {
+                        if let Some(existing) = frame.locals.get(item.name.as_str()) {
                             if existing.declared_at == *line {
                                 continue;
                             }
@@ -1187,7 +1344,9 @@ impl<'p, 'o> Runtime<'p, 'o> {
                                 *line,
                             ));
                         }
-                        frame.locals.insert(item.name.clone(), slot);
+                        frame
+                            .locals
+                            .insert(std::borrow::Cow::Owned(item.name.clone()), slot);
                     } else if !self.declare_slot(&item.name, value.clone(), slot_ty, *line)? {
                         // 同一条 `Dim` 又跑了一遍（循环体里）：变量保留，初值重新算。
                         if item.initializer.is_some() {
@@ -1274,8 +1433,10 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 let coerced = value
                     .coerce(*ty)
                     .map_err(|message| RuntimeError::from_coerce(message, *line))?;
-                self.scope_mut()
-                    .insert(name.clone(), Slot::constant(coerced, *ty));
+                self.scope_mut().insert(
+                    std::borrow::Cow::Owned(name.clone()),
+                    Slot::constant(coerced, *ty),
+                );
                 Ok(Flow::Normal)
             }
             Stmt::Assign {
@@ -1327,7 +1488,36 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     ));
                 }
                 let current = slot.value();
-                if let Ok(entries) = current.as_dictionary() {
+                // 数组是最常见的情形，先判它：`as_dictionary()` 在「不是字典」时会构造一条错误字符串，
+                // 放在前面等于每次数组赋值都白分配一次。
+                if let Value::Array(array) = &current {
+                    let indices = self.eval_indices(indices, *line)?;
+                    if self.count_stats {
+                        self.stats.array_accesses += 1;
+                    }
+                    // `Variant` 数组要记下元素的内容类型（`arr(0) = CByte(9)` 之后 `VarType(arr(0))` 是 17）。
+                    let narrow = if array.borrow().element_type() == VbType::Variant {
+                        self.narrow_of(Some(rhs))
+                    } else {
+                        None
+                    };
+                    array
+                        .borrow_mut()
+                        .set(&indices, value, narrow)
+                        .map_err(|message| {
+                            if message.contains("溢出") {
+                                RuntimeError::from_coerce(
+                                    format!("数组 `{name}`：{message}"),
+                                    *line,
+                                )
+                            } else {
+                                RuntimeError::new(format!("数组 `{name}`：{message}"), *line)
+                                    .with_number(9)
+                            }
+                        })?;
+                    return Ok(Flow::Normal);
+                }
+                if let Some(entries) = current.dictionary_rc() {
                     // `d("键") = 值`：字典按键写入（不存在则新增）。
                     let key = match indices.as_slice() {
                         [single] => self.eval(single, *line)?,
@@ -1357,31 +1547,10 @@ impl<'p, 'o> Runtime<'p, 'o> {
                         })?;
                     return Ok(Flow::Normal);
                 }
-                let indices = self.eval_indices(indices, *line)?;
-                if self.count_stats {
-                    self.stats.array_accesses += 1;
-                }
-                let array = current
-                    .as_array()
-                    .map_err(|message| RuntimeError::new(format!("`{name}` {message}"), *line))?;
-                // `Variant` 数组要记下元素的内容类型（`arr(0) = CByte(9)` 之后 `VarType(arr(0))` 是 17）。
-                let narrow = if array.borrow().element_type() == VbType::Variant {
-                    self.narrow_of(Some(rhs))
-                } else {
-                    None
-                };
-                array
-                    .borrow_mut()
-                    .set(&indices, value, narrow)
-                    .map_err(|message| {
-                        if message.contains("溢出") {
-                            RuntimeError::from_coerce(format!("数组 `{name}`：{message}"), *line)
-                        } else {
-                            RuntimeError::new(format!("数组 `{name}`：{message}"), *line)
-                                .with_number(9)
-                        }
-                    })?;
-                Ok(Flow::Normal)
+                let _ = self.eval_indices(indices, *line)?;
+                // 其余类型（数字/字符串/空）按原样报「不是数组」，与改动前一致。
+                let message = current.as_array().err().unwrap_or_default();
+                Err(RuntimeError::new(format!("`{name}` {message}"), *line))
             }
             Stmt::AssignMember {
                 base,
@@ -1435,24 +1604,24 @@ impl<'p, 'o> Runtime<'p, 'o> {
             } => {
                 let root = self.eval(base, *line)?;
                 if matches!(root, Value::ComObject(_)) {
-                    // 中间层按属性读出来（`rs.Fields`），再分两种情形：
-                    // `d.Item("k") = v` 走索引属性写入，`rs.Fields("id").Value = v` 则读出中间对象再设成员。
-                    let mut target = root.clone();
-                    for member in &path[..path.len().saturating_sub(1)] {
-                        target = self.read_member(&Expr::Literal(target), member, *line)?;
-                    }
-                    let Some(member) = path.last().cloned() else {
-                        return Err(RuntimeError::new("缺少成员名", *line));
-                    };
-                    let Value::ComObject(com) = &target else {
-                        return Err(RuntimeError::new("COM 索引属性的目标不是对象", *line));
-                    };
-                    let mut index_values = Vec::with_capacity(indices.len());
-                    for expr in indices {
-                        index_values.push(self.eval(expr, *line)?);
-                    }
-                    let value = self.eval(value, *line)?;
+                    // 只有一级（`d.Item("k") = v`）时走索引属性写入；
+                    // 后面还有成员（`rs.Fields("id").Value = v`）就把这一级当调用读出对象再往下写。
                     if member_path.is_empty() {
+                        let mut target = root.clone();
+                        for member in &path[..path.len().saturating_sub(1)] {
+                            target = self.read_member(&Expr::Literal(target), member, *line)?;
+                        }
+                        let Some(member) = path.last().cloned() else {
+                            return Err(RuntimeError::new("缺少成员名", *line));
+                        };
+                        let Value::ComObject(com) = &target else {
+                            return Err(RuntimeError::new("COM 索引属性的目标不是对象", *line));
+                        };
+                        let mut index_values = Vec::with_capacity(indices.len());
+                        for expr in indices {
+                            index_values.push(self.eval(expr, *line)?);
+                        }
+                        let value = self.eval(value, *line)?;
                         com.set_indexed(&member, &index_values, &value)
                             .map_err(|failure| {
                                 RuntimeError::new(failure.message, *line)
@@ -1460,33 +1629,25 @@ impl<'p, 'o> Runtime<'p, 'o> {
                             })?;
                         return Ok(Flow::Normal);
                     }
-                    let mut nested =
-                        self.call_com_with_values(com, &member, index_values, *line)?;
-                    for step in &member_path[..member_path.len() - 1] {
-                        nested = self.read_member(&Expr::Literal(nested), step, *line)?;
-                    }
-                    let last = member_path.last().cloned().unwrap_or_default();
-                    let Value::ComObject(object) = &nested else {
-                        return Err(RuntimeError::new(
-                            format!("`{last}` 所在的值不是 COM 对象"),
-                            *line,
-                        )
-                        .with_number(424));
-                    };
-                    object.set(&last, &value).map_err(|failure| {
-                        RuntimeError::new(failure.message, *line).with_number(failure.number)
-                    })?;
+                    let container = self.read_member_chain(root, path, indices, *line)?;
+                    self.assign_through_members(container, member_path, value, *set_op, *line)?;
                     return Ok(Flow::Normal);
                 }
                 if let Value::Class(instance) = &root {
-                    self.assign_instance_index(
-                        &instance.0,
-                        path.first().map(String::as_str).unwrap_or_default(),
-                        indices,
-                        value,
-                        *set_op,
-                        *line,
-                    )?;
+                    if member_path.is_empty() {
+                        self.assign_instance_index(
+                            &instance.0,
+                            path.first().map(String::as_str).unwrap_or_default(),
+                            indices,
+                            value,
+                            *set_op,
+                            *line,
+                        )?;
+                    } else {
+                        // `obj.Method(实参).Prop = v` / `obj.Prop(1).Sub = v`：先调用再赋值。
+                        let container = self.read_member_chain(root, path, indices, *line)?;
+                        self.assign_through_members(container, member_path, value, *set_op, *line)?;
+                    }
                     return Ok(Flow::Normal);
                 }
                 let indices = self.eval_indices(indices, *line)?;
@@ -1533,33 +1694,97 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 }
                 Ok(Flow::Normal)
             }
-            Stmt::AssignWithMember { path, value, line } => {
+            Stmt::AssignWithMember {
+                path,
+                indices,
+                member_path,
+                value,
+                set_op,
+                line,
+            } => {
                 let Some(root) = self.with_stack.last().cloned() else {
                     return Err(RuntimeError::new(
                         "`.成员` 赋值只能出现在 `With` 块内",
                         *line,
                     ));
                 };
-                let value = self.eval(value, *line)?;
-                match &root {
-                    Value::ComObject(object) if path.len() == 1 => {
-                        object.set(&path[0], &value).map_err(|failure| {
-                            RuntimeError::new(failure.message, *line).with_number(failure.number)
-                        })?;
+                if indices.is_empty() && member_path.is_empty() {
+                    match &root {
+                        Value::ComObject(object) if path.len() == 1 => {
+                            let value = self.eval(value, *line)?;
+                            object.set(&path[0], &value).map_err(|failure| {
+                                RuntimeError::new(failure.message, *line)
+                                    .with_number(failure.number)
+                            })?;
+                        }
+                        Value::ComObject(_) => {
+                            // `With rs : .Fields.Value = v`：中间层按属性读出来再设最后一层。
+                            let Some((last, parents)) = path.split_last() else {
+                                return Err(RuntimeError::new("缺少成员名", *line));
+                            };
+                            let container = self.read_member_chain(root, parents, &[], *line)?;
+                            self.assign_through_members(
+                                container,
+                                std::slice::from_ref(last),
+                                value,
+                                *set_op,
+                                *line,
+                            )?;
+                        }
+                        Value::Class(instance) => {
+                            self.assign_instance_member(&instance.0, path, value, *set_op, *line)?;
+                        }
+                        _ => {
+                            let value = self.eval(value, *line)?;
+                            self.assign_member(root, path, value, None, *line)?;
+                        }
                     }
-                    Value::ComObject(_) => {
-                        return Err(RuntimeError::new("COM 属性暂不支持链式成员赋值", *line));
+                    return Ok(Flow::Normal);
+                }
+                // `.Prop(1) = v` / `.Fields("id").Value = v`：先走完前几层成员。
+                let Some((member, parents)) = path.split_last() else {
+                    return Err(RuntimeError::new("缺少成员名", *line));
+                };
+                let mut container = root;
+                for step in parents {
+                    container = self.read_member(&Expr::Literal(container), step, *line)?;
+                }
+                if member_path.is_empty() {
+                    match &container {
+                        Value::ComObject(object) => {
+                            let mut values = Vec::with_capacity(indices.len());
+                            for expr in indices {
+                                values.push(self.eval(expr, *line)?);
+                            }
+                            let value = self.eval(value, *line)?;
+                            object
+                                .set_indexed(member, &values, &value)
+                                .map_err(|failure| {
+                                    RuntimeError::new(failure.message, *line)
+                                        .with_number(failure.number)
+                                })?;
+                        }
+                        Value::Class(instance) => {
+                            self.assign_instance_index(
+                                &instance.0,
+                                member,
+                                indices,
+                                value,
+                                *set_op,
+                                *line,
+                            )?;
+                        }
+                        _ => {
+                            return Err(RuntimeError::new(
+                                format!("`.{member}(...)` 赋值的对象不是类或 COM 对象"),
+                                *line,
+                            )
+                            .with_number(438));
+                        }
                     }
-                    Value::Class(instance) => {
-                        self.assign_instance_member(
-                            &instance.0,
-                            path,
-                            &Expr::Literal(value),
-                            true,
-                            *line,
-                        )?;
-                    }
-                    _ => self.assign_member(root, path, value, None, *line)?,
+                } else {
+                    let nested = self.read_member_step(container, member, indices, *line)?;
+                    self.assign_through_members(nested, member_path, value, *set_op, *line)?;
                 }
                 Ok(Flow::Normal)
             }
@@ -1625,7 +1850,11 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     && !value.is_dictionary()
                     && !matches!(
                         value,
-                        Value::Class(_) | Value::ComObject(_) | Value::Picture(_) | Value::Empty
+                        Value::Class(_)
+                            | Value::ComObject(_)
+                            | Value::Picture(_)
+                            | Value::Empty
+                            | Value::Nothing
                     )
                 {
                     return Err(RuntimeError::new(
@@ -1634,6 +1863,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     ));
                 }
                 if self.find_slot(target).is_none() {
+                    // `target` 借自语句本身，活不过 `'p`，这里复制一份名字。
                     self.declare(target, VbType::Object, *line)?;
                 }
                 self.connect_events_for_name(target, &value, *line)?;
@@ -1665,8 +1895,21 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     target = self.read_member(&Expr::Literal(target), member, *line)?;
                 }
                 if let Value::Class(instance) = &target {
-                    self.call_class_method(&instance.0, &method, args, *line)?;
-                    return Ok(Flow::Normal);
+                    match self.call_class_method(&instance.0, &method, args, *line) {
+                        Ok(_) => return Ok(Flow::Normal),
+                        Err(error) => {
+                            // `h.Value`（实例字段）单独成句：VB6 会报「缺少子程序、函数或属性」，
+                            // QIDE 宽容地读一次、丢掉结果。没有这个方法时按字段读一次。
+                            if !args.is_empty()
+                                || self
+                                    .read_member(&Expr::Literal(target.clone()), &method, *line)
+                                    .is_err()
+                            {
+                                return Err(error);
+                            }
+                            return Ok(Flow::Normal);
+                        }
+                    }
                 }
                 if let Value::ComObject(object) = &target {
                     self.call_com_member(object, &method, args, *line)?;
@@ -1676,7 +1919,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 for expr in args {
                     values.push(self.eval(expr, *line)?);
                 }
-                if let Ok(collection) = target.as_collection() {
+                if let Some(collection) = target.collection_rc() {
                     match method.as_str() {
                         "add" => {
                             let Some(item) = values.first() else {
@@ -1712,7 +1955,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     }
                     return Ok(Flow::Normal);
                 }
-                if let Ok(entries) = target.as_dictionary() {
+                if let Some(entries) = target.dictionary_rc() {
                     match method.as_str() {
                         "add" => {
                             if values.len() != 2 {
@@ -1747,6 +1990,25 @@ impl<'p, 'o> Runtime<'p, 'o> {
                         }
                     }
                     return Ok(Flow::Normal);
+                }
+                // `p.X` 这种「裸字段读取」单独成句：VB6 会报「缺少子程序、函数或属性」，
+                // QIDE 宽容地按「读出来再丢掉」处理。只在没有实参时回退
+                // （`x.Add 1` 仍报「不是 Collection」）。
+                if args.is_empty() {
+                    let mut value = slot.value();
+                    let mut read = true;
+                    for member in path {
+                        match self.read_member(&Expr::Literal(value), member, *line) {
+                            Ok(next) => value = next,
+                            Err(_) => {
+                                read = false;
+                                break;
+                            }
+                        }
+                    }
+                    if read {
+                        return Ok(Flow::Normal);
+                    }
                 }
                 Err(RuntimeError::new(
                     format!("`{object}` 不是 `Collection` 或 `Dictionary`，不能调用 `{method}`"),
@@ -1837,6 +2099,11 @@ impl<'p, 'o> Runtime<'p, 'o> {
             }
             Stmt::GosubReturn { .. } => Ok(Flow::GosubReturn),
             Stmt::Halt { .. } => Ok(Flow::Halt),
+            // 单独成句的表达式：求值后丢掉结果（比 VB6 宽，VB6 `/make` 实测这类写法编译不过）。
+            Stmt::Eval { expr, line } => {
+                self.eval(expr, *line)?;
+                Ok(Flow::Normal)
+            }
             Stmt::Label(..) => Ok(Flow::Normal),
             Stmt::Goto(label, _) => Ok(Flow::Goto(label.clone())),
             Stmt::Gosub(label, _) => Ok(Flow::Gosub(label.clone())),
@@ -1913,7 +2180,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                             RuntimeError::new(format!("无法创建 `{path}`：{error}"), *line)
                                 .with_number(open_error_number(&error, &resolved))
                         })?;
-                        FileHandle::Writer(FileWriter::new(file))
+                        FileHandle::Writer(FileWriter::new(file, 2))
                     }
                     FileMode::Append => {
                         let file = OpenOptions::new()
@@ -1924,7 +2191,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                                 RuntimeError::new(format!("无法追加 `{path}`：{error}"), *line)
                                     .with_number(open_error_number(&error, &resolved))
                             })?;
-                        FileHandle::Writer(FileWriter::new(file))
+                        FileHandle::Writer(FileWriter::new(file, 8))
                     }
                     FileMode::Binary | FileMode::Random => {
                         let file = OpenOptions::new()
@@ -2207,7 +2474,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     RuntimeError::new("`Get` 的目标必须是变量、数组元素或记录字段", *line)
                 })?;
                 let current = slot.value();
-                if let Ok(record) = current.as_record() {
+                if let Some(record) = current.record_rc() {
                     // UDT：按结构体布局整块读写。
                     let type_name = Self::record_type_name(&record);
                     let size = ffi::record_size(&type_name, &self.types)
@@ -2443,7 +2710,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         line: usize,
     ) -> Result<Flow, RuntimeError> {
         let value = self.eval(collection, line)?;
-        if let Ok(items) = value.as_collection() {
+        if let Some(items) = value.collection_rc() {
             let snapshot = items.borrow().values_with_types();
             for (item, narrow) in snapshot {
                 self.tick(line)?;
@@ -2456,7 +2723,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
             }
             return Ok(Flow::Normal);
         }
-        if let Ok(entries) = value.as_dictionary() {
+        if let Some(entries) = value.dictionary_rc() {
             // `For Each` 遍历 Scripting.Dictionary 时取「键」，按插入顺序（本机 VB6 实测）；
             // 要遍历值请写 `For Each v In d.Items`。
             let snapshot = entries.borrow().keys();
@@ -2472,17 +2739,41 @@ impl<'p, 'o> Runtime<'p, 'o> {
             return Ok(Flow::Normal);
         }
         if let Value::ComObject(object) = &value {
-            // COM 集合：走 `_NewEnum`（`IEnumVARIANT`）取元素快照，再按普通集合遍历。
-            let mut enumerator = object.items().map_err(|failure| {
-                RuntimeError::new(failure.message, line).with_number(failure.number)
-            })?;
-            let mut snapshot = Vec::new();
-            while let Some(item) = enumerator.next().map_err(|failure| {
-                RuntimeError::new(failure.message, line).with_number(failure.number)
-            })? {
-                snapshot.push(item);
-            }
-            for item in snapshot {
+            // COM 集合：走 `_NewEnum`（`IEnumVARIANT`）拿一个**活枚举器**，每轮 `Next` 取一个，
+            // 与 VB6 一致——循环体里增删集合元素的效果由服务器自己的枚举器决定，
+            // 不是「进循环前先取一份快照」。
+            let mut enumerator = match object.items() {
+                Ok(enumerator) => enumerator,
+                // 本机 VB6 实测（`WScript.Shell` 这种没有 `_NewEnum` 的对象，`On Error Resume Next` 下）：
+                // 循环体照样跑**一次**，此时循环变量保持 `Empty`、`Err.Number` 已经是 438，
+                // 然后 `Next` 报 92（「For 循环未初始化」）——循环体里写了 `Exit For` 也一样。
+                Err(failure)
+                    if failure.number == 438
+                        && matches!(self.error_handler(), Some(ErrorMode::ResumeNext)) =>
+                {
+                    self.last_error =
+                        Some(RuntimeError::new(failure.message, line).with_number(failure.number));
+                    self.tick(line)?;
+                    self.set_iteration_var(var, Value::Empty, None, line)?;
+                    match self.exec_block(body)? {
+                        Flow::Normal | Flow::ExitDo | Flow::ExitFor => {}
+                        other => return Ok(other),
+                    }
+                    return Err(RuntimeError::new(builtins::error_text(92), line).with_number(92));
+                }
+                Err(failure) => {
+                    return Err(
+                        RuntimeError::new(failure.message, line).with_number(failure.number)
+                    );
+                }
+            };
+            loop {
+                let Some(item) = enumerator.next().map_err(|failure| {
+                    RuntimeError::new(failure.message, line).with_number(failure.number)
+                })?
+                else {
+                    break;
+                };
                 self.tick(line)?;
                 self.set_iteration_var(var, item, None, line)?;
                 match self.exec_block(body)? {
@@ -2658,8 +2949,23 @@ impl<'p, 'o> Runtime<'p, 'o> {
         }
     }
 
-    /// 分派已排队的 COM 事件（在语句边界调用，避免在 COM 回调里重入解释器）。
-    fn drain_com_events(&mut self) -> Result<(), RuntimeError> {
+    /// 分派已排队的 COM 事件。
+    ///
+    /// 两个调用点：**语句边界**（COM 回调里不能重入解释器，只能先排队）与 **`DoEvents`**
+    /// （VB6 在消息循环里同步执行事件，所以 `DoEvents` 返回时事件已经处理完了）。
+    /// 处理过程里再进来的调用先跳过，新排队的留到下一次边界，避免递归分派同一条链。
+    fn pump_com_events(&mut self) -> Result<(), RuntimeError> {
+        if self.com_events.is_empty() || self.pumping_events {
+            return Ok(());
+        }
+        self.pumping_events = true;
+        let outcome = self.dispatch_queued_com_events();
+        self.pumping_events = false;
+        outcome
+    }
+
+    /// 取走队列里的事件并逐个调用处理过程（`pump_com_events` 的实体）。
+    fn dispatch_queued_com_events(&mut self) -> Result<(), RuntimeError> {
         if self.com_events.is_empty() {
             return Ok(());
         }
@@ -2758,7 +3064,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
     /// 变长 `String` 直接写字符字节（没有长度前缀，见 VB6 实测）。
     fn encode_put(&mut self, expr: &Expr, line: usize) -> Result<Vec<u8>, RuntimeError> {
         let value = self.eval(expr, line)?;
-        if let Ok(record) = value.as_record() {
+        if let Some(record) = value.record_rc() {
             let type_name = Self::record_type_name(&record);
             return ffi::encode_record(&type_name, &record.borrow(), &self.types)
                 .map_err(|message| RuntimeError::new(format!("`Put` {message}"), line));
@@ -3040,6 +3346,47 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     FileHandle::Writer(_) => Ok(Value::Bool(true)),
                 }
             }
+            "fileattr" => {
+                // `FileAttr(n, returntype)`：VB6 里 `returntype` 只能是 1（返回模式码），
+                // 其它值（包括 2）报错误号 5——但**先查文件号**：没打开时是 52，
+                // 不管 `returntype` 传的是什么（本机实测 `FileAttr(已关闭的文件号, 2)` 是 52）。
+                if !self.files.contains_key(&number) {
+                    return Err(
+                        RuntimeError::new(format!("文件号 #{number} 没有打开"), line)
+                            .with_number(52),
+                    );
+                }
+                let Some(expression) = args.get(1) else {
+                    return Err(RuntimeError::new("`FileAttr` 缺少第 2 个参数", line));
+                };
+                let return_type = self.eval(expression, line)?.as_int().map_err(|message| {
+                    RuntimeError::new(format!("`FileAttr` 的返回值类型：{message}"), line)
+                })?;
+                if return_type != 1 {
+                    return Err(
+                        RuntimeError::new("`FileAttr` 的返回值类型只能是 1", line).with_number(5)
+                    );
+                }
+                let Some(handle) = self.files.get(&number) else {
+                    return Err(
+                        RuntimeError::new(format!("文件号 #{number} 没有打开"), line)
+                            .with_number(52),
+                    );
+                };
+                let mode = match handle {
+                    FileHandle::Reader(_) => 1,
+                    FileHandle::Writer(writer) => writer.mode,
+                    // `For Random` 是 4，`For Binary` 是 32。
+                    FileHandle::Binary(binary) => {
+                        if binary.random {
+                            4
+                        } else {
+                            32
+                        }
+                    }
+                };
+                Ok(Value::Int(mode))
+            }
             "seek" | "loc" => {
                 let Some(handle) = self.files.get_mut(&number) else {
                     return Err(
@@ -3084,6 +3431,57 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 Ok(Value::Int(size as i64))
             }
         }
+    }
+
+    /// `Input(n, #f)`：从 `For Input` 的文本文件里读 `n` 个字符（换行也照读）。
+    ///
+    /// 本机 VB6 实测：剩下的字符不够 `n` 个时报**错误号 62**（输入超出文件尾），赋值不生效。
+    fn input_function(&mut self, args: &[Expr], line: usize) -> Result<Value, RuntimeError> {
+        let Some(count_expr) = args.first() else {
+            return Err(RuntimeError::new("`Input` 缺少第 1 个参数", line));
+        };
+        let count = self
+            .eval(count_expr, line)?
+            .as_int()
+            .map_err(|message| RuntimeError::new(format!("`Input` 的字符数：{message}"), line))?;
+        let count = usize::try_from(count.max(0)).unwrap_or(usize::MAX);
+        let Some(number_expr) = args.get(1) else {
+            return Err(RuntimeError::new("`Input` 缺少第 2 个参数", line));
+        };
+        let number = self.file_number(number_expr, line)?;
+        let Some(handle) = self.files.get_mut(&number) else {
+            return Err(
+                RuntimeError::new(format!("文件号 #{number} 没有打开"), line).with_number(52),
+            );
+        };
+        let reader = match handle {
+            FileHandle::Reader(reader) => reader,
+            // 本机 VB6 实测：`For Binary` 的文件上 `Input(n, #f)` 不报错、返回空串；
+            // `For Output` / `For Append` 才报 54（文件模式错误）。
+            FileHandle::Binary(_) => return Ok(Value::Str(String::new())),
+            FileHandle::Writer(_) => {
+                return Err(
+                    RuntimeError::new(format!("文件号 #{number} 不是以 Input 打开"), line)
+                        .with_number(54),
+                );
+            }
+        };
+        let mut text = String::new();
+        for _ in 0..count {
+            match read_char(reader) {
+                Ok(Some(ch)) => text.push(ch),
+                Ok(None) => {
+                    return Err(RuntimeError::new("输入超出文件尾", line).with_number(62));
+                }
+                Err(error) => {
+                    return Err(
+                        RuntimeError::new(format!("读取 #{number} 失败：{error}"), line)
+                            .with_number(io_error_number(&error)),
+                    );
+                }
+            }
+        }
+        Ok(Value::Str(text))
     }
 
     /// 求维度表达式并换算成 `(下界, 元素数)`。
@@ -3224,7 +3622,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
     }
 
     /// 裸调用同类成员时沿用的局部变量（实例变量 + `Me`）。
-    fn current_instance_locals(&self) -> FastMap<String, Slot> {
+    fn current_instance_locals(&self) -> FastMap<std::borrow::Cow<'p, str>, Slot> {
         match self.current_instance() {
             Some(instance) => Self::instance_locals(&instance),
             None => FastMap::default(),
@@ -3245,7 +3643,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         );
         for field in instance.fields() {
             locals.insert(
-                field.name.clone(),
+                field.name.clone().into(),
                 Slot::from_cell(field.cell.clone(), field.ty),
             );
         }
@@ -3311,7 +3709,9 @@ impl<'p, 'o> Runtime<'p, 'o> {
     }
 
     /// 类方法执行时的起始局部变量：实例变量（共享存储）+ `Me`。
-    fn instance_locals(instance: &Rc<RefCell<VbInstance>>) -> FastMap<String, Slot> {
+    fn instance_locals(
+        instance: &Rc<RefCell<VbInstance>>,
+    ) -> FastMap<std::borrow::Cow<'p, str>, Slot> {
         let borrowed = instance.borrow();
         let fields = borrowed.fields();
         // 预分配容量，避免字段较多时反复扩容。
@@ -3321,7 +3721,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         );
         for field in fields {
             locals.insert(
-                field.name.clone(),
+                field.name.clone().into(),
                 Slot::from_cell_with_narrow(field.cell.clone(), field.ty, field.narrow.clone()),
             );
         }
@@ -3443,16 +3843,14 @@ impl<'p, 'o> Runtime<'p, 'o> {
         line: usize,
     ) -> Result<(), RuntimeError> {
         if path.len() > 1 {
-            // `obj.Inner.X = 值`：先把第一层取出来，再交给记录赋值。
-            let inner = self.read_instance_member(instance, &path[0], line)?;
-            if !inner.is_record() {
-                return Err(RuntimeError::new(
-                    format!("`{}` 不是记录类型，不能继续访问 `{}`", path[0], path[1]),
-                    line,
-                ));
+            // `obj.Inner.X = 值` / `obj.Self2.Value = 值`：先把第一层取出来，
+            // 再按取到的容器（类 / COM / 记录）继续往下写。
+            let mut current = Value::Class(ClassRef(instance.clone()));
+            for step in &path[..path.len() - 1] {
+                current = self.read_member(&Expr::Literal(current), step, line)?;
             }
-            let value = self.eval(value, line)?;
-            return self.assign_member(inner, &path[1..], value, None, line);
+            let last = path.last().expect("path 长度大于 1");
+            return self.assign_value_member(current, last, value, set_op, line);
         }
         let name = path
             .first()
@@ -3534,6 +3932,107 @@ impl<'p, 'o> Runtime<'p, 'o> {
         }
         let display = instance.borrow().type_name().to_string();
         Err(RuntimeError::new(format!("类 `{display}` 没有成员 `{name}`"), line).with_number(438))
+    }
+
+    /// 成员链的中间一层：`obj.A.B` / `obj.Method(实参).B` 里把这一段读成值。
+    ///
+    /// 带括号（`indices` 非空，或上游解析出空括号）表示**调用**；不带括号按成员读，
+    /// 与表达式里 `obj.Self2()` / `obj.Self3` 的规则一致。
+    fn read_member_step(
+        &mut self,
+        current: Value,
+        name: &str,
+        indices: &[Expr],
+        line: usize,
+    ) -> Result<Value, RuntimeError> {
+        if indices.is_empty() {
+            return self.read_member(&Expr::Literal(current), name, line);
+        }
+        match &current {
+            Value::Class(instance) => self.call_class_method(&instance.0, name, indices, line),
+            Value::ComObject(object) => {
+                let mut values = Vec::with_capacity(indices.len());
+                for expr in indices {
+                    values.push(self.eval(expr, line)?);
+                }
+                self.call_com_with_values(object, name, values, line)
+            }
+            _ => Err(
+                RuntimeError::new(format!("值不是对象，不能调用 `{name}(...)`"), line)
+                    .with_number(438),
+            ),
+        }
+    }
+
+    /// 把值写到容器（类实例 / COM 对象 / 记录）的 `name` 成员上。
+    fn assign_value_member(
+        &mut self,
+        container: Value,
+        name: &str,
+        value: &Expr,
+        set_op: bool,
+        line: usize,
+    ) -> Result<(), RuntimeError> {
+        match &container {
+            Value::Class(instance) => {
+                self.assign_instance_member(&instance.0, &[name.to_string()], value, set_op, line)
+            }
+            Value::ComObject(object) => {
+                let value = self.eval(value, line)?;
+                object.set(name, &value).map_err(|failure| {
+                    RuntimeError::new(failure.message, line).with_number(failure.number)
+                })
+            }
+            _ => {
+                if !container.is_record() {
+                    return Err(RuntimeError::new(
+                        format!("不能给 `{name}` 赋值：所在的值不是对象或记录"),
+                        line,
+                    )
+                    .with_number(424));
+                }
+                let narrow = self.narrow_of(Some(value));
+                let value = self.eval(value, line)?;
+                self.assign_member(container, &[name.to_string()], value, narrow, line)
+            }
+        }
+    }
+
+    /// 走完成员路径（最后一段带 `indices`，空括号也算调用）拿到链中间的对象。
+    fn read_member_chain(
+        &mut self,
+        root: Value,
+        path: &[String],
+        indices: &[Expr],
+        line: usize,
+    ) -> Result<Value, RuntimeError> {
+        let (last, parents) = path
+            .split_last()
+            .ok_or_else(|| RuntimeError::new("缺少成员名", line))?;
+        let mut current = root;
+        for step in parents {
+            current = self.read_member(&Expr::Literal(current), step, line)?;
+        }
+        self.read_member_step(current, last, indices, line)
+    }
+
+    /// 沿 `member_path` 读到最后一级，再把值写上去（`member_path` 至少一级）。
+    fn assign_through_members(
+        &mut self,
+        container: Value,
+        member_path: &[String],
+        value: &Expr,
+        set_op: bool,
+        line: usize,
+    ) -> Result<(), RuntimeError> {
+        let (target, steps) = member_path
+            .split_last()
+            .ok_or_else(|| RuntimeError::new("缺少成员名", line))?;
+        let mut current = container;
+        for step in steps {
+            current = self.read_member(&Expr::Literal(current), step, line)?;
+        }
+        self.assign_value_member(current, target, value, set_op, line)
     }
 
     /// `obj.Prop(下标) = 值` / `Set obj.Prop(下标) = 对象`：交给带参数的 `Property Let/Set`。
@@ -3709,7 +4208,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         }
 
         let value = self.eval(base, line)?;
-        if let Ok(collection) = value.as_collection() {
+        if let Some(collection) = value.collection_rc() {
             return match name {
                 "count" => Ok(Value::Int(collection.borrow().count() as i64)),
                 _ => Err(RuntimeError::new(
@@ -3718,7 +4217,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 )),
             };
         }
-        if let Ok(entries) = value.as_dictionary() {
+        if let Some(entries) = value.dictionary_rc() {
             let entries = entries.borrow();
             return match name {
                 "count" => Ok(Value::Int(entries.count() as i64)),
@@ -3738,7 +4237,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 RuntimeError::new(failure.message, line).with_number(failure.number)
             });
         }
-        if matches!(value, Value::Empty) {
+        if matches!(value, Value::Empty | Value::Nothing) {
             return Err(RuntimeError::new(
                 format!("对象变量还没有 `Set`，不能访问 `.{name}`"),
                 line,
@@ -3973,7 +4472,12 @@ impl<'p, 'o> Runtime<'p, 'o> {
     }
 
     fn eval_condition(&mut self, cond: &Expr, line: usize) -> Result<bool, RuntimeError> {
-        self.eval(cond, line)?
+        let value = self.eval(cond, line)?;
+        // `If Nothing Then` 在 VB6 里是运行时错误 91（不是 `to_bool` 其它失败对应的 13）。
+        if matches!(value, Value::Nothing) {
+            return Err(RuntimeError::new(builtins::error_text(91), line).with_number(91));
+        }
+        value
             .to_bool()
             .map_err(|message| RuntimeError::from_coerce(message, line))
     }
@@ -4009,6 +4513,9 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 "命名参数仅支持 COM Automation 方法调用",
                 line,
             )),
+            // 省略的实参在需要值时就是 `Empty`（内置函数、COM 调用走这里）；
+            // 用户过程的绑定在 `bind_argument` 之前就把它识别成「调用时省略」。
+            Expr::OmittedArg => Ok(Value::Empty),
             Expr::Var(name) => {
                 if self.count_stats {
                     self.stats.variable_reads += 1;
@@ -4042,7 +4549,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 if let Value::ComObject(object) = &root {
                     return self.call_com_member(object, name, indices, line);
                 }
-                if let Ok(collection) = root.as_collection() {
+                if let Some(collection) = root.collection_rc() {
                     let key = match indices.as_slice() {
                         [single] => self.eval(single, line)?,
                         _ => {
@@ -4059,7 +4566,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     self.result_narrow = narrow;
                     return Ok(value);
                 }
-                if let Ok(entries) = root.as_dictionary() {
+                if let Some(entries) = root.dictionary_rc() {
                     let key = match indices.as_slice() {
                         [single] => self.eval(single, line)?,
                         _ => {
@@ -4120,7 +4627,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                         .type_name()
                         .eq_ignore_ascii_case(class_name),
                     Value::ComObject(_) => class_name == "object",
-                    Value::Empty => false,
+                    Value::Empty | Value::Nothing => false,
                     _ => {
                         return Err(
                             RuntimeError::new("`TypeOf` 只能用于对象", line).with_number(424)
@@ -4228,8 +4735,6 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 RuntimeError::new("`CallByName` 需要对象、成员名和调用方式", line).with_number(449),
             );
         }
-        // `Nothing`（声明成对象的变量）与空 `Variant` 在 VB6 里错号不同：5 / 424。
-        let object_is_object = matches!(self.static_type(object_expr), Some(VbType::Object));
         let object = self.eval(object_expr, line)?;
         let name = self.eval(&rest[0], line)?.to_display().to_lowercase();
         let call_type = self
@@ -4250,9 +4755,8 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 4 | 8 => self.com_put_member(object, &name, call_args, line),
                 _ => self.call_com_member(object, &name, call_args, line),
             },
-            Value::Empty if object_is_object => {
-                Err(RuntimeError::new(builtins::error_text(5), line).with_number(5))
-            }
+            // 声明成对象的变量（`Nothing`）报 5，空 `Variant` 报 424（本机 VB6 实测）。
+            Value::Nothing => Err(RuntimeError::new(builtins::error_text(5), line).with_number(5)),
             _ => Err(RuntimeError::new(builtins::error_text(424), line).with_number(424)),
         }
     }
@@ -4414,7 +4918,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         }
         let value = self.eval(expr, line)?;
         let pointer = match &value {
-            Value::Empty => 0,
+            Value::Empty | Value::Nothing => 0,
             Value::Class(instance) => std::rc::Rc::as_ptr(&instance.0) as usize as i64,
             Value::Collection(items) => std::rc::Rc::as_ptr(items) as usize as i64,
             Value::Dictionary(entries) => std::rc::Rc::as_ptr(entries) as usize as i64,
@@ -4829,16 +5333,26 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     .map_err(|message| RuntimeError::new(message, line).with_number(429));
             }
             let active_prog_id = match values.as_slice() {
-                [path]
-                    if {
-                        let pathname = path.to_display();
-                        is_moniker_path(&pathname, &self.cwd)
-                    } =>
-                {
-                    let pathname = self.resolve_moniker_path(&path.to_display());
-                    return com::get_object(&pathname, None)
+                [path] => {
+                    let pathname = path.to_display();
+                    if pathname.is_empty() {
+                        // VB6 实测：`GetObject("")` 报 5（路径为空），不是「缺少 ProgID」。
+                        return Err(RuntimeError::new("`GetObject` 的路径不能是空字符串", line)
+                            .with_number(5));
+                    }
+                    // 像路径/moniker 的解析成绝对路径（相对路径按脚本目录）；
+                    // 不像路径的裸名字原样交给 moniker 解析，这样失败号与 VB6 一致
+                    // （`GetObject("hosts")` 是 moniker 语法错误 -2147221020）。
+                    let resolved = if is_moniker_path(&pathname, &self.cwd) {
+                        self.resolve_moniker_path(&pathname)
+                    } else {
+                        pathname.clone()
+                    };
+                    return com::get_object(&pathname, &resolved, None)
                         .map(Value::ComObject)
-                        .map_err(|message| RuntimeError::new(message, line).with_number(429));
+                        .map_err(|failure| {
+                            RuntimeError::new(failure.message, line).with_number(failure.number)
+                        });
                 }
                 [Value::Empty, class] => Some(class.to_display()),
                 [path, class] if path.to_display().is_empty() => {
@@ -4854,18 +5368,14 @@ impl<'p, 'o> Runtime<'p, 'o> {
                         .map(Value::ComObject)
                         .map_err(|message| RuntimeError::new(message, line).with_number(429));
                 }
-                [class] if class.to_display().is_empty() => {
-                    return Err(
-                        RuntimeError::new("`GetObject` 缺少 ProgID 参数", line).with_number(450)
-                    );
-                }
-                [class] => Some(class.to_display()),
                 [path, class] => {
                     let pathname = path.to_display();
-                    let pathname = self.resolve_moniker_path(&pathname);
-                    return com::get_object(&pathname, Some(&class.to_display()))
+                    let resolved = self.resolve_moniker_path(&pathname);
+                    return com::get_object(&pathname, &resolved, Some(&class.to_display()))
                         .map(Value::ComObject)
-                        .map_err(|message| RuntimeError::new(message, line).with_number(429));
+                        .map_err(|failure| {
+                            RuntimeError::new(failure.message, line).with_number(failure.number)
+                        });
                 }
                 [path, class, ..] => {
                     let _ = (path, class);
@@ -4877,7 +5387,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 }
                 _ => {
                     return Err(RuntimeError::new(
-                        "`GetObject` 需要 ProgID，可写 `GetObject(\"ProgID\")` 或 `GetObject(, \"ProgID\")`",
+                        "`GetObject` 需要路径，可写 `GetObject(\"路径\")` 或 `GetObject(, \"ProgID\")`",
                         line,
                     )
                     .with_number(450));
@@ -4897,7 +5407,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
             if value.is_array() {
                 return self.index_array(name, &value, args, line);
             }
-            if let Ok(entries) = value.as_dictionary() {
+            if let Some(entries) = value.dictionary_rc() {
                 // `d("键")`：按键读值。
                 let key = match args {
                     [single] => self.eval(single, line)?,
@@ -4912,7 +5422,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     .get(&key)
                     .map_err(|message| RuntimeError::new(message, line).with_number(9));
             }
-            if let Ok(collection) = value.as_collection() {
+            if let Some(collection) = value.collection_rc() {
                 // `c(1)` / `c("键")`：`Collection` 的默认成员就是 `Item`（VB6 实测可用）。
                 let key = match args {
                     [single] => self.eval(single, line)?,
@@ -4935,8 +5445,14 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 return self.call_com_default(object, args, line);
             }
         }
-        if matches!(name, "eof" | "lof" | "freefile" | "seek" | "loc") {
+        if matches!(
+            name,
+            "eof" | "lof" | "freefile" | "seek" | "loc" | "fileattr"
+        ) {
             return self.file_builtin(name, args, line);
+        }
+        if name == "input" {
+            return self.input_function(args, line);
         }
         // 类方法里可以裸调用同类的成员（VB 的隐式 `Me.`）。
         if let Some(def) = self.current_class()
@@ -4964,6 +5480,13 @@ impl<'p, 'o> Runtime<'p, 'o> {
         // `VarPtr` / `ObjPtr` 也要原始表达式：前者取变量的存储单元，后者取对象实例的身份。
         if name == "varptr" || name == "objptr" {
             return self.pointer_of(name, args, line);
+        }
+        // `DoEvents` 在 VB6 里会把排队的 COM 事件**当场**执行完（事件在消息循环里同步分派），
+        // 所以要在这里拦一道，不能走纯函数的内置函数表。
+        if name == "doevents" {
+            self.pump_com_events()?;
+            ffi::sleep_ms(0);
+            return Ok(Value::Int(0));
         }
         if builtins::is_builtin(name) {
             // `Hex` / `Oct` 的输出宽度跟着实参的静态类型走（`Hex(-1)` 是 16 位、`Hex(-1&)` 是 32 位）。
@@ -5101,7 +5624,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         &mut self,
         procedure: &'p Procedure,
         args: &[Expr],
-        locals: FastMap<String, Slot>,
+        locals: FastMap<std::borrow::Cow<'p, str>, Slot>,
         line: usize,
     ) -> Result<Value, RuntimeError> {
         self.call_user_with_locals_and_by_value_args(procedure, args, locals, &[], line)
@@ -5111,7 +5634,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         &mut self,
         procedure: &'p Procedure,
         args: &[Expr],
-        mut locals: FastMap<String, Slot>,
+        mut locals: FastMap<std::borrow::Cow<'p, str>, Slot>,
         by_value_args: &[bool],
         line: usize,
     ) -> Result<Value, RuntimeError> {
@@ -5153,12 +5676,35 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     values.push((value, narrow));
                 }
                 locals.insert(
-                    param.name.clone(),
+                    param.name.clone().into(),
                     Slot::new(Value::array_with_types(values), VbType::Variant),
                 );
                 continue;
             }
             let slot = match args.get(index) {
+                // `F 1, , 3`：省略的实参按「调用时省略」绑定（`IsMissing` 为真），
+                // 必填形参省略时报 449（VB6 的「参数不可选」）。
+                Some(Expr::OmittedArg) => {
+                    if param.optional {
+                        let slot = self.bind_default(param, line)?;
+                        // `IsMissing` 只对「省略的、没有默认值的 `Variant` 可选形参」为真；
+                        // 带默认值的可选参数按默认值绑定，`IsMissing` 是 False。
+                        if param.ty == VbType::Variant && param.default.is_none() {
+                            slot.omitted_optional()
+                        } else {
+                            slot
+                        }
+                    } else {
+                        return Err(RuntimeError::new(
+                            format!(
+                                "过程 `{}` 的必填参数 `{}` 不能省略",
+                                procedure.name, param.name
+                            ),
+                            line,
+                        )
+                        .with_number(449));
+                    }
+                }
                 Some(expr) => {
                     let slot = self.bind_argument(
                         expr,
@@ -5186,12 +5732,15 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     .with_number(449));
                 }
             };
-            locals.insert(param.name.clone(), slot);
+            locals.insert(std::borrow::Cow::Borrowed(param.name.as_str()), slot);
         }
 
         let result = if procedure.is_function {
             let slot = Slot::new(Value::Empty, procedure.ret);
-            locals.insert(procedure.name.clone(), slot.clone());
+            locals.insert(
+                std::borrow::Cow::Borrowed(procedure.name.as_str()),
+                slot.clone(),
+            );
             Some(slot)
         } else {
             None
@@ -5200,7 +5749,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         self.frames.push(Frame {
             locals,
             result: result.clone(),
-            procedure: Some(procedure.name.clone()),
+            procedure: Some(procedure.name.as_str()),
             call_line: line,
             ..Frame::default()
         });
@@ -5669,7 +6218,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         &mut self,
         procedure: &'p Procedure,
         values: Vec<Value>,
-        locals: FastMap<String, Slot>,
+        locals: FastMap<std::borrow::Cow<'p, str>, Slot>,
     ) -> Result<Value, RuntimeError> {
         self.call_procedure_values_with_params(procedure, values, locals, false)
             .map(|(value, _)| value)
@@ -5679,7 +6228,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         &mut self,
         procedure: &'p Procedure,
         values: Vec<Value>,
-        mut locals: FastMap<String, Slot>,
+        mut locals: FastMap<std::borrow::Cow<'p, str>, Slot>,
         capture_params: bool,
     ) -> Result<(Value, Vec<Value>), RuntimeError> {
         let line = procedure.line;
@@ -5697,11 +6246,17 @@ impl<'p, 'o> Runtime<'p, 'o> {
                 Some(value) => value.copy_value(),
                 None => Value::Empty,
             };
-            locals.insert(param.name.clone(), Self::bind_value(value, param, line)?);
+            locals.insert(
+                std::borrow::Cow::Borrowed(param.name.as_str()),
+                Self::bind_value(value, param, line)?,
+            );
         }
         let result = if procedure.is_function {
             let slot = Slot::new(Value::Empty, procedure.ret);
-            locals.insert(procedure.name.clone(), slot.clone());
+            locals.insert(
+                std::borrow::Cow::Borrowed(procedure.name.as_str()),
+                slot.clone(),
+            );
             Some(slot)
         } else {
             None
@@ -5710,7 +6265,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
         self.frames.push(Frame {
             locals,
             result: result.clone(),
-            procedure: Some(procedure.name.clone()),
+            procedure: Some(procedure.name.as_str()),
             call_line: line,
             ..Frame::default()
         });
@@ -5725,7 +6280,7 @@ impl<'p, 'o> Runtime<'p, 'o> {
                     .map(|param| {
                         frame
                             .locals
-                            .get(&param.name)
+                            .get(param.name.as_str())
                             .map(Slot::value)
                             .unwrap_or(Value::Empty)
                     })
@@ -6199,6 +6754,7 @@ fn stmt_line(stmt: &Stmt) -> usize {
         | Stmt::Set { line, .. }
         | Stmt::CallMethod { line, .. }
         | Stmt::Call { line, .. }
+        | Stmt::Eval { line, .. }
         | Stmt::Print { line, .. }
         | Stmt::If { line, .. }
         | Stmt::For { line, .. }
@@ -6544,8 +7100,12 @@ fn currency_ratio(numerator: i128, denominator: i128) -> Result<i64, String> {
 /// `a Is b`：对象同一性判断（`Nothing` 视作空）。
 fn objects_identical(left: &Value, right: &Value) -> Result<bool, String> {
     Ok(match (left, right) {
-        (Value::Empty, Value::Empty) => true,
-        (Value::Empty, _) | (_, Value::Empty) => false,
+        (Value::Nothing, Value::Nothing) => true,
+        // `Empty` 不是对象：本机 VB6 实测 `Dim v: v Is Nothing` 报 424。
+        (Value::Empty, _) | (_, Value::Empty) => {
+            return Err("`Is` 要求两侧都是对象（Empty 不是对象）".into());
+        }
+        (Value::Nothing, _) | (_, Value::Nothing) => false,
         (Value::Collection(a), Value::Collection(b)) => Rc::ptr_eq(a, b),
         (Value::Dictionary(a), Value::Dictionary(b)) => Rc::ptr_eq(a, b),
         (Value::Class(a), Value::Class(b)) => Rc::ptr_eq(&a.0, &b.0),
@@ -6553,6 +7113,31 @@ fn objects_identical(left: &Value, right: &Value) -> Result<bool, String> {
         (Value::Picture(a), Value::Picture(b)) => Rc::ptr_eq(a, b),
         _ => return Err("`Is` 只能比较对象与 `Nothing`".into()),
     })
+}
+
+/// 从文本文件里读一个字符（`Input(n, #f)` 用）：按 UTF-8 首字节决定长度。
+fn read_char(reader: &mut BufReader<File>) -> std::io::Result<Option<char>> {
+    use std::io::BufRead as _;
+    let buffer = reader.fill_buf()?;
+    if buffer.is_empty() {
+        return Ok(None);
+    }
+    let first = buffer[0];
+    let width = if first < 0x80 {
+        1
+    } else if first >= 0xF0 {
+        4
+    } else if first >= 0xE0 {
+        3
+    } else if first >= 0xC0 {
+        2
+    } else {
+        1
+    };
+    let width = width.min(buffer.len());
+    let bytes = buffer[..width].to_vec();
+    reader.consume(width);
+    Ok(String::from_utf8_lossy(&bytes).chars().next())
 }
 
 /// `Write #` 的单个字段：字符串加引号（内部 `"` 双写），布尔/Null 写成 `#…#`。

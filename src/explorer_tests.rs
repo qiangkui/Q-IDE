@@ -6,7 +6,9 @@
 use std::fs;
 use std::path::PathBuf;
 
-use crate::explorer::{DragOutState, ExplorerModel, ExplorerSelection, Root};
+use gpui_kit::{point, px};
+
+use crate::explorer::{BandDrag, DragOutState, ExplorerModel, ExplorerSelection, Root, band_range};
 
 /// 造一个临时文件夹：含 `sub/inner.txt` 与 `a.txt`。
 fn temp_dir(name: &str) -> PathBuf {
@@ -107,6 +109,40 @@ fn moving_is_only_allowed_into_other_existing_folders() {
         &dir.join("缺失").to_string_lossy(),
         false
     ));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn dragging_a_selection_moves_every_member_once() {
+    let dir = temp_dir("multi-move");
+    let sub = dir.join("sub");
+    let nested = sub.join("nested");
+    let target = dir.join("target");
+    fs::create_dir_all(&nested).expect("创建子子目录");
+    fs::create_dir_all(&target).expect("创建目标目录");
+    let file = dir.join("a.txt").to_string_lossy().into_owned();
+    let sub_id = sub.to_string_lossy().into_owned();
+    let inner = sub.join("inner.txt").to_string_lossy().into_owned();
+    let nested_id = nested.to_string_lossy().into_owned();
+    let target_id = target.to_string_lossy().into_owned();
+
+    // 两个互不包含的条目都会搬。
+    assert_eq!(
+        crate::explorer::move_targets(&[(file.clone(), false), (sub_id.clone(), true)], &target_id),
+        vec![file.clone(), sub_id.clone()]
+    );
+    // 父目录也在这一批里时，子项不再单独搬一次。
+    assert_eq!(
+        crate::explorer::move_targets(
+            &[(inner.clone(), false), (sub_id.clone(), true)],
+            &target_id
+        ),
+        vec![sub_id.clone()]
+    );
+    // 已经在目标目录里的条目、以及文件夹拖进自己的子目录，都不搬。
+    assert!(crate::explorer::move_targets(&[(target_id.clone(), true)], &target_id).is_empty());
+    assert!(crate::explorer::move_targets(&[(sub_id.clone(), true)], &nested_id).is_empty());
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -264,6 +300,52 @@ fn selection_tracks_the_anchor_for_shift_ranges() {
 
     selection.clear();
     assert_eq!(selection.anchor(), None, "退出选择后范围起点也清空");
+}
+
+#[test]
+fn band_drag_tracks_covered_rows_and_finishes_once() {
+    let mut band = BandDrag::default();
+    assert!(!band.is_active());
+    assert_eq!(band.rect(), None);
+
+    band.begin(point(px(10.0), px(300.0)));
+    assert!(band.is_active());
+    assert!(band.cover(7), "扫过的新行要记下来（需要重绘）");
+    assert!(!band.cover(7), "同一行只记一次");
+    assert!(band.cover(3));
+    assert!(band.move_to(point(px(20.0), px(120.0))));
+    assert!(!band.move_to(point(px(20.0), px(120.0))), "位置没变不重绘");
+
+    let rect = band.rect().expect("框选期间有矩形");
+    assert_eq!(rect.0, point(px(10.0), px(300.0)));
+    assert_eq!(rect.1, point(px(20.0), px(120.0)));
+
+    assert_eq!(band.finish(), Some(vec![7, 3]));
+    assert!(!band.is_active(), "结束后不再画框");
+    assert_eq!(band.finish(), None, "重复结束是空操作");
+
+    // 没开始过的状态不会记录经过的行。
+    assert!(!band.cover(1));
+    assert!(!band.move_to(point(px(0.0), px(0.0))));
+}
+
+#[test]
+fn band_drag_cancel_drops_the_rectangle() {
+    let mut band = BandDrag::default();
+    band.begin(point(px(1.0), px(2.0)));
+    band.cover(4);
+    band.cancel();
+    assert!(!band.is_active());
+    assert_eq!(band.rect(), None);
+    assert_eq!(band.finish(), None);
+}
+
+#[test]
+fn band_range_spans_the_smallest_and_largest_row() {
+    assert_eq!(band_range(&[]), None);
+    assert_eq!(band_range(&[5]), Some((5, 5)));
+    assert_eq!(band_range(&[9, 2, 6]), Some((2, 9)));
+    assert_eq!(band_range(&[1, 1, 1]), Some((1, 1)));
 }
 
 #[test]

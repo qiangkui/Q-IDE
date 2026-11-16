@@ -166,7 +166,12 @@ fn write_to_console(text: &str) {
 fn message_box(text: &str, level: Level) {
     #[link(name = "user32")]
     unsafe extern "system" {
-        fn MessageBoxW(window: *mut std::ffi::c_void, text: *const u16, caption: *const u16, kind: u32) -> i32;
+        fn MessageBoxW(
+            window: *mut std::ffi::c_void,
+            text: *const u16,
+            caption: *const u16,
+            kind: u32,
+        ) -> i32;
     }
     /// `MB_OK`、`MB_ICONINFORMATION`、`MB_ICONWARNING`、`MB_SETFOREGROUND`。
     const MB_OK: u32 = 0;

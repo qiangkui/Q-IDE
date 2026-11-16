@@ -18,6 +18,7 @@ impl CodeWindow {
             dark_theme: ui_theme::resolve(&settings.appearance.theme, cx)
                 .mode
                 .is_dark(),
+            break_on_error: self.break_on_error,
         };
         menu::render(
             cx,
@@ -85,15 +86,6 @@ impl CodeWindow {
                     })),
             )
             .child(
-                Button::new("toggle-ai-panel")
-                    .ghost()
-                    .icon(Icon::new(IconName::Bot).text_color(icon_color))
-                    .tooltip("AI 编程")
-                    .selected(appearance.show_ai())
-                    .when(appearance.show_ai(), |button| button.bg(selected_bg))
-                    .on_click(cx.listener(|this, _, window, cx| this.toggle_ai_panel(window, cx))),
-            )
-            .child(
                 Button::new("toggle-search-panel")
                     .ghost()
                     .icon(Icon::new(IconName::Search).text_color(icon_color))
@@ -153,6 +145,7 @@ impl CodeWindow {
                 settings.appearance.show_output = !settings.appearance.show_output;
             })
         });
+        let on_toggle_ai = cx.listener(|this, _, window, cx| this.toggle_ai_panel(window, cx));
         let debug_state = self.debug.as_ref().map(|session| {
             if session.paused {
                 match &session.snapshot {
@@ -185,6 +178,9 @@ impl CodeWindow {
             },
             on_toggle_output,
             encoding_menu,
+            settings.appearance.show_output,
+            settings.appearance.show_ai(),
+            on_toggle_ai,
         )
     }
 }
@@ -239,6 +235,8 @@ impl Render for CodeWindow {
             .on_action(cx.listener(|this, _: &DebugPause, _window, cx| this.debug_pause(cx)))
             .on_action(cx.listener(|this, _: &DebugResume, _window, cx| this.debug_resume(cx)))
             .on_action(cx.listener(|this, _: &DebugStep, _window, cx| this.debug_step(cx)))
+            .on_action(cx.listener(|this, _: &DebugStepOver, _window, cx| this.debug_step_over(cx)))
+            .on_action(cx.listener(|this, _: &DebugStepOut, _window, cx| this.debug_step_out(cx)))
             .on_action(
                 cx.listener(|this, _: &GoToDefinition, window, cx| {
                     this.go_to_definition(window, cx)

@@ -393,6 +393,11 @@ fn new_cell(value: Value) -> Rc<RefCell<Value>> {
 
 /// 某声明类型的默认初值（数值 0、字符串 ""、布尔 False）。
 pub fn default_value(ty: VbType) -> Value {
+    // 对象变量的初值是 `Nothing` 而不是 `Empty`：本机 VB6 实测 `Dim o As Object` 之后
+    // `VarType(o)` 是 9、`TypeName(o)` 是 `Nothing`、`IsObject(o)` 为真、`IsEmpty(o)` 为假。
+    if matches!(ty, VbType::Object) {
+        return Value::Nothing;
+    }
     Value::Empty.coerce(ty).unwrap_or(Value::Empty)
 }
 
@@ -858,6 +863,13 @@ pub enum Value {
     Empty,
     /// 数据库空值（`Null`），参与运算即报错。
     Null,
+    /// 空对象引用（`Nothing`）。
+    ///
+    /// 在 VB6 里它是**独立的值**，不能和 `Empty` 混为一谈（本机实测）：`VarType(Nothing)` 是 9、
+    /// `TypeName(Nothing)` 是 `Nothing`、`IsObject(Nothing)` 为真、`IsEmpty(Nothing)` 为假；
+    /// 用 `CStr`/`Len`/`&`/算术把它当普通值用是**编译期**错误，运行时按错误号 91 处理。
+    /// 声明成对象的变量（`Dim o As Object`）初值就是它。
+    Nothing,
     Bool(bool),
     /// 所有整数类型统一用 `i64` 承载，赋值时按声明类型截断。
     Int(i64),
@@ -952,11 +964,14 @@ impl Value {
         Self::Dictionary(Rc::new(RefCell::new(VbDictionary::new())))
     }
 
-    /// 取集合本体；不是集合时给出可直接展示的错误。
-    pub fn as_collection(&self) -> Result<Rc<RefCell<VbCollection>>, String> {
+    /// 取集合本体；不是集合时返回 `None`。
+    ///
+    /// 热路径判类型用这个（或 [`Self::is_collection`]）——以前的 `as_collection()` 失败时会
+    /// 现场构造一条错误字符串，放在每次循环都走的分支上等于白分配，已删除。
+    pub fn collection_rc(&self) -> Option<Rc<RefCell<VbCollection>>> {
         match self {
-            Self::Collection(items) => Ok(items.clone()),
-            _ => Err("该值不是 Collection".into()),
+            Self::Collection(items) => Some(items.clone()),
+            _ => None,
         }
     }
 
@@ -968,6 +983,14 @@ impl Value {
         }
     }
 
+    /// 取字典本体；不是字典时返回 `None`（热路径判类型用，理由同 [`Self::collection_rc`]）。
+    pub fn dictionary_rc(&self) -> Option<Rc<RefCell<VbDictionary>>> {
+        match self {
+            Self::Dictionary(entries) => Some(entries.clone()),
+            _ => None,
+        }
+    }
+
     pub fn is_dictionary(&self) -> bool {
         matches!(self, Self::Dictionary(_))
     }
@@ -976,7 +999,8 @@ impl Value {
     pub fn is_object(&self) -> bool {
         matches!(
             self,
-            Self::Collection(_)
+            Self::Nothing
+                | Self::Collection(_)
                 | Self::Dictionary(_)
                 | Self::Class(_)
                 | Self::ComObject(_)
@@ -1000,6 +1024,14 @@ impl Value {
         }
     }
 
+    /// 取记录本体；不是记录时返回 `None`（热路径判类型用，理由同 [`Self::collection_rc`]）。
+    pub fn record_rc(&self) -> Option<Rc<RefCell<VbRecord>>> {
+        match self {
+            Self::Record(record) => Some(record.clone()),
+            _ => None,
+        }
+    }
+
     /// 按值复制：记录与数组会深拷贝；集合、类与 COM 对象保留引用语义。
     pub fn copy_value(&self) -> Value {
         match self {
@@ -1013,6 +1045,7 @@ impl Value {
         match self {
             Self::Empty => "Empty".into(),
             Self::Null => "Null".into(),
+            Self::Nothing => "Nothing".into(),
             Self::Bool(_) => "Boolean".into(),
             Self::Int(_) => "Long".into(),
             Self::Float(_) => "Double".into(),
@@ -1039,6 +1072,8 @@ impl Value {
         Ok(match self {
             Self::Empty => false,
             Self::Null => return Err("无效使用 Null：Null 不能用作条件".into()),
+            // VB6 里 `If Nothing Then` 是运行时错误 91（对象变量未设置）。
+            Self::Nothing => return Err("对象变量未设置（Nothing）不能用作条件".into()),
             Self::Bool(value) => *value,
             Self::Int(value) => *value != 0,
             Self::Float(value) => *value != 0.0,
@@ -1074,6 +1109,7 @@ impl Value {
         match self {
             Self::Empty => Ok(0),
             Self::Null => Err("Null 不能转换为数值".into()),
+            Self::Nothing => Err("Nothing 不能转换为数值".into()),
             // VB 的 `True` 转成整数是 -1，与 [`Self::as_float`] 保持一致。
             Self::Bool(value) => Ok(if *value { -1 } else { 0 }),
             Self::Int(value) => Ok(*value),
@@ -1099,6 +1135,7 @@ impl Value {
         match self {
             Self::Empty => Ok(0.0),
             Self::Null => Err("Null 不能转换为数值".into()),
+            Self::Nothing => Err("Nothing 不能转换为数值".into()),
             Self::Bool(value) => Ok(if *value { -1.0 } else { 0.0 }),
             Self::Int(value) => Ok(*value as f64),
             Self::Float(value) => Ok(*value),
@@ -1135,6 +1172,7 @@ impl Value {
                     || parse_radix_text(trimmed).is_some_and(|(_, used)| used == trimmed.len())
             }
             Self::Null
+            | Self::Nothing
             | Self::Date(_)
             | Self::Array(_)
             | Self::Record(_)
@@ -1152,6 +1190,9 @@ impl Value {
         match self {
             Self::Empty => String::new(),
             Self::Null => "Null".into(),
+            // VB6 把「把 `Nothing` 当普通值用」判成**编译期**错误（`CStr(Nothing)`、`Len(Nothing)`、
+            // `Nothing & ""` 都编不过），没有运行时行为可对齐；QIDE 按空串处理（与 `Empty` 一致）。
+            Self::Nothing => String::new(),
             Self::Bool(value) => {
                 if *value {
                     "True".into()

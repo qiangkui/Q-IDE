@@ -51,20 +51,12 @@ fn search_shortcut_also_works_while_the_panel_has_focus() {
         "焦点在面板上时也要能再按一次关闭"
     );
     assert_eq!(
-        first_action(
-            "ctrl-f",
-            &["Input mode=editor", "SearchPanel", "Input"]
-        )
-        .as_deref(),
+        first_action("ctrl-f", &["Input mode=editor", "SearchPanel", "Input"]).as_deref(),
         Some("first::ToggleSearch"),
         "焦点在查找输入框里时，必须覆盖内层输入的内置绑定"
     );
     assert_eq!(
-        first_action(
-            "ctrl-h",
-            &["Input mode=editor", "SearchPanel", "Input"]
-        )
-        .as_deref(),
+        first_action("ctrl-h", &["Input mode=editor", "SearchPanel", "Input"]).as_deref(),
         Some("first::ToggleReplace")
     );
 }

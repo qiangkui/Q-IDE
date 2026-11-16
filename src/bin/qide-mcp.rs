@@ -430,7 +430,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("qide-mcp-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("创建临时目录");
         let app = dir.join("first.exe");
-        assert!(!agent_interface_disabled(&app), "没有 layout.txt 时按开启处理");
+        assert!(
+            !agent_interface_disabled(&app),
+            "没有 layout.txt 时按开启处理"
+        );
 
         std::fs::write(dir.join("layout.txt"), "ai_agent_enabled=0\n").expect("写布局文件");
         assert!(agent_interface_disabled(&app));
@@ -440,4 +443,3 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
-

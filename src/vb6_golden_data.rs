@@ -3,6 +3,7 @@
 //! 期望值来自本机 VB6 真编译（`CompilationType=-1`，IDE 调试用的 p-code 形态）的实际输出。
 
 /// 表达式 → `CStr(表达式)` 的结果。
+#[rustfmt::skip]
 pub const CASES: &[(&str, &str)] = &[
     ("1 + 2 * 3", "7"),
     ("2 ^ 3 ^ 2", "64"),
@@ -621,6 +622,64 @@ pub const CASES: &[(&str, &str)] = &[
     ("Format(1234.5, \"@@@@@@\")", "1234.5"),
     ("Format(1234567, \"0,\")", "1235"),
     ("Format(1234567, \"0,,\")", "1"),
+    ("Format(123, \"abc\")", "ab1900/5/2"),
+    ("Format(123, \"c\")", "1900/5/2"),
+    ("Format(12345, \"000-00\")", "123-45"),
+    ("Format(123, \"00:00\")", "01:23"),
+    ("Format(123, \"0 0 0\")", "1 2 3"),
+    ("Format(123, \"\\0\")", "0"),
+    ("Format(123, \"0.0\"\"x\"\"\")", "123.0x"),
+    ("Format(123, \"\\$0\")", "$123"),
+    ("Format(123, \"000-000\")", "000-123"),
+    ("Format(1234567, \"000,000,000\")", "001,234,567"),
+    ("Format(1234567, \"0-000\")", "1234-567"),
+    ("Format(12345, \"###-###\")", "12-345"),
+    ("Format(12345678, \"000,000\")", "12,345,678"),
+    ("Format(1234567, \"0,0\")", "1,234,567"),
+    ("Format(1234, \"#,##,##0\")", "1,234"),
+    ("Format(12345, \"0,000\")", "12,345"),
+    ("Format(1234567, \"0,.0\")", "1234.6"),
+    ("Format(1234, \"0,00.00\")", "1,234.00"),
+    ("Format(1234, \"0.0,\")", "1234.0"),
+    ("Format(1234567, \"0.0,,\")", "1234567.0"),
+    ("Format(123, \"!0000\")", "0000"),
+    ("Format(123, \"!###\")", "###"),
+    ("Format(123, \"!\")", ""),
+    ("Format(0.5, \"%0\")", "%1"),
+    ("Format(5, \",\")", ","),
+    ("Format(0.1234, \"0.##\")", "0.12"),
+    ("Format(0, \"#.##\")", "."),
+    ("Format(123, \".00\")", "123.00"),
+    ("Format(0.5, \".00\")", ".50"),
+    ("Format(\"abc\", \"&&&&\")", "abc"),
+    ("Format(5, \"0.\")", "5."),
+    ("Format(123, \"0.0\\+0\")", "123.0+0"),
+    ("Format(0.5, \"0%\")", "50%"),
+    ("Format(-1234, \"$#,##0.00\")", "-$1,234.00"),
+    ("Format(12345, \"(###) ###-####\")", "() 1-2345"),
+    ("Format(0, \"0;(0);zero\")", "zero"),
+    ("Format(-5, \"0;(0)\")", "(5)"),
+    ("Format(1.5, \"0.0#;0.0#\")", "1.5"),
+    ("Format(123.456, \"#,##0.0#\")", "123.46"),
+    ("Format(1e20, \"0\")", "100000000000000000000"),
+    ("Atn(1)", "0.785398163397448"),
+    ("Atn(0)", "0"),
+    ("Atn(-1)", "-0.785398163397448"),
+    ("Sin(1)", "0.841470984807897"),
+    ("Cos(1)", "0.54030230586814"),
+    ("Tan(1)", "1.5574077246549"),
+    ("Sin(0)", "0"),
+    ("Cos(0)", "1"),
+    ("Tan(0)", "0"),
+    ("Sin(90 * 3.14159265358979 / 180)", "1"),
+    ("TypeName(Sin(1))", "Double"),
+    ("VarType(Sin(1))", "5"),
+    ("IsNull(Abs(Null))", "True"),
+    ("IsNull(Int(Null))", "True"),
+    ("IsNull(Fix(Null))", "True"),
+    ("IsNull(Round(Null))", "True"),
+    ("IsNull(Hex(Null))", "True"),
+    ("IsNull(Oct(Null))", "True"),
     ("Format(1234, \"#,##0,\")", "1"),
     ("DateAdd(\"y\", 1, #2024-12-31#)", "2025/1/1"),
     ("DateAdd(\"w\", 3, #2024-02-27#)", "2024/3/1"),
@@ -633,9 +692,137 @@ pub const CASES: &[(&str, &str)] = &[
     ("DateDiff(\"q\", #2024-03-31#, #2024-04-01#)", "1"),
     ("DateDiff(\"q\", #2024-04-01#, #2024-03-31#)", "-1"),
     ("DateDiff(\"q\", #2024-01-01#, #2025-01-01#)", "4"),
+    ("SLN(10000, 1000, 5)", "1800"),
+    ("SLN(1000, 0, 3)", "333.333333333333"),
+    ("SLN(0, 0, 3)", "0"),
+    ("SLN(10000, 1000, -1)", "-9000"),
+    ("SYD(10000, 1000, 5, 1)", "3000"),
+    ("SYD(10000, 1000, 5, 2)", "2400"),
+    ("SYD(10000, 1000, 5, 3)", "1800"),
+    ("SYD(10000, 1000, 5, 4)", "1200"),
+    ("SYD(10000, 1000, 5, 5)", "600"),
+    ("DDB(10000, 1000, 5, 1)", "4000"),
+    ("DDB(10000, 1000, 5, 2)", "2400"),
+    ("DDB(10000, 1000, 5, 3)", "1440"),
+    ("DDB(10000, 1000, 5, 4)", "864"),
+    ("DDB(10000, 1000, 5, 5)", "296"),
+    ("DDB(10000, 1000, 5, 2, 1.5)", "2100"),
+    ("DDB(10000, 1000, 5, 1, 2.5)", "5000"),
+    ("DDB(0, 1000, 5, 1)", "0"),
+    ("DDB(10000, 1000, 5, 1.5)", "3098.38667696593"),
+    ("DDB(10000, 1000, 5, 4.5)", "669.251522224642"),
+    ("DDB(10000, 1000, 5, 4.999)", "296.662199128142"),
+    ("DDB(10000, 1000, 3, 3)", "111.111111111111"),
+    ("DDB(10000, 0, 3, 3)", "740.740740740741"),
+    ("DDB(10000, 2000, 3, 3)", "0"),
+    ("DDB(500, 1000, 5, 1)", "-500"),
+    ("DDB(10000, 1000, 1, 1)", "9000"),
+    ("FV(0.05, 10, -100)", "1257.78925355488"),
+    ("FV(0.05, 10, -1000)", "12577.8925355488"),
+    ("FV(0.05, 10, -100, 0, 1)", "1320.67871623263"),
+    ("FV(0.05, 10, -100, 1000)", "-371.105373222558"),
+    ("FV(0, 10, -100)", "1000"),
+    ("FV(0, 10, -100, 500)", "500"),
+    ("FV(0.05 / 12, 120, -100)", "15528.2279445667"),
+    ("FV(0.05, 10, 0, 1000)", "-1628.89462677744"),
+    ("FV(0.05, 10, -100, 1000, 1)", "-308.215910544814"),
+    ("FV(0.05, -10, -100)", "-772.173492918482"),
+    ("PV(0.05, 10, -100)", "772.173492918482"),
+    ("PV(0.05, 10, -100, 1000)", "158.260239377723"),
+    ("PV(0.05, 10, -100, 0, 1)", "810.782167564406"),
+    ("PV(0, 10, -100)", "1000"),
+    ("PV(0.05, 0, -100)", "0"),
+    ("PV(0.05, 10, 0, 1000)", "-613.913253540759"),
+    ("PV(0.05, 10, -100, 1000, 1)", "196.868914023647"),
+    ("Pmt(0.05, 10, 10000)", "-1295.04574965457"),
+    ("Pmt(0.05, 10, 10000, 0, 1)", "-1233.37690443292"),
+    ("Pmt(0, 10, 10000)", "-1000"),
+    ("Pmt(0.05 / 12, 120, 10000)", "-106.065515239076"),
+    ("Pmt(0.05, 10, 10000, 1000)", "-1374.55032462002"),
+    ("Pmt(0.05, 10, 10000, 0, True)", "-1233.37690443292"),
+    ("NPer(0.05, -100, 1000)", "14.2066990828905"),
+    ("NPer(0.05, -100, 1000, 500)", "18.7802346532834"),
+    ("NPer(0.05, -100, 1000, 0, 1)", "13.2532278981381"),
+    ("NPer(0.05, -100, 1000, 500, 1)", "17.6306286290802"),
+    ("NPer(0, -100, 1000)", "10"),
+    ("NPer(0.05, -100, 0)", "0"),
+    ("IPmt(0.05, 1, 10, 10000)", "-500"),
+    ("IPmt(0.05, 10, 10, 10000)", "-61.668845221646"),
+    ("IPmt(0.05, 1, 10, 10000, 0, 1)", "0"),
+    ("IPmt(0.05, 2, 10, 10000, 0, 1)", "-438.331154778354"),
+    ("IPmt(0.05, 3, 10, 10000, 0, 1)", "-398.578867295626"),
+    ("IPmt(0.05, 4, 10, 10000, 0, 1)", "-356.838965438761"),
+    ("IPmt(0.05, 10, 10, 10000, 0, 1)", "-58.7322335444249"),
+    ("IPmt(0, 1, 10, 10000)", "0"),
+    ("PPmt(0.05, 1, 10, 10000)", "-795.045749654566"),
+    ("PPmt(0.05, 5, 10, 10000)", "-966.383077741061"),
+    ("PPmt(0.05, 10, 10, 10000)", "-1233.37690443292"),
+    ("PPmt(0.05, 1, 10, 10000, 0, 1)", "-1233.37690443292"),
+    ("PPmt(0.05, 2, 10, 10000, 0, 1)", "-795.045749654566"),
+    ("PPmt(0.05, 3, 10, 10000, 0, 1)", "-834.798037137295"),
+    ("PPmt(0.05, 10, 10, 10000, 0, 1)", "-1174.6446708885"),
+    ("PPmt(0, 1, 10, 10000)", "-1000"),
+    ("VarType(FV(0.05, 10, -100))", "5"),
+    ("TypeName(SLN(10000, 1000, 5))", "Double"),
+    ("FV(\"0.05\", 10, -100)", "1257.78925355488"),
+    ("StrConv(\"abc def\", 1)", "ABC DEF"),
+    ("StrConv(\"ABC Def\", 2)", "abc def"),
+    ("StrConv(\"hello world\", 3)", "Hello World"),
+    ("StrConv(\"hello,world/x-y\", 3)", "Hello,world/x-y"),
+    ("StrConv(\"a1b2 3c\", 3)", "A1b2 3c"),
+    ("StrConv(\"abc\", 4)", "ａｂｃ"),
+    ("StrConv(\"abc\", 1 + 4)", "ＡＢＣ"),
+    ("StrConv(\"\", 3)", ""),
+    ("StrConv(\"你好abc\", 1)", "你好ABC"),
+    ("StrConv(\"a\" & Chr(9) & \"b\", 3)", "A	B"),
+    ("StrConv(\" abc\", 3)", " Abc"),
+    ("StrConv(\"123ABC\", 3)", "123abc"),
+    ("StrConv(\"a-b\", 3)", "A-b"),
+    ("StrConv(\"你好 abc\", 3)", "你好 Abc"),
+    ("IsObject(1)", "False"),
+    ("IsObject(Empty)", "False"),
+    ("IsObject(Null)", "False"),
+    ("IsObject(\"abc\")", "False"),
+    ("IsObject(New Collection)", "True"),
+    ("IsEmpty(Empty)", "True"),
+    ("IsNull(Null)", "True"),
+    ("IsEmpty(1)", "False"),
+    ("StrPtr(\"abc\") <> 0", "True"),
+    ("StrPtr(\"\") = 0", "False"),
+    ("TimeValue(\"13:30:00\")", "13:30:00"),
+    ("TimeValue(\"1:2:3 PM\")", "13:02:03"),
+    ("TimeValue(\"12:00:00 AM\")", "0:00:00"),
+    ("TimeValue(\"12:00:00 PM\")", "12:00:00"),
+    ("TimeValue(\"1 PM\")", "13:00:00"),
+    ("TimeValue(\"9:05am\")", "9:05:00"),
+    ("TimeValue(\"1:30\")", "1:30:00"),
+    ("TimeValue(\"0:30\")", "0:30:00"),
+    ("TimeValue(\"23:59:59\")", "23:59:59"),
+    ("TimeValue(\"12:00 am\")", "0:00:00"),
+    ("TimeValue(\"12:30AM\")", "0:30:00"),
+    ("TimeValue(\"13:00 PM\")", "13:00:00"),
+    ("TimeValue(\"00:00:01\")", "0:00:01"),
+    ("TimeValue(#6:00:00 PM#)", "18:00:00"),
+    ("TimeValue(CDate(0.75))", "18:00:00"),
+    ("IsDate(\"1:30 PM\")", "True"),
+    ("IsDate(\"abc\")", "False"),
+    ("CDate(\"1:2:3 PM\")", "13:02:03"),
+    ("CDate(\"13:30\")", "13:30:00"),
+    ("VarType(Nothing)", "9"),
+    ("TypeName(Nothing)", "Nothing"),
+    ("IsObject(Nothing)", "True"),
+    ("IsEmpty(Nothing)", "False"),
+    ("IsNull(Nothing)", "False"),
+    ("Nothing Is Nothing", "True"),
+    ("ObjPtr(Nothing) = 0", "True"),
+    ("VarType(Empty)", "0"),
+    ("TypeName(Empty)", "Empty"),
+    ("IsEmpty(Empty)", "True"),
+    ("IsNull(Empty)", "False"),
 ];
 
 /// 会失败的语句 → `Err.Number`。
+#[rustfmt::skip]
 pub const ERROR_CASES: &[(&str, i64)] = &[
     ("x = 1 / 0", 11),
     ("x = 1 \\ 0", 11),
@@ -700,9 +887,36 @@ pub const ERROR_CASES: &[(&str, i64)] = &[
     ("x = InStr(0, \"abc\", \"b\")", 5),
     ("x = InStrRev(\"abc\", \"b\", 0)", 5),
     ("x = InStr(\"abc\", \"b\", Null)", 13),
+    ("x = Sgn(Null)", 94),
+    ("x = Sin(Null)", 94),
+    ("x = Atn(Null)", 94),
+    ("x = Val(Null)", 94),
+    ("x = TimeValue(\"25:00\")", 13),
+    ("x = TimeValue(\"12:34:56.5\")", 13),
+    ("x = TimeValue(\"0:60\")", 13),
+    ("x = TimeValue(\"\")", 13),
+    ("x = TimeValue(\"1:2:3 XM\")", 13),
+    ("x = TimeValue(\"abc\")", 13),
+    ("x = CDate(\"abc\")", 13),
+    ("x = TimeValue(0.75)", 13),
+    ("x = TimeValue(1)", 13),
+];
+
+/// 浮点末位不稳的表达式 → (VB6 的 `CStr` 结果, 允许的相对误差)。
+/// 比对规则：`|QIDE - VB6| <= 容差 * max(|VB6|, 1)`。
+#[rustfmt::skip]
+pub const APPROX_CASES: &[(&str, &str, f64)] = &[
+    ("Tan(1.5707963267949)", "-286411217403671", 1e-05),
+    ("Sin(3.14159265358979)", "3.23108510433268E-15", 1e-05),
+    ("IPmt(0.05, 5, 10, 10000)", "-328.662671913506", 1e-09),
+    ("Rate(11, -100, 1000)", "1.62313281745908E-02", 1e-09),
+    ("Rate(10, -100, 1000, 100)", "-0.020569696650118", 1e-09),
+    ("Rate(360, -1000, 200000)", "3.65592795236269E-03", 1e-09),
+    ("Rate(20, 100, -1000)", "7.75468953001051E-02", 1e-09),
 ];
 
 /// 脚本用例共用的声明与辅助过程（与 VB6 侧同一份）。
+#[rustfmt::skip]
 pub const SCRIPT_SUPPORT: &str = r#"
 Private Type Pt
     X As Long
@@ -778,9 +992,18 @@ Function StaticArr(ByVal i As Long) As Long
     buf(i) = buf(i) + 1
     StaticArr = buf(i)
 End Function
+
+Function QideMissing(Optional ByVal a As Variant, Optional ByVal b As Variant) As String
+    QideMissing = CStr(IsMissing(a)) & "/" & CStr(IsMissing(b))
+End Function
+
+Function QideMiddle(ByVal a As Long, Optional ByVal b As Variant, Optional ByVal c As Variant) As String
+    QideMiddle = CStr(a) & "/" & CStr(IsMissing(b)) & "/" & CStr(IsMissing(c))
+End Function
 "#;
 
 /// (用例名, 模块级选项（`Option Base 1` 等，空串表示没有）, 语句块, `Debug.Print` 的期望输出（行之间用 `\n` 分隔））。
+#[rustfmt::skip]
 pub const SCRIPT_CASES: &[(&str, &str, &str, &str)] = &[
     ("for_counter_overflow", "", "Dim i As Integer, n As Long, j As Long
 On Error Resume Next
@@ -1629,4 +1852,112 @@ v = IsNull(Null)
 Debug.Print v
 v = IsNumeric(Null)
 Debug.Print v", "True\nTrue\nTrue\nTrue\nTrue\nTrue\nTrue\nTrue\nTrue\nTrue\nTrue\nTrue\nTrue\n[]            False\nTrue\nFalse"),
+    ("omitted_arguments", "", "Dim m1 As String, m2 As String, m3 As String
+m1 = QideMissing(1, \"y\")
+m2 = QideMissing(, \"x\")
+m3 = QideMiddle(1, , 3)
+Debug.Print m1
+Debug.Print m2
+Debug.Print m3", "False/False\nTrue/False\n1/True/False"),
+    ("nothing_semantics", "", "Dim o As Object, v As Variant, e As Variant
+Debug.Print VarType(o), TypeName(o), IsObject(o), IsEmpty(o), IsNull(o)
+Debug.Print o Is Nothing
+Set v = Nothing
+Debug.Print VarType(v), TypeName(v), IsObject(v), IsEmpty(v), IsNull(v)
+Debug.Print v Is Nothing
+Debug.Print ObjPtr(o)
+On Error Resume Next
+Err.Clear
+Debug.Print o.Foo
+Debug.Print Err.Number
+Err.Clear
+If Nothing Then
+End If
+Debug.Print Err.Number
+Err.Clear
+Debug.Print e Is Nothing
+Debug.Print Err.Number", " 9            Nothing       True          False         False\nTrue\n 9            Nothing       True          False         False\nTrue\n 0\n 91\n 91\n 424"),
+    ("file_statements", "", "Dim h As Integer, s As String
+On Error Resume Next
+Kill \"golden_a.txt\"
+Kill \"golden_b.txt\"
+Kill \"golden_c.txt\"
+Err.Clear
+h = FreeFile
+Open \"golden_a.txt\" For Output As #h
+Print #h, \"one\"
+Print #h, \"two\"
+Close #h
+Debug.Print FileLen(\"golden_a.txt\")
+Debug.Print GetAttr(\"golden_a.txt\") And (vbReadOnly Or vbHidden Or vbSystem Or vbArchive)
+h = FreeFile
+Open \"golden_a.txt\" For Input As #h
+Debug.Print EOF(h)
+Line Input #h, s
+Debug.Print s
+Debug.Print EOF(h)
+Line Input #h, s
+Debug.Print s
+Debug.Print EOF(h)
+Close #h
+FileCopy \"golden_a.txt\", \"golden_b.txt\"
+Debug.Print FileLen(\"golden_b.txt\")
+Debug.Print Dir(\"golden_b.txt\")
+Name \"golden_b.txt\" As \"golden_c.txt\"
+Debug.Print Dir(\"golden_c.txt\")
+Debug.Print IsDate(FileDateTime(\"golden_a.txt\"))
+Debug.Print Abs(DateDiff(\"s\", FileDateTime(\"golden_a.txt\"), Now)) < 120
+Kill \"golden_a.txt\"
+Kill \"golden_c.txt\"
+Debug.Print Len(Dir(\"golden_a.txt\"))
+Debug.Print Err.Number", " 10\n 32\nFalse\none\nFalse\ntwo\nTrue\n 10\ngolden_b.txt\ngolden_c.txt\nTrue\nTrue\n 0\n 0"),
+    ("file_attr_input", "", "Dim h As Integer, s As String
+On Error Resume Next
+Kill \"ga.txt\"
+Kill \"ga.dat\"
+Err.Clear
+h = FreeFile
+Open \"ga.txt\" For Output As #h
+Print #h, \"abcdef\"
+Close #h
+h = FreeFile
+Open \"ga.txt\" For Append As #h
+Debug.Print FileAttr(h, 1)
+Close #h
+h = FreeFile
+Open \"ga.txt\" For Input As #h
+Debug.Print FileAttr(h, 1)
+Debug.Print \"[\" & Input(3, #h) & \"]\"
+Debug.Print \"[\" & Input(1, #h) & \"]\"
+Err.Clear
+s = Input(100, #h)
+Debug.Print Len(s)
+Debug.Print Err.Number
+Close #h
+h = FreeFile
+Open \"ga.dat\" For Binary As #h
+Debug.Print FileAttr(h, 1)
+Err.Clear
+s = Input(1, #h)
+Debug.Print Len(s)
+Debug.Print Err.Number
+Close #h
+h = FreeFile
+Open \"ga.dat\" For Random As #h
+Debug.Print FileAttr(h, 1)
+Close #h
+Err.Clear
+Debug.Print FileAttr(99, 1)
+Debug.Print Err.Number
+Err.Clear
+Debug.Print FileAttr(h, 2)
+Debug.Print Err.Number
+Err.Clear
+h = FreeFile
+Open \"ga.dat\" For Output As #h
+s = Input(1, #h)
+Debug.Print Err.Number
+Close #h
+Kill \"ga.txt\"
+Kill \"ga.dat\"", " 8\n 1\n[abc]\n[d]\n 0\n 62\n 32\n 0\n 0\n 4\n 52\n 52\n 54"),
 ];

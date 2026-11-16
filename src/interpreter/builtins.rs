@@ -121,6 +121,10 @@ const BUILTINS: &[&str] = &[
     "sqr",
     "exp",
     "log",
+    "sin",
+    "cos",
+    "tan",
+    "atn",
     "round",
     "rnd",
     "hex",
@@ -161,11 +165,15 @@ const BUILTINS: &[&str] = &[
     "second",
     "eof",
     "lof",
+    "fileattr",
+    "input",
     "freefile",
     "error",
     "dir",
     "filelen",
     "filedatetime",
+    "getattr",
+    "setattr",
     "curdir",
     "kill",
     "filecopy",
@@ -194,12 +202,14 @@ const BUILTINS: &[&str] = &[
 ];
 
 pub fn is_builtin(name: &str) -> bool {
-    BUILTINS.contains(&name)
+    BUILTINS.contains(&name) || crate::interpreter::finance::BUILTINS.contains(&name)
 }
 
 /// 全部内置函数名（小写），供编辑器补全使用。
-pub fn names() -> &'static [&'static str] {
-    BUILTINS
+pub fn names() -> Vec<&'static str> {
+    let mut names = BUILTINS.to_vec();
+    names.extend_from_slice(crate::interpreter::finance::BUILTINS);
+    names
 }
 
 /// VB 错误号对应的说明文字（`Error()` 与 `Err.Raise` / `Error n` 的默认描述）。
@@ -296,6 +306,8 @@ fn vartype_code(value: Option<&Value>) -> i64 {
     match value {
         Value::Empty => 0,
         Value::Null => 1,
+        // `VarType(Nothing)` 是 9（vbObject），与真正的空值 `Empty` 不同（本机 VB6 实测）。
+        Value::Nothing => 9,
         Value::Int(_) => 3,
         Value::Float(_) => 5,
         Value::Currency(_) => 6,
@@ -375,11 +387,17 @@ fn strconv(source: &str, conversion: i64) -> Result<String, String> {
     Ok(text)
 }
 
+/// `vbProperCase`：只有**空白**才是词边界（本机 VB6 实测 `hello,world/x-y` → `Hello,world/x-y`，
+/// 逗号与斜杠后面的字母保持小写），并且只有词首那个字符本身是字母时才大写
+/// （`123abc` → `123abc`、`a-b` → `A-b`）。
 fn proper_case(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     let mut at_word_start = true;
     for ch in source.chars() {
-        if ch.is_alphanumeric() {
+        if ch.is_whitespace() {
+            out.push(ch);
+            at_word_start = true;
+        } else if ch.is_alphanumeric() {
             if at_word_start {
                 out.extend(ch.to_uppercase());
             } else {
@@ -388,7 +406,7 @@ fn proper_case(source: &str) -> String {
             at_word_start = false;
         } else {
             out.push(ch);
-            at_word_start = true;
+            at_word_start = false;
         }
     }
     out
@@ -428,6 +446,10 @@ fn partition(number: i64, start: i64, stop: i64, interval: i64) -> Result<String
 }
 
 pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String> {
+    // 财务函数单独一个模块（`finance.rs`），这里先让给它，未命中再往下走。
+    if let Some(value) = crate::interpreter::finance::call(name, &args, ctx)? {
+        return Ok(value);
+    }
     let text = |index: usize| -> Result<String, String> {
         args.get(index)
             .map(Value::to_display)
@@ -968,7 +990,10 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
             ctx.failure = if result.is_ok() { None } else { Some(5) };
             Value::Str(result?)
         }
+        // `Abs`/`Int`/`Fix`/`Round`/`Hex`/`Oct` 接收 `Variant`，`Null` 原样返回（本机 VB6 实测）；
+        // `Sgn`/`Sqr`/`Exp`/`Log`/三角函数/`Val` 是强类型，`Null` 报 94。
         "abs" => match args.first() {
+            Some(Value::Null) => Value::Null,
             Some(Value::Float(value)) => Value::Float(value.abs()),
             Some(Value::Currency(value)) => {
                 let Some(value) = value.checked_abs() else {
@@ -996,6 +1021,11 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
                 0
             })
         }
+        // 三角函数：参数与结果都是 `Double`，`Null` 报 94（本机 VB6 实测）。
+        "sin" => math_double(args.first(), f64::sin)?,
+        "cos" => math_double(args.first(), f64::cos)?,
+        "tan" => math_double(args.first(), f64::tan)?,
+        "atn" => math_double(args.first(), f64::atan)?,
         // `Sqr` 负数、`Log` 非正数都报错误号 5，`Exp` 溢出报错误号 6（本机 VB6 实测）。
         "sqr" => {
             let value = args
@@ -1035,19 +1065,23 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
             Value::Float(value.ln())
         }
         "round" => {
-            let value = args
-                .first()
-                .map(|v| v.as_float())
-                .transpose()?
-                .unwrap_or(0.0);
-            let digits = args
-                .get(1)
-                .map(Value::as_int)
-                .transpose()?
-                .unwrap_or(0)
-                .max(0) as i32;
-            let factor = 10f64.powi(digits);
-            Value::Float(round_half_even(value * factor) / factor)
+            if matches!(args.first(), Some(Value::Null)) {
+                Value::Null
+            } else {
+                let value = args
+                    .first()
+                    .map(|v| v.as_float())
+                    .transpose()?
+                    .unwrap_or(0.0);
+                let digits = args
+                    .get(1)
+                    .map(Value::as_int)
+                    .transpose()?
+                    .unwrap_or(0)
+                    .max(0) as i32;
+                let factor = 10f64.powi(digits);
+                Value::Float(round_half_even(value * factor) / factor)
+            }
         }
         "rnd" => {
             let mut state = *ctx.rng;
@@ -1057,8 +1091,20 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
             *ctx.rng = state;
             Value::Float((state % 1_000_003) as f64 / 1_000_003.0)
         }
-        "hex" => Value::Str(radix_text(number(0)?, ctx.arg_type, 16)),
-        "oct" => Value::Str(radix_text(number(0)?, ctx.arg_type, 8)),
+        "hex" => {
+            if matches!(args.first(), Some(Value::Null)) {
+                Value::Null
+            } else {
+                Value::Str(radix_text(number(0)?, ctx.arg_type, 16))
+            }
+        }
+        "oct" => {
+            if matches!(args.first(), Some(Value::Null)) {
+                Value::Null
+            } else {
+                Value::Str(radix_text(number(0)?, ctx.arg_type, 8))
+            }
+        }
         "space" => {
             strict(0)?;
             let count = number(0)?;
@@ -1265,6 +1311,11 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
         "dir" => dir_value(&args, ctx)?,
         "filelen" => file_len_value(&args, ctx)?,
         "filedatetime" => file_datetime_value(&args, ctx)?,
+        "getattr" => get_attr_value(&args, ctx)?,
+        "setattr" => {
+            set_attr_value(&args, ctx)?;
+            Value::Empty
+        }
         "curdir" => Value::Str(ctx.cwd.display().to_string()),
         "environ" => Value::Str(
             args.first()
@@ -1413,14 +1464,22 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
             }
         }
         "timevalue" => match args.first() {
-            Some(Value::Float(_) | Value::Int(_) | Value::Date(_)) => {
-                Value::Date(args[0].as_float()?.fract())
+            // VB6 只接受字符串与 `Date` 值：`TimeValue(0.75)` / `TimeValue(1)` 报 13，
+            // 而 `TimeValue(CDate(0.75))` 是 18:00:00（本机实测）。
+            Some(Value::Date(_)) => Value::Date(args[0].as_float()?.fract()),
+            Some(Value::Int(_) | Value::Float(_) | Value::Currency(_) | Value::Bool(_)) => {
+                ctx.failure = Some(13);
+                return Err("`TimeValue` 只接受字符串与日期值".into());
             }
             _ => {
                 let raw = text(0)?;
                 match parse_time_text(&raw) {
                     Some(serial) => Value::Date(serial),
-                    None => return Err(format!("`TimeValue` 无法识别时间 \"{raw}\"")),
+                    None => {
+                        // VB6 对认不出的时间文本报 13（类型不匹配），不是 5。
+                        ctx.failure = Some(13);
+                        return Err(format!("`TimeValue` 无法识别时间 \"{raw}\""));
+                    }
                 }
             }
         },
@@ -1437,8 +1496,9 @@ pub fn call(name: &str, args: Vec<Value>, ctx: &mut Ctx) -> Result<Value, String
             Value::Empty
         }
         "doevents" => {
-            // 宿主是 GPUI 应用，脚本里派发本进程消息会和编辑器自己的事件循环打架，
-            // 这里只让出一次时间片，效果等价于「别把界面卡死」。
+            // 运行时会在 `DoEvents` 上先分派排队的 COM 事件，再落到这里；这条分支留给
+            // 直接调 `builtins::call` 的场合：只让出一次时间片（不派发本进程消息，
+            // 宿主的 GPUI 事件循环不能被脚本抢占）。
             ffi::sleep_ms(0);
             Value::Int(0)
         }
@@ -1486,6 +1546,7 @@ fn int_or_fix(value: Option<&Value>, floor: bool) -> Result<Value, String> {
         }
     };
     Ok(match value {
+        Value::Null => Value::Null,
         Value::Int(number) => Value::Int(*number),
         Value::Float(number) => Value::Float(apply(*number)),
         Value::Date(number) => Value::Date(apply(*number)),
@@ -1500,6 +1561,12 @@ fn int_or_fix(value: Option<&Value>, floor: bool) -> Result<Value, String> {
             ));
         }
     })
+}
+
+/// `Sin`/`Cos`/`Tan`/`Atn`：参数按 `Double` 换算（`Null` 报 94），结果也是 `Double`。
+fn math_double(value: Option<&Value>, apply: impl Fn(f64) -> f64) -> Result<Value, String> {
+    let number = value.map(Value::as_float).transpose()?.unwrap_or(0.0);
+    Ok(Value::Float(apply(number)))
 }
 
 /// `Str` 的数字写法：`|x| < 1` 时不写整数部分的 0（`Str(0.5)` 是 `" .5"`），正数前面加空格。
@@ -1636,6 +1703,14 @@ const VB_CONSTANTS: &[(&str, i64)] = &[
     ("vbbyte", 17),
     ("vblonglong", 20),
     ("vbuserdefinedtype", 36),
+    ("vbnormal", 0),
+    ("vbreadonly", 1),
+    ("vbhidden", 2),
+    ("vbsystem", 4),
+    ("vbvolume", 8),
+    ("vbdirectory", 16),
+    ("vbarchive", 32),
+    ("vbalias", 64),
     ("vbarray", 8192),
     ("vbmethod", 1),
     ("vbget", 2),
@@ -2108,6 +2183,100 @@ fn file_len_value(args: &[Value], ctx: &mut Ctx) -> Result<Value, String> {
         })
 }
 
+/// `SetAttr` 允许设置的属性位：`vbReadOnly` / `vbHidden` / `vbSystem` / `vbArchive`。
+const SET_ATTR_MASK: i64 = 1 | 2 | 4 | 32;
+
+/// `GetAttr(path)`：返回文件的属性位。
+///
+/// 本机 VB6 实测返回的就是 Win32 属性位（新建文件常带 `0x2000`「未编入索引」，例如 8224），
+/// `vbReadOnly` 1 / `vbHidden` 2 / `vbSystem` 4 / `vbDirectory` 16 / `vbArchive` 32 与系统位一一对应。
+fn get_attr_value(args: &[Value], ctx: &mut Ctx) -> Result<Value, String> {
+    let path = args.first().map(Value::to_display).unwrap_or_default();
+    let target = resolved(ctx.cwd, &path);
+    let metadata = std::fs::metadata(&target).map_err(|error| {
+        ctx.failure = Some(io_number(&error));
+        format!("`GetAttr` 无法读取 `{path}`：{error}")
+    })?;
+    Ok(Value::Int(attribute_bits(&metadata) as i64))
+}
+
+#[cfg(windows)]
+fn attribute_bits(metadata: &std::fs::Metadata) -> u32 {
+    use std::os::windows::fs::MetadataExt as _;
+    // `FILE_ATTRIBUTE_NORMAL`（0x80）只在「没有其它属性」时由系统给出，VB6 的 `GetAttr`
+    // 把它报成 `vbNormal`（0），所以要清掉这一位（本机 VB6 实测 `SetAttr vbNormal` 后是 0）。
+    metadata.file_attributes() & !0x80
+}
+
+#[cfg(not(windows))]
+fn attribute_bits(metadata: &std::fs::Metadata) -> u32 {
+    let mut bits = 0;
+    if metadata.permissions().readonly() {
+        bits |= 1;
+    }
+    if metadata.is_dir() {
+        bits |= 16;
+    }
+    bits
+}
+
+/// `SetAttr path, attributes`：只接受 `vbReadOnly`/`vbHidden`/`vbSystem`/`vbArchive` 的组合，
+/// 其它位（`vbDirectory`、`vbVolume` 等）按 VB6 报错误号 5；属性不是数值报 13。
+fn set_attr_value(args: &[Value], ctx: &mut Ctx) -> Result<(), String> {
+    let path = args.first().map(Value::to_display).unwrap_or_default();
+    let attributes = match args.get(1).map(Value::as_int) {
+        Some(Ok(value)) => value,
+        Some(Err(message)) => {
+            ctx.failure = Some(13);
+            return Err(format!("`SetAttr` 的属性参数无效：{message}"));
+        }
+        None => 0,
+    };
+    if attributes & !SET_ATTR_MASK != 0 {
+        ctx.failure = Some(5);
+        return Err(format!(
+            "`SetAttr` 不支持属性位 {attributes}（只能组合 vbReadOnly/vbHidden/vbSystem/vbArchive）"
+        ));
+    }
+    let target = resolved(ctx.cwd, &path);
+    set_file_attributes(&target, attributes as u32).map_err(|error| {
+        ctx.failure = Some(match error.raw_os_error() {
+            Some(2 | 3) => 53,
+            Some(5) => 70,
+            _ => 5,
+        });
+        format!("`SetAttr` 无法修改 `{path}` 的属性：{error}")
+    })
+}
+
+#[cfg(windows)]
+fn set_file_attributes(path: &std::path::Path, attributes: u32) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    unsafe extern "system" {
+        fn SetFileAttributesW(name: *const u16, attributes: u32) -> i32;
+    }
+    // `SetFileAttributesW` 不接受 0：`vbNormal` 要换成 FILE_ATTRIBUTE_NORMAL（0x80）。
+    let flags = if attributes == 0 { 0x80 } else { attributes };
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    if unsafe { SetFileAttributesW(wide.as_ptr(), flags) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn set_file_attributes(path: &std::path::Path, attributes: u32) -> std::io::Result<()> {
+    // 其它平台只有只读位可写。
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_readonly(attributes & 1 != 0);
+    std::fs::set_permissions(path, permissions)
+}
+
 /// `FileDateTime(path)`：本地时区的 VB 日期序列。
 fn file_datetime_value(args: &[Value], ctx: &mut Ctx) -> Result<Value, String> {
     let path = args.first().map(Value::to_display).unwrap_or_default();
@@ -2282,13 +2451,61 @@ pub fn parse_date_value(text: &str) -> Option<f64> {
     parse_number(text)
 }
 
-/// 识别 `12:34`、`12:34:56.5` 这类时间文本。
+/// 识别 `12:34`、`12:34:56`、`1:2:3 PM`、`9:05am` 这类时间文本。
+///
+/// 本机 VB6 实测：不收小数秒（`TimeValue("12:34:56.5")` 报 13）、时分秒超范围报 13；
+/// `AM`/`PM` 后缀可以紧贴也可以空一格，且只在 12 小时制内起作用
+/// （`TimeValue("13:00 PM")` 是 13:00:00，后缀被忽略）。
 fn parse_time_text(text: &str) -> Option<f64> {
-    let mut parts = text.trim().split(':');
-    let hour: i64 = parts.next()?.trim().parse().ok()?;
-    let minute: i64 = parts.next().unwrap_or("0").trim().parse().ok()?;
-    let second: f64 = parts.next().unwrap_or("0").trim().parse().ok()?;
-    Some((hour * 3600 + minute * 60) as f64 / 86_400.0 + second / 86_400.0)
+    let (body, am) = split_meridiem(text);
+    let mut parts = body.split(':');
+    let hour = parse_time_field(parts.next()?)?;
+    let minute = match parts.next() {
+        Some(part) => parse_time_field(part)?,
+        None => 0,
+    };
+    let second = match parts.next() {
+        Some(part) => parse_time_field(part)?,
+        None => 0,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    let hour = match am {
+        Some(true) if hour == 12 => 0,
+        Some(true) => hour,
+        Some(false) if hour < 12 => hour + 12,
+        Some(false) => hour,
+        None => hour,
+    };
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    Some((hour * 3600 + minute * 60 + second) as f64 / 86_400.0)
+}
+
+/// 时间字段只认十进制数字；空串、符号、小数点都算非法。
+fn parse_time_field(text: &str) -> Option<i64> {
+    let text = text.trim();
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// 拆掉末尾的 `AM` / `PM`（大小写不敏感、前面可以空一格），返回（正文, 是否 AM）。
+fn split_meridiem(text: &str) -> (&str, Option<bool>) {
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let am = if lower.ends_with("am") {
+        true
+    } else if lower.ends_with("pm") {
+        false
+    } else {
+        return (trimmed, None);
+    };
+    let body = trimmed[..trimmed.len() - 2].trim_end();
+    (body, Some(am))
 }
 
 fn is_date(value: &Value) -> bool {
@@ -2601,7 +2818,7 @@ fn is_date_format(spec: &str) -> bool {
     spec.chars().any(|ch| {
         matches!(
             ch.to_ascii_lowercase(),
-            'y' | 'm' | 'd' | 'h' | 'n' | 's' | 'w' | 'q' | 'a'
+            'y' | 'm' | 'd' | 'h' | 'n' | 's' | 'w' | 'q' | 'a' | 'c'
         )
     })
 }
@@ -2740,6 +2957,8 @@ fn format_date(serial: f64, spec: &str) -> String {
             'w' if run >= 2 => week_of_year(serial, 1, 1).to_string(),
             'w' => weekday.to_string(),
             'q' => ((month - 1) / 3 + 1).to_string(),
+            // 单个 `c` 是 VB6 的 `General Date`（`Format(123, "c")` 是 `1900/5/2`）。
+            'c' if run == 1 => format_date_display(serial),
             _ => {
                 output.push(ch);
                 index += 1;
@@ -2811,13 +3030,14 @@ fn format_value(value: &Value, spec: &str) -> Result<String, String> {
             return Ok(format_date(value.as_float()?, spec));
         }
         let text = value.to_display();
-        return if spec.contains('>') {
-            Ok(text.to_uppercase())
-        } else if spec.contains('<') {
-            Ok(text.to_lowercase())
-        } else {
-            Err(format!("`Format` 暂不支持格式 \"{spec}\""))
-        };
+        if spec.contains('>') {
+            return Ok(text.to_uppercase());
+        }
+        if spec.contains('<') {
+            return Ok(text.to_lowercase());
+        }
+        // 没有占位符也没有日期/文本标记：整串按字面量输出（`Format(5, ",")` 是 `,`）。
+        return Ok(format_literal(spec));
     }
 
     let number = value
@@ -2829,7 +3049,8 @@ fn format_value(value: &Value, spec: &str) -> Result<String, String> {
 /// `@` / `&` 文本占位符：文本按占位符个数左补空格（VB6 实测 `Format("abc", "@@@@@")` 是 `"  abc"`、
 /// `Format(1234.5, "@@@@@@")` 是 `"1234.5"`，超长时不截断）。
 fn format_text(value: &Value, spec: &str) -> String {
-    let width = spec.chars().filter(|ch| matches!(ch, '@' | '&')).count();
+    // `@` 补空格到占位符个数，`&` 不补（本机 VB6 实测 `Format("abc", "&&&&")` 是 `abc`）。
+    let width = spec.chars().filter(|ch| *ch == '@').count();
     let text = value.to_display();
     let length = text.chars().count();
     if length >= width {
@@ -3017,74 +3238,318 @@ fn format_section(value: f64, section: &str) -> Result<String, String> {
     if section.is_empty() {
         return Ok(String::new());
     }
+    let chars = parse_format_chars(section);
 
-    let chars: Vec<char> = section.chars().collect();
-    let first = chars.iter().position(|ch| matches!(ch, '0' | '#'));
-    let last = chars.iter().rposition(|ch| matches!(ch, '0' | '#'));
-    let (Some(first), Some(last)) = (first, last) else {
-        return Ok(unquote(section));
-    };
-
-    let prefix = unquote(&chars[..first].iter().collect::<String>());
-    // 占位符后面的每个逗号表示「除以 1000」（`Format(1234567, "0,")` 是 `1235`）。
-    let mut scale = 0u32;
-    let mut suffix_chars = &chars[last + 1..];
-    while suffix_chars.first() == Some(&',') {
-        scale += 1;
-        suffix_chars = &suffix_chars[1..];
-    }
-    let suffix = unquote(&suffix_chars.iter().collect::<String>());
-
-    let core: String = chars[first..=last].iter().collect();
-    let (mantissa, exponent) = match core.find(['E', 'e']) {
-        Some(index) => (core[..index].to_string(), Some(core[index..].to_string())),
-        None => (core.clone(), None),
-    };
-    if let Some(bad) = mantissa
-        .chars()
-        .find(|ch| !matches!(ch, '0' | '#' | ',' | '.'))
+    // 本机 VB6 实测：段首的 `!` 让这一段的数字填充失效——整段按字面量输出，`!` 本身丢掉。
+    if chars
+        .first()
+        .is_some_and(|item| !item.literal && item.ch == '!')
     {
-        return Err(format!("`Format` 不支持格式字符 `{bad}`"));
+        return Ok(chars
+            .iter()
+            .filter(|item| item.ch != '!')
+            .map(|item| item.ch)
+            .collect());
     }
-    let exponent = match exponent {
-        Some(text) => Some(exponent_spec(&text)?),
-        None => None,
-    };
 
-    let value = if prefix.contains('%') || suffix.contains('%') {
-        value * 100.0
-    } else {
-        value
-    };
-    // 末尾逗号是千位缩放（每个逗号除以 1000），在百分比之后、取整之前应用。
+    let placeholder = |item: &FormatChar| !item.literal && matches!(item.ch, '0' | '#');
+    let decimal = chars
+        .iter()
+        .position(|item| !item.literal && item.ch == '.');
+    let int_end = decimal.unwrap_or(chars.len());
+    let frac_start = decimal.map_or(chars.len(), |index| index + 1);
+    let int_placeholders: Vec<usize> = (0..int_end).filter(|&i| placeholder(&chars[i])).collect();
+    let frac_placeholders: Vec<usize> = (frac_start..chars.len())
+        .filter(|&i| placeholder(&chars[i]))
+        .collect();
+    if int_placeholders.is_empty() && frac_placeholders.is_empty() {
+        return Ok(chars.iter().map(|item| item.ch).collect());
+    }
+
+    // 指数写法（`0.00E+00`）：尾数交给 `render_scientific`，前面的字面量原样保留。
+    // `E` 可能在小数点后面，所以要在整段里找。
+    if let Some(exponent) = chars
+        .iter()
+        .position(|item| !item.literal && matches!(item.ch, 'E' | 'e'))
+    {
+        return render_section_scientific(value, &chars, exponent);
+    }
+
+    let last_placeholder = frac_placeholders
+        .last()
+        .or(int_placeholders.last())
+        .copied();
+    // `%` 只有出现在最后一个占位符后面才乘 100（`%0` 不乘，本机 VB6 实测）。
+    let percent = last_placeholder.is_some_and(|last| {
+        chars[last + 1..]
+            .iter()
+            .any(|item| !item.literal && item.ch == '%')
+    });
+    let value = if percent { value * 100.0 } else { value };
+
+    // 整数占位符后面、小数点之前的每个逗号表示除以 1000（`Format(1234567, "0,")` 是 `1235`）。
+    let mut scale = 0u32;
+    if let Some(last) = int_placeholders.last() {
+        for item in &chars[last + 1..int_end] {
+            if !item.literal && item.ch == ',' {
+                scale += 1;
+            }
+        }
+    }
     let value = if scale > 0 {
         value / 1000f64.powi(scale as i32)
     } else {
         value
     };
 
+    // 整数占位符之间的逗号是千位分组（`#,##0` 对 1234567 是 `1,234,567`）。
+    let grouped = match (int_placeholders.first(), int_placeholders.last()) {
+        (Some(first), Some(last)) => chars[*first..=*last]
+            .iter()
+            .any(|item| !item.literal && item.ch == ','),
+        _ => false,
+    };
+
+    let decimals = frac_placeholders.len();
+    let (integer_digits, fraction_digits) = round_decimal(value, decimals);
+    let min_integer = int_placeholders
+        .iter()
+        .filter(|&&index| chars[index].ch == '0')
+        .count();
+    let mut digits = integer_digits;
+    if digits == "0" && min_integer == 0 {
+        // `#` 没有最少位数时 0 不显示（`Format(0, "#.##")` 是 `.`）。
+        digits.clear();
+    }
+    while digits.chars().count() < min_integer {
+        digits.insert(0, '0');
+    }
+
+    let mut output = String::with_capacity(section.len() + 4);
+    if grouped {
+        // 分组时按整串数字每三位插逗号：格式串里的逗号位置与占位符个数都不再限制位数。
+        let first = int_placeholders.first().copied().unwrap_or(0);
+        let last = int_placeholders.last().copied().unwrap_or(first);
+        push_literals(&mut output, &chars[..first]);
+        if !digits.is_empty() {
+            output.push_str(&group_thousands(&digits));
+        }
+        push_literals(&mut output, &chars[last + 1..int_end]);
+    } else {
+        push_positional_section(
+            &mut output,
+            &chars,
+            &int_placeholders,
+            &frac_placeholders,
+            decimal,
+            &digits,
+            &fraction_digits,
+        );
+        return Ok(output);
+    }
+
+    if decimal.is_some() {
+        output.push('.');
+        push_fraction_literals(
+            &mut output,
+            &chars,
+            frac_start,
+            &frac_placeholders,
+            &fraction_digits,
+        );
+    }
+    Ok(output)
+}
+
+/// 格式串里的一个字符：`literal` 表示它被 `\` 或 `"` 转义过，不参与占位符解释。
+#[derive(Clone, Copy)]
+struct FormatChar {
+    ch: char,
+    literal: bool,
+}
+
+/// 拆出格式串的字符并处理转义：`\x` 与 `"…"` 里的字符按字面量输出。
+fn parse_format_chars(section: &str) -> Vec<FormatChar> {
+    let mut chars = Vec::with_capacity(section.chars().count());
+    let mut iter = section.chars();
+    while let Some(ch) = iter.next() {
+        match ch {
+            '\\' => {
+                if let Some(next) = iter.next() {
+                    chars.push(FormatChar {
+                        ch: next,
+                        literal: true,
+                    });
+                }
+            }
+            '"' => {
+                for inner in iter.by_ref() {
+                    if inner == '"' {
+                        break;
+                    }
+                    chars.push(FormatChar {
+                        ch: inner,
+                        literal: true,
+                    });
+                }
+            }
+            _ => chars.push(FormatChar { ch, literal: false }),
+        }
+    }
+    chars
+}
+
+/// 没有占位符时的 `Format`：整串按字面量输出（段首 `!` 的怪癖与数值格式一致）。
+fn format_literal(spec: &str) -> String {
+    parse_format_chars(spec)
+        .iter()
+        .filter(|item| item.ch != '!')
+        .map(|item| item.ch)
+        .collect()
+}
+
+/// 原样输出一批字符（转义已处理）；未转义的逗号只用于分组/缩放，不显示。
+fn push_literals(output: &mut String, chars: &[FormatChar]) {
+    for item in chars {
+        if !item.literal && item.ch == ',' {
+            continue;
+        }
+        output.push(item.ch);
+    }
+}
+
+/// 科学计数法的分段渲染：`0.00E+00` 前面的字面量、尾数、指数与后面的字面量。
+fn render_section_scientific(
+    value: f64,
+    chars: &[FormatChar],
+    exponent: usize,
+) -> Result<String, String> {
+    let placeholder = |item: &FormatChar| !item.literal && matches!(item.ch, '0' | '#');
+    let first = (0..exponent)
+        .find(|&i| placeholder(&chars[i]))
+        .ok_or_else(|| "`Format` 的指数格式缺少数字占位符".to_string())?;
+    let last = (0..exponent)
+        .rfind(|&i| placeholder(&chars[i]))
+        .unwrap_or(first);
+    let mantissa: String = chars[first..=last]
+        .iter()
+        .filter(|item| placeholder(item) || (!item.literal && matches!(item.ch, '.' | ',')))
+        .map(|item| item.ch)
+        .collect();
+    let spec_text: String = chars[exponent..].iter().map(|item| item.ch).collect();
+    let spec = exponent_spec(&spec_text)?;
     let (int_format, frac_format) = match mantissa.split_once('.') {
         Some((int, frac)) => (int, frac),
         None => (mantissa.as_str(), ""),
     };
-    let (integer, fraction, exponent_text) = match exponent {
-        Some(spec) => render_scientific(value, int_format, frac_format, &spec),
-        None => {
-            let (integer, fraction) = render_fixed(value, int_format, frac_format);
-            (integer, fraction, String::new())
-        }
-    };
+    let (integer, fraction, exponent_text) =
+        render_scientific(value, int_format, frac_format, &spec);
 
-    let mut output = String::with_capacity(section.len() + 4);
-    output.push_str(&prefix);
+    let mut output = String::with_capacity(chars.len() + 8);
+    push_literals(&mut output, &chars[..first]);
     output.push_str(&integer);
-    if !frac_format.is_empty() {
+    if mantissa.contains('.') {
         output.push('.');
         output.push_str(&fraction);
     }
     output.push_str(&exponent_text);
-    output.push_str(&suffix);
     Ok(output)
+}
+
+/// 不做千位分组时的逐字符排版：整数占位符右对齐填数字，小数占位符左对齐，
+/// 其它字符按位置原样输出（逗号只用于分组/缩放，不直接显示）。
+fn push_positional_section(
+    output: &mut String,
+    chars: &[FormatChar],
+    int_placeholders: &[usize],
+    frac_placeholders: &[usize],
+    decimal: Option<usize>,
+    digits: &str,
+    fraction_digits: &str,
+) {
+    let total_int = int_placeholders.len();
+    let digit_count = digits.chars().count();
+    // 位数比占位符多时，多出来的数字接在最左边那个占位符前面。
+    let extra = digit_count.saturating_sub(total_int);
+    let fraction_limit = {
+        let min = frac_placeholders
+            .iter()
+            .filter(|&&index| chars[index].ch == '0')
+            .count();
+        fraction_digits
+            .trim_end_matches('0')
+            .chars()
+            .count()
+            .max(min)
+    };
+    let mut int_index = 0usize;
+    let mut frac_index = 0usize;
+    for (index, item) in chars.iter().enumerate() {
+        if Some(index) == decimal {
+            // 没有整数占位符（`.00`）时整数部分也要显示（`Format(123, ".00")` 是 `123.00`），
+            // 但值为 0 时 `digits` 已经是空的。
+            if int_placeholders.is_empty() {
+                output.push_str(digits);
+            }
+            output.push('.');
+            continue;
+        }
+        if int_index < int_placeholders.len() && int_placeholders[int_index] == index {
+            if int_index == 0 && extra > 0 {
+                output.push_str(&digits.chars().take(extra).collect::<String>());
+            }
+            let digit_index = digit_count as isize - (total_int - int_index) as isize;
+            if digit_index >= 0 && (digit_index as usize) < digit_count {
+                output.push(digits.chars().nth(digit_index as usize).unwrap_or('0'));
+            }
+            int_index += 1;
+            continue;
+        }
+        if frac_index < frac_placeholders.len() && frac_placeholders[frac_index] == index {
+            if frac_index < fraction_limit && frac_index < fraction_digits.chars().count() {
+                output.push(fraction_digits.chars().nth(frac_index).unwrap_or('0'));
+            }
+            frac_index += 1;
+            continue;
+        }
+        if !item.literal && item.ch == ',' {
+            continue;
+        }
+        output.push(item.ch);
+    }
+}
+
+/// 千位分组时的小数部分：占位符左对齐填数字，字面量原样保留，逗号不显示。
+fn push_fraction_literals(
+    output: &mut String,
+    chars: &[FormatChar],
+    start: usize,
+    frac_placeholders: &[usize],
+    fraction_digits: &str,
+) {
+    let min = frac_placeholders
+        .iter()
+        .filter(|&&index| chars[index].ch == '0')
+        .count();
+    let fraction_limit = fraction_digits
+        .trim_end_matches('0')
+        .chars()
+        .count()
+        .max(min);
+    let mut frac_index = 0usize;
+    for (index, item) in chars.iter().enumerate().skip(start) {
+        if !item.literal && item.ch == ',' {
+            continue;
+        }
+        if frac_index < frac_placeholders.len() && frac_placeholders[frac_index] == index {
+            if frac_index < fraction_limit {
+                output.push(fraction_digits.chars().nth(frac_index).unwrap_or('0'));
+            }
+            frac_index += 1;
+            continue;
+        }
+        output.push(item.ch);
+    }
 }
 
 /// 把非负数按 `0`/`#` 的位数渲染成 (整数部分, 小数部分)。
@@ -3235,31 +3700,6 @@ fn group_thousands(digits: &str) -> String {
             output.push(',');
         }
         output.push(ch);
-    }
-    output
-}
-
-/// 去掉格式里的引号/反斜杠转义，得到字面量文本。
-fn unquote(text: &str) -> String {
-    let mut output = String::new();
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' => {
-                for inner in chars.by_ref() {
-                    if inner == '"' {
-                        break;
-                    }
-                    output.push(inner);
-                }
-            }
-            '\\' => {
-                if let Some(next) = chars.next() {
-                    output.push(next);
-                }
-            }
-            _ => output.push(ch),
-        }
     }
     output
 }

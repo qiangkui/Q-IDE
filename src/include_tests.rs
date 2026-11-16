@@ -59,10 +59,7 @@ fn include_expands_types_constants_and_keeps_main_line_numbers() {
     assert_eq!(program.procedures[0].line, 7);
     assert!(program.types.iter().any(|ty| ty.display == "Pt"));
 
-    assert_eq!(
-        output(main, &path).expect("应当运行成功"),
-        ["42", "7"]
-    );
+    assert_eq!(output(main, &path).expect("应当运行成功"), ["42", "7"]);
     assert!(
         crate::lint::analyze_with_path(main, Some(&path))
             .issues
@@ -78,9 +75,12 @@ fn include_falls_back_to_the_program_assets_directory() {
     let main = "#Include \"common.vb\"\nDebug.Print FROM_ASSETS\n";
     let path = dir.write("main.vb", main);
 
-    let expanded =
-        crate::interpreter::include::expand_with_assets(main, Some(&path), Some(assets.0.as_path()))
-            .expect("应当从 assets 找到 include");
+    let expanded = crate::interpreter::include::expand_with_assets(
+        main,
+        Some(&path),
+        Some(assets.0.as_path()),
+    )
+    .expect("应当从 assets 找到 include");
     assert!(expanded.text.contains("FROM_ASSETS"), "{}", expanded.text);
 
     let program =
@@ -109,9 +109,12 @@ fn script_directory_takes_precedence_over_assets() {
     assets.write("common.vb", "Private Const FROM_ASSETS As Long = 2\n");
     let main = "#Include \"common.vb\"\nDebug.Print FROM_SCRIPT\n";
     let path = dir.write("main.vb", main);
-    let expanded =
-        crate::interpreter::include::expand_with_assets(main, Some(&path), Some(assets.0.as_path()))
-            .expect("脚本目录里的同名文件优先");
+    let expanded = crate::interpreter::include::expand_with_assets(
+        main,
+        Some(&path),
+        Some(assets.0.as_path()),
+    )
+    .expect("脚本目录里的同名文件优先");
     assert!(expanded.text.contains("FROM_SCRIPT"));
     assert!(!expanded.text.contains("FROM_ASSETS"));
 }
@@ -138,7 +141,10 @@ fn include_only_happens_once() {
     dir.write("common.vb", "Private Const VALUE As Long = 9\n");
     let main = "#Include \"common.vb\"\n#Include \"common.vb\"\nDebug.Print VALUE\n";
     let path = dir.write("main.vb", main);
-    assert_eq!(output(main, &path).expect("重复 include 不应重复定义"), ["9"]);
+    assert_eq!(
+        output(main, &path).expect("重复 include 不应重复定义"),
+        ["9"]
+    );
 }
 
 #[test]
@@ -185,7 +191,10 @@ fn nested_include_error_maps_to_the_top_level_directive() {
 fn nested_include_definitions_are_in_scope() {
     let dir = TempDir::new("nested-ok");
     dir.write("b.vb", "Private Const B1 As Long = 2\n");
-    dir.write("a.vb", "Private Const A1 As Long = 1\n#Include \"b.vb\"\nPrivate Const A2 As Long = 3\n");
+    dir.write(
+        "a.vb",
+        "Private Const A1 As Long = 1\n#Include \"b.vb\"\nPrivate Const A2 As Long = 3\n",
+    );
     let main = "#Include \"a.vb\"\nDebug.Print A1 + B1 + A2\n";
     let path = dir.write("main.vb", main);
     assert_eq!(output(main, &path).expect("嵌套 include 应当可用"), ["6"]);

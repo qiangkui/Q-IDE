@@ -6,10 +6,7 @@ use crate::custom_theme::{
 use crate::theme::Palette;
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "gpui-first-theme-{}-{name}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("gpui-first-theme-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }
@@ -69,9 +66,8 @@ fn missing_colors_fall_back_to_the_base_palette() {
 
 #[test]
 fn light_base_and_unknown_keys_are_handled() {
-    let store = ThemeStore::parse(
-        "theme=晨光\nbase=light\nnonsense=1\npanel_bg=oops\nwindow_bg=#FFFFFF\n",
-    );
+    let store =
+        ThemeStore::parse("theme=晨光\nbase=light\nnonsense=1\npanel_bg=oops\nwindow_bg=#FFFFFF\n");
     let theme = store.find("晨光").expect("应解析出主题");
     assert!(!theme.dark);
     assert_eq!(theme.colors[0], 0xffffff);
@@ -101,7 +97,10 @@ fn draft_rejects_invalid_colors_and_points_at_the_field() {
     draft.set_name("深蓝");
     draft.set_color(0, "#12");
     let error = draft.to_theme().expect_err("颜色非法应报错");
-    assert!(error.contains(COLORS[0].label), "错误信息应指出哪一项：{error}");
+    assert!(
+        error.contains(COLORS[0].label),
+        "错误信息应指出哪一项：{error}"
+    );
 }
 
 #[test]

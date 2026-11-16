@@ -25,12 +25,7 @@ pub fn render(palette: Palette, maximized: bool, menu_bar: impl IntoElement) -> 
                 // 内容整体下移一点，视觉上更居中于系统窗口边缘。
                 .pt(px(4.0))
                 .pr(px(6.0))
-                .child(
-                    img("app-icon.png")
-                        .flex_shrink_0()
-                        .w(px(16.0))
-                        .h(px(16.0)),
-                ),
+                .child(img("app-icon.png").flex_shrink_0().w(px(16.0)).h(px(16.0))),
         )
         .child(
             h_flex()

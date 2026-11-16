@@ -97,9 +97,67 @@ Debug.Print Dir(\"*.txt\")
         "App.Path 应当返回脚本所在目录"
     );
     assert_eq!(lines[3], "data.txt", "Dir 应当列出脚本目录里的文件");
+    // `Print #` 的行尾是 CRLF（本机 VB6 实测）。
     assert_eq!(
         std::fs::read_to_string(dir.join("out.txt")).expect("out.txt 应写在脚本目录"),
-        "written\n"
+        "written\r\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn get_attr_and_set_attr_match_vb6() {
+    // 期望值来自本机 VB6 实测：`SetAttr` 只接受 vbReadOnly/vbHidden/vbSystem/vbArchive 的组合
+    // （其它位报 5），属性不是数值报 13，缺文件报 53；目录的 vbDirectory 位由系统保留
+    // （`SetAttr vbHidden` 之后 `GetAttr` 是 18，改回 `vbNormal` 之后仍是 16）。
+    let dir = temp_dir("file-attributes");
+    let source = r#"
+Dim n As Integer
+n = FreeFile
+Open "attr.txt" For Output As #n
+Print #n, "x"
+Close #n
+On Error Resume Next
+SetAttr "attr.txt", vbArchive
+Debug.Print GetAttr("attr.txt") And (vbReadOnly Or vbHidden Or vbSystem Or vbDirectory Or vbArchive)
+SetAttr "attr.txt", vbReadOnly
+Debug.Print GetAttr("attr.txt")
+SetAttr "attr.txt", vbNormal
+Debug.Print GetAttr("attr.txt")
+SetAttr "attr.txt", vbReadOnly + vbHidden
+Debug.Print GetAttr("attr.txt")
+SetAttr "attr.txt", vbNormal
+SetAttr "attr.txt", vbReadOnly + vbHidden + vbSystem + vbArchive
+Debug.Print GetAttr("attr.txt")
+SetAttr "attr.txt", vbNormal
+Debug.Print GetAttr("attr.txt") And vbReadOnly
+MkDir "attr_dir"
+Debug.Print GetAttr("attr_dir") And (vbReadOnly Or vbHidden Or vbSystem Or vbDirectory Or vbArchive)
+SetAttr "attr_dir", vbHidden
+Debug.Print GetAttr("attr_dir") And (vbReadOnly Or vbHidden Or vbSystem Or vbDirectory Or vbArchive)
+SetAttr "attr_dir", vbNormal
+Debug.Print GetAttr("attr_dir") And (vbReadOnly Or vbHidden Or vbSystem Or vbDirectory Or vbArchive)
+Debug.Print Err.Number
+Err.Clear
+SetAttr "attr.txt", 16
+Debug.Print Err.Number
+Err.Clear
+SetAttr "attr.txt", 8192
+Debug.Print Err.Number
+Err.Clear
+SetAttr "attr.txt", "x"
+Debug.Print Err.Number
+Err.Clear
+Debug.Print GetAttr("missing.txt")
+Debug.Print Err.Number
+Rmdir "attr_dir"
+"#;
+    assert_eq!(
+        run_in_script_dir(&dir, source).expect("脚本应当跑完"),
+        [
+            "32", "1", "0", "3", "39", "0", "16", "18", "16", "0", "5", "5", "13", "53"
+        ]
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -181,7 +239,8 @@ Close
     assert_eq!(lines[0], "读到: hello");
     assert_eq!(lines[1], format!("App.Path = {}", dir.display()));
     assert_eq!(lines[2], format!("CurDir   = {}", dir.display()));
-    assert_eq!(lines[3], "FileLen(output.txt) = 18");
+    // 本机 VB6 实测：`Print #` 的行尾是 CRLF，"hello from script" 写出去是 19 字节。
+    assert_eq!(lines[3], "FileLen(output.txt) = 19");
     assert_eq!(lines[4], "文件: data.txt");
     assert_eq!(lines[5], "文件: output.txt");
     assert_eq!(
@@ -938,6 +997,127 @@ Debug.Print VarType(ObjPtr(nothing1))
         [
             "0", "Picture", "9", "False", "True", "True", "True", "Picture", "False", "53", "481",
             "True", "False", "3", "False", "True", "0", "3",
+        ]
+    );
+}
+
+/// 财务函数与 VB6 一致的失败：错误号 5 / 11 / 13 / 94。
+#[test]
+fn financial_functions_raise_vb6_error_numbers() {
+    let statements = [
+        "x = SLN(10000, 1000, 0)",
+        "x = SYD(10000, 1000, 5, 6)",
+        "x = SYD(10000, 1000, 5, 0)",
+        "x = SYD(10000, 1000, 0, 1)",
+        "x = SYD(10000, 1000, -5, 1)",
+        "x = DDB(10000, 1000, 5, 6)",
+        "x = DDB(10000, 1000, 5, 1, 0)",
+        "x = DDB(10000, 1000, 5, 1, -1)",
+        "x = DDB(10000, 1000, 0, 1)",
+        "x = DDB(10000, 1000, -5, 1)",
+        "x = DDB(10000, 1000, 5, 0)",
+        "x = Pmt(0, 0, 10000)",
+        "x = Pmt(0.05, 0, 10000)",
+        "x = NPer(0.05, 0, 1000)",
+        "x = NPer(0, 0, 1000)",
+        "x = IPmt(0.05, 0, 10, 10000)",
+        "x = IPmt(0.05, 11, 10, 10000)",
+        "x = PPmt(0.05, 0, 10, 10000)",
+        "x = Rate(10, -100, 1000)",
+        "x = Rate(10, -100, 1000, 0, 0, 0.05)",
+        "x = Rate(10, -100, 1000, 0, 1)",
+        "x = Rate(5, -100, 500)",
+    ];
+    let mut source = String::from("On Error Resume Next\nDim x\n");
+    for statement in statements {
+        source.push_str(&format!("Err.Clear\n{statement}\nPrint CStr(Err.Number)\n"));
+    }
+    source.push_str("Err.Clear\nx = SLN(Null, 1000, 5)\nPrint CStr(Err.Number)\n"); // 94
+    source.push_str("Err.Clear\nx = SLN(\"abc\", 1000, 5)\nPrint CStr(Err.Number)\n"); // 13
+    let lines = run_with_args(&source, "").expect("错误用例应当被 On Error 接住");
+    let mut expected: Vec<&str> = vec!["5"; statements.len()];
+    expected.extend(["94", "13"]);
+    assert_eq!(lines, expected);
+}
+/// `NPV`/`IRR`/`MIRR`/`Rate`/`IPmt`：期望值同样是本机 VB6 实测的 `CStr` 结果。
+///
+/// `IRR`/`Rate` 是迭代解（割线法），`IPmt`/`MIRR` 的部分算例在 x87 长双精度下末位差 1，
+/// 所以这几项只比对字符串，能不能逐位一致取决于运算顺序——下面的期望值是两边对齐后的结果。
+#[test]
+fn financial_cash_flow_functions_match_vb6() {
+    let source = r#"
+Dim a(0 To 3) As Double
+Dim b(0 To 1) As Double
+Dim c(0 To 3) As Double
+Dim d(0 To 2) As Double
+Dim e(0 To 2) As Double
+a(0) = -10000: a(1) = 3000: a(2) = 4200: a(3) = 6800
+b(0) = -1000: b(1) = 1100
+c(0) = -1000: c(1) = 300: c(2) = 400: c(3) = 500
+d(0) = -1000: d(1) = 0: d(2) = 1210
+e(0) = -1000: e(1) = -200: e(2) = 1500
+Print CStr(NPV(0.1, a))
+Print CStr(NPV(0, a))
+Print CStr(NPV(-0.5, a))
+Print CStr(MIRR(c, 0, 0))
+Print CStr(MIRR(c, 0, 0.12))
+Print CStr(MIRR(c, 0.1, 0))
+Print CStr(MIRR(d, 0.1, 0.1))
+Print CStr(MIRR(d, 0, 0.15))
+Print CStr(MIRR(e, 0.1, 0.1))
+Print CStr(MIRR(e, 0, 0))
+Print CStr(MIRR(e, 0.05, 0.2))
+Print CStr(IRR(a))
+Print CStr(IRR(a, 0.2))
+"#;
+    let lines = run_with_args(source, "").expect("现金流函数脚本应当执行成功");
+    assert_eq!(
+        lines,
+        [
+            "1188.44341233522",
+            "4000",
+            "134400",
+            "6.26585691826111E-02",
+            "9.81566924463155E-02",
+            "6.26585691826111E-02",
+            "0.1",
+            "0.1",
+            "0.126601424298216",
+            "0.118033988749895",
+            "0.122497216032182",
+            "0.163405600684551",
+            "0.163405600688998",
+        ]
+    );
+}
+
+/// 迭代解与 VB6 的差值（VB6 的 `IRR` 收敛到 1e-11 量级就停了，`Rate` 更紧）。
+#[test]
+fn financial_iterative_results_stay_close_to_vb6() {
+    let source = r#"
+Dim a(0 To 3) As Double
+Dim c(0 To 3) As Double
+Dim p(0 To 2) As Double
+a(0) = -10000: a(1) = 3000: a(2) = 4200: a(3) = 6800
+c(0) = -1000: c(1) = 300: c(2) = 400: c(3) = 500
+p(0) = 100: p(1) = 200: p(2) = 300
+On Error Resume Next
+Dim x
+Print CStr(Abs(MIRR(c, 0.1, 0.1) - 0.0922317710801409) < 0.000000000001)
+Print CStr(Abs(IPmt(0.05, 5, 10, 10000) + 328.662671913506) < 0.000000001)
+Print CStr(Abs(IRR(a, -0.1) - 0.163405600688989) < 0.0000001)
+Print CStr(Abs(Rate(11, -100, 1000) - 0.0162313281745908) < 0.000000001)
+Print CStr(Abs(Rate(10, -100, 1000, 100) + 0.020569696650118) < 0.000000001)
+Print CStr(Abs(Rate(360, -1000, 200000) - 0.00365592795236269) < 0.000000001)
+Print CStr(Abs(Rate(20, 100, -1000) - 0.0775468953001051) < 0.000000001)
+Err.Clear: x = IRR(p): Print CStr(Err.Number)
+Err.Clear: x = MIRR(p, 0.1, 0.1): Print CStr(Err.Number)
+"#;
+    let lines = run_with_args(source, "").expect("脚本应当执行成功");
+    assert_eq!(
+        lines,
+        [
+            "True", "True", "True", "True", "True", "True", "True", "5", "11"
         ]
     );
 }

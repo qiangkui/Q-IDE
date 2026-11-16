@@ -3,7 +3,9 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use crate::workspace::{best_match, collect_files, disk_stamp, fuzzy_score, reprefix_path, stamp_differs};
+use crate::workspace::{
+    best_match, collect_files, disk_stamp, fuzzy_score, reprefix_path, stamp_differs,
+};
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("gpui-first-{name}-{}", std::process::id()));
@@ -120,7 +122,10 @@ fn reprefix_path_rewrites_files_under_a_renamed_folder() {
 #[test]
 fn reprefix_path_ignores_similar_prefixes() {
     // 只差前缀的兄弟目录不能被当成子项。
-    assert_eq!(reprefix_path("C:\\proj\\older\\a.vb", "C:\\proj\\old", ""), None);
+    assert_eq!(
+        reprefix_path("C:\\proj\\older\\a.vb", "C:\\proj\\old", ""),
+        None
+    );
     assert_eq!(reprefix_path("C:\\proj\\oldish", "C:\\proj\\old", ""), None);
     assert_eq!(
         reprefix_path("C:\\proj\\old\\a.vb", "C:\\proj\\old", "").as_deref(),

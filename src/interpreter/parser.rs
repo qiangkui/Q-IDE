@@ -1232,7 +1232,7 @@ impl Parser {
         }
 
         if self.at_op(Op::Dot) {
-            return self.parse_with_member(line);
+            return self.parse_with_member(line, false);
         }
         if self.eat_kw(Kw::With) {
             let subject = self.parse_expr()?;
@@ -1425,11 +1425,7 @@ impl Parser {
             } else if self.at_statement_end() {
                 Vec::new()
             } else {
-                let mut args = vec![self.parse_expr()?];
-                while self.eat_op(Op::Comma) {
-                    args.push(self.parse_expr()?);
-                }
-                args
+                self.parse_plain_args()?
             };
             return Ok(Stmt::RaiseEvent { name, args, line });
         }
@@ -1452,6 +1448,10 @@ impl Parser {
         }
         if self.at_kw(Kw::Set) {
             self.advance();
+            // `With` 块里的 `Set .Child = 对象`。
+            if self.at_op(Op::Dot) {
+                return self.parse_with_member(line, true);
+            }
             let target = self.expect_ident("对象变量名")?;
             // `Set obj.Member = x` / `Set obj.Item(1) = x`：对象属性的赋值。
             if self.at_op(Op::Dot) {
@@ -1464,13 +1464,14 @@ impl Parser {
                 } else {
                     Vec::new()
                 };
-                if !indices.is_empty() {
-                    let mut member_path = Vec::new();
-                    while self.eat_op(Op::Dot) {
-                        member_path.push(self.expect_member_name()?);
-                    }
-                    self.expect_op(Op::Eq, "`Set` 需要 `=`")?;
-                    let value = self.parse_expr()?;
+                // `Set obj.Method().Prop = x` 也是合法写法：空括号后面还能接成员路径。
+                let mut member_path = Vec::new();
+                while self.eat_op(Op::Dot) {
+                    member_path.push(self.expect_member_name()?);
+                }
+                self.expect_op(Op::Eq, "`Set` 需要 `=`")?;
+                let value = self.parse_expr()?;
+                if !indices.is_empty() || !member_path.is_empty() {
                     return Ok(Stmt::AssignMemberIndex {
                         base: Expr::Var(target),
                         path,
@@ -1481,8 +1482,6 @@ impl Parser {
                         line,
                     });
                 }
-                self.expect_op(Op::Eq, "`Set` 需要 `=`")?;
-                let value = self.parse_expr()?;
                 return Ok(Stmt::AssignMember {
                     base: Expr::Var(target),
                     path,
@@ -1578,26 +1577,47 @@ impl Parser {
         })
     }
 
-    /// `With` 块里的 `.X = 1`（也允许 `.A.B = 1`）。
-    fn parse_with_member(&mut self, line: usize) -> Result<Stmt, ParseError> {
+    /// `With` 块里的 `.X = 1`（也允许 `.A.B = 1` / `.X(1) = 5` / `.X(1).Y = 5`）。
+    ///
+    /// `set_op` 来自 `Set .X = 对象`：赋值走 `Property Set`。
+    fn parse_with_member(&mut self, line: usize, set_op: bool) -> Result<Stmt, ParseError> {
         let mut path = Vec::new();
         while self.eat_op(Op::Dot) {
             path.push(self.expect_member_name()?);
         }
+        let mut indices = Vec::new();
+        let mut member_path = Vec::new();
+        let mut had_parens = false;
+        if self.at_op(Op::LParen) {
+            had_parens = true;
+            indices = self.parse_paren_args()?;
+            while self.eat_op(Op::Dot) {
+                member_path.push(self.expect_member_name()?);
+            }
+        }
         if self.eat_op(Op::Eq) {
             let value = self.parse_expr()?;
-            return Ok(Stmt::AssignWithMember { path, value, line });
+            return Ok(Stmt::AssignWithMember {
+                path,
+                indices,
+                member_path,
+                value,
+                set_op,
+                line,
+            });
         }
-        let args = if self.at_op(Op::LParen) {
-            self.parse_paren_args()?
+        if !member_path.is_empty() {
+            return Err(ParseError::new(
+                "`.成员(实参).成员` 不能单独成句，后面需要 `=`",
+                line,
+            ));
+        }
+        let args = if had_parens {
+            indices
         } else if self.at_statement_end() {
             Vec::new()
         } else {
-            let mut args = vec![self.parse_expr()?];
-            while self.eat_op(Op::Comma) {
-                args.push(self.parse_expr()?);
-            }
-            args
+            self.parse_plain_args()?
         };
         Ok(Stmt::WithCall { path, args, line })
     }
@@ -1656,7 +1676,20 @@ impl Parser {
         }))
     }
 
+    /// 把从 `start` 开始的整条语句重新解析成表达式（求值后丢掉结果）。
+    fn parse_expression_statement(
+        &mut self,
+        start: usize,
+        line: usize,
+    ) -> Result<Stmt, ParseError> {
+        self.pos = start;
+        let expr = self.parse_expr()?;
+        Ok(Stmt::Eval { expr, line })
+    }
+
     fn parse_ident_statement(&mut self, line: usize) -> Result<Stmt, ParseError> {
+        // 语句起点：`obj.Method(实参).属性` 这类单独成句的表达式要用它回退重解析。
+        let statement_start = self.pos;
         let (name, suffix) = self.expect_ident_typed("语句")?;
         // `Name 旧路径 As 新路径`：VB 的改名语句（`As` 不是表达式的一部分，得单独解析）。
         if name == "name"
@@ -1728,11 +1761,14 @@ impl Parser {
                 if self.at_op(Op::LParen) {
                     args = self.parse_paren_args()?;
                 } else {
-                    args.push(self.parse_expr()?);
-                    while self.eat_op(Op::Comma) {
-                        args.push(self.parse_expr()?);
-                    }
+                    args = self.parse_plain_args()?;
                 }
+            }
+            // `obj.Method(实参).属性` 单独成句：整条按表达式求值（会先执行调用再读属性）。
+            // 这条比 VB6 宽：本机 VB6 `/make` 实测 `h.Self2().Value` 单独成句编译不过，
+            // QIDE 宽容处理，详见 ROADMAP「已知遗留」。
+            if self.at_op(Op::Dot) {
+                return self.parse_expression_statement(statement_start, line);
             }
             return Ok(Stmt::CallMethod {
                 object: name,
@@ -1785,6 +1821,10 @@ impl Parser {
             {
                 return Ok(stmt);
             }
+            // `Foo(1).Bar` 单独成句：整条按表达式求值。
+            if self.at_op(Op::Dot) {
+                return self.parse_expression_statement(statement_start, line);
+            }
             return Ok(Stmt::Call {
                 name,
                 by_value_args: Vec::new(),
@@ -1802,10 +1842,7 @@ impl Parser {
                 line,
             });
         }
-        args.push(self.parse_expr()?);
-        while self.eat_op(Op::Comma) {
-            args.push(self.parse_expr()?);
-        }
+        args.append(&mut self.parse_plain_args()?);
         Ok(Stmt::Call {
             name,
             args,
@@ -2514,9 +2551,29 @@ impl Parser {
                 self.advance();
                 Expr::Literal(Value::Null)
             }
-            TokenKind::Kw(Kw::Empty | Kw::Nothing) => {
+            TokenKind::Kw(Kw::Empty) => {
                 self.advance();
                 Expr::Literal(Value::Empty)
+            }
+            // `Nothing` 是独立的值：`VarType` 是 9、`TypeName` 是 `Nothing`、`IsObject` 为真（本机 VB6 实测）。
+            TokenKind::Kw(Kw::Nothing) => {
+                self.advance();
+                Expr::Literal(Value::Nothing)
+            }
+            // `Input(n, #f)`：表达式里的 `Input` 是读字符的函数（语句形式是 `Input #` / `Line Input #`）。
+            // VB6 的文件号可以带 `#`（`Input(3, #1)`），这里手动解析两个实参、吃掉那个 `#`。
+            TokenKind::Kw(Kw::Input) if matches!(self.peek_at(1), TokenKind::Op(Op::LParen)) => {
+                self.advance();
+                self.expect_op(Op::LParen, "`Input` 需要 `(`")?;
+                let count = self.parse_expr()?;
+                self.expect_op(Op::Comma, "`Input` 需要 `,` 和文件号")?;
+                self.eat_op(Op::Hash);
+                let number = self.parse_expr()?;
+                self.expect_op(Op::RParen, "`Input` 缺少 `)`")?;
+                Expr::Call {
+                    name: "input".to_string(),
+                    args: vec![count, number],
+                }
             }
             TokenKind::Ident(name) if name == "new" => {
                 self.advance();
@@ -2638,6 +2695,10 @@ impl Parser {
     }
 
     fn parse_argument(&mut self) -> Result<Expr, ParseError> {
+        // `F(a, , c)`：省略掉的实参（只能对应可选形参）。
+        if self.at_op(Op::Comma) || self.at_op(Op::RParen) {
+            return Ok(Expr::OmittedArg);
+        }
         if matches!(self.peek(), TokenKind::Ident(_))
             && matches!(self.peek_at(1), TokenKind::Colon)
             && matches!(self.peek_at(2), TokenKind::Op(Op::Eq))
@@ -2674,6 +2735,24 @@ impl Parser {
             self.skip_newlines();
         }
         self.expect_op(Op::RParen, "调用需要 `)`")?;
+        Ok(args)
+    }
+
+    /// 无括号调用的实参列表：`Foo a, , c`（中间省略的可选参数是 [`Expr::OmittedArg`]）。
+    ///
+    /// 调用方先确认「不是语句结尾」再进来；末尾的逗号（`Foo a,`）也算一个省略实参。
+    fn parse_plain_args(&mut self) -> Result<Vec<Expr>, ParseError> {
+        let mut args = Vec::new();
+        loop {
+            if self.at_op(Op::Comma) || self.at_statement_end() {
+                args.push(Expr::OmittedArg);
+            } else {
+                args.push(self.parse_expr()?);
+            }
+            if !self.eat_op(Op::Comma) {
+                break;
+            }
+        }
         Ok(args)
     }
 

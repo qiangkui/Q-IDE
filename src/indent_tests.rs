@@ -79,6 +79,52 @@ fn ordinary_statements_keep_indent() {
 }
 
 #[test]
+fn comment_tail_does_not_hide_a_block_opener() {
+    // 编辑器只在代码上下文里套规则，光标停在注释里时不会自动缩进；
+    // `dedent_after_block_end` 用这个函数补一次。
+    for line in [
+        "If a > 0 Then ' 注释",
+        "If a > 0 Then   '注释",
+        "For i = 1 To 3 '循环",
+        "Sub Main() '入口",
+        "Do 'loop",
+        "With obj '对象",
+        "Select Case x '分支",
+        "For i = 1 To 3: s = \"it's\" ' 字符串里的单引号不算注释",
+    ] {
+        assert!(
+            indent::opens_block_ignoring_comment(line),
+            "应当识别为开块：{line:?}"
+        );
+    }
+    for line in [
+        "x = 1 ' If a Then",
+        "Debug.Print \"If a > 0 Then\" ' 注释",
+        "s = \"it's\" ' 字符串里的单引号",
+        "If a > 0 Then x = 1 ' 单行 If 不开块",
+        "' If a > 0 Then",
+        "End If ' 结束",
+    ] {
+        assert!(
+            !indent::opens_block_ignoring_comment(line),
+            "不应识别为开块：{line:?}"
+        );
+    }
+}
+
+#[test]
+fn strip_comment_only_drops_the_trailing_comment() {
+    assert_eq!(indent::strip_comment("x = 1 ' 注释"), "x = 1 ");
+    assert_eq!(indent::strip_comment("x = 1"), "x = 1");
+    assert_eq!(indent::strip_comment("s = \"a'b\""), "s = \"a'b\"");
+    assert_eq!(
+        indent::strip_comment("s = \"a\"\"b\" ' c"),
+        "s = \"a\"\"b\" "
+    );
+    assert_eq!(indent::strip_comment(""), "");
+}
+
+#[test]
 fn closers_are_recognized() {
     for line in [
         "End Sub",

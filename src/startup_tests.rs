@@ -66,7 +66,10 @@ fn background_flag_keeps_paths() {
     assert_eq!(parse(["--background"]), background(&[]));
     assert_eq!(parse(["--background", "a.vb"]), background(&["a.vb"]));
     // 选项顺序无关，重复给出也不报错。
-    assert_eq!(parse(["a.vb", "--background", "--background"]), background(&["a.vb"]));
+    assert_eq!(
+        parse(["a.vb", "--background", "--background"]),
+        background(&["a.vb"])
+    );
     // `--` 之后一律当路径。
     assert_eq!(parse(["--", "--background"]), open(&["--background"]));
 }

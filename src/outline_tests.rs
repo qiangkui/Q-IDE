@@ -257,7 +257,11 @@ fn references_finds_every_whole_word_use() {
          Debug.Print TOTAL\n";
     let found = references(source, "total");
     let lines: Vec<usize> = found.iter().map(|(line, _)| *line).collect();
-    assert_eq!(lines, [1, 2, 3, 4], "整词、忽略大小写、注释里的不算：{found:?}");
+    assert_eq!(
+        lines,
+        [1, 2, 3, 4],
+        "整词、忽略大小写、注释里的不算：{found:?}"
+    );
     assert_eq!(found[1].1, "total = 1", "应当带上该行文本");
 }
 
@@ -299,7 +303,10 @@ fn goto_target_parses_line_numbers_and_names() {
         goto_target("AddOne"),
         Some(GotoTarget::Symbol("AddOne".to_string()))
     );
-    assert_eq!(goto_target("Box.Bump"), Some(GotoTarget::Symbol("Box.Bump".to_string())));
+    assert_eq!(
+        goto_target("Box.Bump"),
+        Some(GotoTarget::Symbol("Box.Bump".to_string()))
+    );
     assert_eq!(goto_target("0"), None, "行号从 1 开始");
     assert_eq!(goto_target("   "), None);
 }

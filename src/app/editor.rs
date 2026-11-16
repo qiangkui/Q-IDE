@@ -366,6 +366,10 @@ impl CodeWindow {
             "run.pause" => self.debug_pause(cx),
             "run.resume" => self.debug_resume(cx),
             "run.step" => self.debug_step(cx),
+            "run.break-on-error" => self.toggle_break_on_error(cx),
+            "run.step-over" => self.debug_step_over(cx),
+            "run.step-out" => self.debug_step_out(cx),
+            "run.set-variable" => self.set_variable_dialog(window, cx),
             "run.to-cursor" => self.run_to_cursor(cx),
             "debug.toggle-breakpoint" => self.toggle_breakpoint(cx),
             "debug.clear-breakpoints" => self.clear_all_breakpoints(cx),
@@ -656,6 +660,10 @@ impl CodeWindow {
     /// 新行会沿用该行自己的缩进；VB6 会给到外层缩进。这里在 `PressEnter` 之后看一眼：
     /// 新行只有空白、且上一行是块结束行，就用 `OutdentInline`（与 `Shift+Tab` 同一条路径）减一级，
     /// 撤销记录仍是一条。
+    ///
+    /// 同一个时机还补了另一半：上一行**行尾带注释**时组件的缩进规则整体不生效
+    /// （光标落在注释上下文里），`If x Then ' 说明` 之后回车不会自动缩进，
+    /// 这时按「注释之前的代码」判断开块，新行没有比上一行更深就补一次 `Indent`。
     fn dedent_after_block_end(
         &mut self,
         editor: &Entity<EditorState>,
@@ -688,10 +696,22 @@ impl CodeWindow {
         let previous_start = text[..previous_end]
             .rfind('\n')
             .map_or(0, |index| index + 1);
-        if !crate::indent::closes_block(&text[previous_start..previous_end]) {
+        let previous_line = &text[previous_start..previous_end];
+        if crate::indent::closes_block(previous_line) {
+            window.dispatch_action(Box::new(OutdentInline), cx);
             return;
         }
-        window.dispatch_action(Box::new(OutdentInline), cx);
+        // 行尾带注释时组件的缩进规则整体不生效（光标被算作「在注释里」），
+        // `If x Then ' 说明` 之后回车不会自动缩进；这里补一次。
+        if !crate::indent::opens_block_ignoring_comment(previous_line) {
+            return;
+        }
+        let previous_indent = previous_line.len() - previous_line.trim_start().len();
+        if indent.len() != previous_indent {
+            // 组件已经缩进过（新行比上一行深），不要再加一级。
+            return;
+        }
+        window.dispatch_action(Box::new(Indent), cx);
     }
 
     /// 编辑框内容变化时把它同步到当前标签；内容真的变了才重绘（用于未保存圆点）。

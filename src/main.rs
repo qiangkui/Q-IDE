@@ -42,6 +42,7 @@ mod outline;
 mod output;
 mod panel_drag;
 mod panels;
+mod panic_log;
 mod search;
 mod secret_store;
 mod settings;
@@ -131,6 +132,9 @@ mod editing_tests;
 mod panels_tests;
 
 #[cfg(test)]
+mod panic_log_tests;
+
+#[cfg(test)]
 mod brackets_tests;
 
 #[cfg(test)]
@@ -154,6 +158,9 @@ mod include_tests;
 use gpui_kit::*;
 
 fn main() {
+    // panic 时先把位置与消息写进 `%APPDATA%\gpui-first\crash.log`，再交给默认钩子。
+    panic_log::install(env!("CARGO_PKG_VERSION"));
+
     // 命令行：`--help` / `--version` 直接输出后退出，其余参数是待打开的文件或文件夹。
     // 文件的“打开方式”指到 first.exe 时，Windows 就是这样把路径传进来的。
     let (startup_paths, startup_background) = match startup::parse(std::env::args().skip(1)) {

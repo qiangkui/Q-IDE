@@ -16,13 +16,20 @@ fn every_command_id_is_unique() {
 fn every_command_label_is_unique() {
     let mut seen = HashSet::new();
     for command in COMMANDS {
-        assert!(seen.insert(command.label), "重复的命令名：{}", command.label);
+        assert!(
+            seen.insert(command.label),
+            "重复的命令名：{}",
+            command.label
+        );
     }
 }
 
 #[test]
 fn an_exact_label_wins() {
-    assert_eq!(best_command("保存").map(|command| command.id), Some("file.save"));
+    assert_eq!(
+        best_command("保存").map(|command| command.id),
+        Some("file.save")
+    );
     assert_eq!(
         best_command("保存全部").map(|command| command.id),
         Some("file.save-all")
@@ -35,7 +42,10 @@ fn an_exact_label_wins() {
 
 #[test]
 fn a_prefix_also_matches() {
-    assert_eq!(best_command("另存").map(|command| command.id), Some("file.save-as"));
+    assert_eq!(
+        best_command("另存").map(|command| command.id),
+        Some("file.save-as")
+    );
     assert_eq!(
         best_command("全屏").map(|command| command.id),
         Some("view.fullscreen")

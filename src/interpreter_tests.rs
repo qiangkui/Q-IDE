@@ -12,34 +12,191 @@ fn output(source: &str) -> Vec<String> {
 }
 
 #[test]
-fn getobject_detects_existing_relative_files_as_paths() {
-    use std::time::{SystemTime, UNIX_EPOCH};
+fn getobject_single_argument_is_always_a_pathname() {
+    // 本机 VB6 实测：单参数 `GetObject` 一律按路径/moniker 处理——
+    // 路径缺失（或不是 OLE 文档）报 432、空路径报 5、类名缺失报 429、
+    // 不像路径的裸名字交给 moniker 解析（语法错误按原 HRESULT 报 -2147221020）。
+    let source = r#"
+On Error Resume Next
+Set unknown = GetObject("C:\QIDE\missing-document.unknown")
+Debug.Print Err.Number
+Err.Clear
+Set unknown = GetObject("")
+Debug.Print Err.Number
+Err.Clear
+Set unknown = GetObject("QIDE.Missing.Document", "QIDE.Missing.Component")
+Debug.Print Err.Number
+Err.Clear
+Set unknown = GetObject("qide-not-a-moniker")
+Debug.Print Err.Number
+"#;
+    assert_eq!(output(source), ["432", "5", "429", "-2147221020"]);
+}
 
-    let temp_dir = std::env::temp_dir().join(format!(
-        "qide-getobject-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir(&temp_dir).unwrap();
-    std::fs::write(temp_dir.join("document.dat"), []).unwrap();
+#[test]
+fn omitted_arguments_bind_as_missing_optional_parameters() {
+    // VB 允许 `F a, , c` 这种「跳过中间可选参数」的写法（本机 VB6 实测）：
+    // 省略的 `Variant` 可选形参（没有默认值）`IsMissing` 为真，带默认值的按默认值绑定。
+    let source = r#"
+Function F(Optional ByVal a As Variant, Optional ByVal b As Variant) As String
+    F = CStr(IsMissing(a)) & "/" & CStr(IsMissing(b))
+End Function
 
-    assert!(crate::interpreter::runtime::is_moniker_path(
-        "document.dat",
-        &temp_dir
-    ));
-    assert!(!crate::interpreter::runtime::is_moniker_path(
-        "QIDE.Missing.Component",
-        &temp_dir
-    ));
-    assert!(crate::interpreter::runtime::is_moniker_path(
-        "document.dat!Item1",
-        &temp_dir
-    ));
+Function H(Optional ByVal a As Variant = 5, Optional ByVal b As Variant) As String
+    H = CStr(IsMissing(a)) & "/" & CStr(IsMissing(b))
+End Function
 
-    std::fs::remove_dir_all(temp_dir).unwrap();
+Function G(Optional ByVal a As Long = 7, Optional ByVal b As Long = 9) As String
+    G = CStr(a) & "/" & CStr(b) & "/" & CStr(IsMissing(a))
+End Function
+
+Sub S(ByVal a As Variant, Optional ByVal b As Variant)
+    Debug.Print "S " & a & " " & CStr(IsMissing(b))
+End Sub
+
+Debug.Print F(1)
+Debug.Print F(, "x")
+Debug.Print F(, )
+Debug.Print H(, "y")
+Debug.Print H(, )
+Debug.Print G(, )
+S 1,
+S 1, 2
+"#;
+    assert_eq!(
+        output(source),
+        [
+            "False/True",
+            "True/False",
+            "True/True",
+            "False/False",
+            "False/True",
+            "7/9/False",
+            "S 1 True",
+            "S 1 False",
+        ]
+    );
+}
+
+#[test]
+fn omitting_a_required_argument_reports_449() {
+    let source = r#"
+Function Two(ByVal a As Long, ByVal b As Long) As Long
+    Two = a + b
+End Function
+
+On Error Resume Next
+Debug.Print Two(1, )
+Debug.Print Err.Number
+Err.Clear
+Debug.Print Two(, 2)
+Debug.Print Err.Number
+"#;
+    assert_eq!(output(source), ["449", "449"]);
+}
+
+#[test]
+fn a_member_read_is_allowed_as_a_statement() {
+    // QIDE 比 VB6 宽：`h.Self2().Value` 单独成句会求值后丢掉结果。
+    // （本机 VB6 `/make` 实测这种写法编译不过，见 ROADMAP「已知遗留」。）
+    let source = r#"
+Class Holder
+    Public Value As Long
+    Public Calls As Long
+    Public Function Self2() As Holder
+        Calls = Calls + 1
+        Set Self2 = Me
+    End Function
+End Class
+
+Dim h As New Holder
+h.Value = 5
+h.Self2().Value
+Debug.Print h.Calls
+"#;
+    // 打印 1 说明整条表达式确实求值了（不是被当成无操作跳过）。
+    assert_eq!(output(source), ["1"]);
+}
+
+#[test]
+fn chained_assignment_writes_through_methods_and_property_gets() {
+    // 本机 VB6 实测（类模块 + Form_Load）：方法调用返回对象后，`= 值`/`Set = 对象`
+    // 落在**返回的对象**上；`obj.Self3.Value` 不带括号也能穿过多级属性读取。
+    let source = r#"
+Class Holder
+    Public Value As Long
+    Public Other As Holder
+    Public Inner As Holder
+
+    Public Function Self2() As Holder
+        Set Self2 = Me
+    End Function
+
+    Public Function Method1(ByVal n As Long) As Holder
+        Method1 = Me
+    End Function
+
+    Public Property Get Self3() As Holder
+        Set Self3 = Me
+    End Property
+
+    Private Sub Class_Initialize()
+        Set Inner = Me
+    End Sub
+End Class
+
+Dim h As New Holder
+Dim e As New Holder
+h.Self2().Value = 7
+Debug.Print h.Value
+h.Self3.Value = 9
+Debug.Print h.Value
+h.Self2().Inner.Value = 11
+Debug.Print h.Value
+Set h.Self2().Other = e
+Debug.Print h.Other Is e
+h.Method1(3).Value = 13
+Debug.Print h.Value
+"#;
+    assert_eq!(output(source), ["7", "9", "11", "True", "13"]);
+}
+
+#[test]
+fn chained_assignment_covers_object_fields_and_parameterized_properties() {
+    // 本机 VB6 实测：对象字段链（`h.Inner.Value`）、带参数的 `Property Get` 链
+    // （`h.PropChain(2).Value`）、无参属性带空括号（`h.Self3().Value`）都按同一规则写入。
+    let source = r#"
+Class Holder
+    Public Value As Long
+    Public Other As Holder
+    Public Inner As Holder
+
+    Public Property Get Self3() As Holder
+        Set Self3 = Me
+    End Property
+
+    Public Property Get PropChain(ByVal n As Long) As Holder
+        Set PropChain = Me
+    End Property
+
+    Private Sub Class_Initialize()
+        Set Inner = Me
+        Set Other = Me
+    End Sub
+End Class
+
+Dim h As New Holder
+Dim e As New Holder
+h.Inner.Value = 21
+Debug.Print h.Value
+h.Self3().Value = 27
+Debug.Print h.Value
+h.PropChain(2).Value = 25
+Debug.Print h.Value
+Set h.Inner.Other = e
+Debug.Print h.Other Is e
+"#;
+    assert_eq!(output(source), ["21", "27", "25", "True"]);
 }
 
 #[test]
@@ -200,6 +357,60 @@ End With
 Debug.Print counter.Value
 "#;
     assert_eq!(output(source), ["17"]);
+}
+
+#[test]
+fn with_assigns_through_property_let_and_chained_members() {
+    // 本机 VB6 实测：`With` 里 `.Value = 10` 走 `Property Let`、`Set .Child = e` 走对象赋值，
+    // `.Inner.Value = 31` 与 `.Kiddie(2).Value = 33` 都先读/调用中间层再在返回对象上赋值。
+    let source = r#"
+Class Holder
+    Public Value As Long
+    Public Child As Holder
+    Public Inner As Holder
+
+    Public Property Get Kiddie(ByVal n As Long) As Holder
+        Set Kiddie = Me
+    End Property
+
+    Private Sub Class_Initialize()
+        Set Inner = Me
+    End Sub
+End Class
+
+Class Counter
+    Private m As Long
+
+    Public Property Get Value() As Long
+        Value = m
+    End Property
+
+    Public Property Let Value(ByVal v As Long)
+        m = v
+    End Property
+End Class
+
+Dim c As New Counter
+Dim h As New Holder
+Dim e As New Holder
+With c
+    .Value = 10
+End With
+Debug.Print c.Value
+With h
+    Set .Child = e
+End With
+Debug.Print h.Child Is e
+With h
+    .Inner.Value = 31
+End With
+Debug.Print h.Value
+With h
+    .Kiddie(2).Value = 33
+End With
+Debug.Print h.Value
+"#;
+    assert_eq!(output(source), ["10", "True", "31", "33"]);
 }
 
 #[test]
@@ -879,7 +1090,8 @@ On Error Resume Next
 Set unknown = GetObject("")
 Debug.Print Err.Number
 "#;
-    assert_eq!(output(source), ["429", "429", "429", "450"]);
+    // `GetObject("")` 在 VB6 里是 5（路径为空，本机实测）。
+    assert_eq!(output(source), ["429", "429", "429", "5"]);
 }
 
 #[test]
@@ -893,7 +1105,8 @@ On Error Resume Next
 Set unknown = GetObject("C:\QIDE\missing-document.unknown")
 Debug.Print Err.Number
 "#;
-    assert_eq!(output(source), ["429", "429"]);
+    // 类名缺失 429；路径缺失 432（VB6 实测，本机逐条对比过）。
+    assert_eq!(output(source), ["429", "432"]);
 }
 
 #[test]
@@ -1021,6 +1234,41 @@ Debug.Print TypeName(fresh)
 
 #[test]
 #[ignore = "requires the Windows Script Host COM server"]
+fn for_each_over_object_without_new_enum_matches_vb6() {
+    // 本机 VB6 实测（`On Error Resume Next` 下）：`WScript.Shell` 没有 `_NewEnum`，
+    // 但 `For Each` 的循环体照样跑**一次**——此时循环变量是 `Empty`（`IsObject` 为假、`IsEmpty` 为真）、
+    // `Err.Number` 已经是 438，随后 `Next` 报 92（「For 循环未初始化」）；循环体里写了 `Exit For` 也一样报 92。
+    let source = r#"
+Dim sh As Object, x As Variant, n As Long
+Set sh = CreateObject("WScript.Shell")
+On Error Resume Next
+Err.Clear
+For Each x In sh
+    n = n + 1
+    Debug.Print n
+    Debug.Print TypeName(x)
+    Debug.Print IsObject(x)
+    Debug.Print IsEmpty(x)
+    Debug.Print Err.Number
+Next x
+Debug.Print n
+Debug.Print Err.Number
+Err.Clear
+For Each x In sh
+    n = n + 1
+    Exit For
+Next x
+Debug.Print n - 1
+Debug.Print Err.Number
+"#;
+    assert_eq!(
+        output(source),
+        ["1", "Empty", "False", "True", "438", "1", "92", "1", "92"]
+    );
+}
+
+#[test]
+#[ignore = "requires the Windows Script Host COM server"]
 fn com_arrays_keep_their_element_type_and_dimensions() {
     // 本机 VB6 实测：数组经 COM 往返后元素类型与各维边界都不变
     // （`Long()` 的 `VarType` 是 8195、`String()` 8200、`Byte()` 8209、`Boolean()` 8203，`Variant(1 To 2, 0 To 2)` 是 8204）。
@@ -1089,6 +1337,27 @@ Debug.Print TypeName(recordset.Fields("id"))
 recordset.Close
 "#;
     assert_eq!(output(source), ["01 1 alpha", "Field"]);
+}
+
+#[test]
+#[ignore = "requires Microsoft ADODB (msado15.dll)"]
+fn with_block_writes_through_com_chained_members() {
+    // 本机 VB6 实测（`python tools/vb6_probe.py --script`）同一段脚本输出 `id=5`。
+    let source = r#"
+Dim recordset As Object
+Set recordset = CreateObject("ADODB.Recordset")
+recordset.Fields.Append "id", 3
+recordset.Open
+recordset.AddNew
+With recordset
+    .Fields("id").Value = 5
+    .Update
+End With
+recordset.MoveFirst
+Debug.Print "id=" & recordset.Fields("id").Value
+recordset.Close
+"#;
+    assert_eq!(output(source), ["id=5"]);
 }
 
 #[test]
@@ -1203,6 +1472,61 @@ Debug.Print dictionary
 Debug.Print Err.Number
 "#;
     assert_eq!(output(source), ["450", "450", "450", "450"]);
+}
+
+#[test]
+#[ignore = "requires the Windows Script Host COM server"]
+fn for_each_over_a_com_collection_uses_a_live_enumerator() {
+    // `For Each` 走 `_NewEnum` 的活枚举器（VB6 同样如此），不是进循环前取一份快照：
+    // 循环体里往集合里加的元素，服务器自己的枚举器看得见，所以这里会多打印一个 `c`。
+    let source = r#"
+Dim dictionary As Object
+Set dictionary = CreateObject("Scripting.Dictionary")
+dictionary.Add "a", 1
+dictionary.Add "b", 2
+Dim key As Variant
+For Each key In dictionary
+    Debug.Print "got " & key
+    If key = "a" Then dictionary.Add "c", 3
+Next
+Debug.Print dictionary.Count
+"#;
+    assert_eq!(output(source), ["got a", "got b", "got c", "3"]);
+}
+
+#[test]
+#[ignore = "requires the Windows Script Host COM server"]
+fn com_error_numbers_match_vb6() {
+    // 本机 VB6 实测（`tools/vb6_probe.py --script`）：系统包装码**原样**当 `Long` 报（含负号），
+    // `E_INVALIDARG` 报 5，服务器自己的 `0x800Axxxx` 取低 16 位。
+    let source = r#"
+Dim sh As Object
+Dim fso As Object
+Set sh = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+On Error Resume Next
+sh.Run "nonexistent-xyz.exe"
+Debug.Print Err.Number
+Err.Clear
+sh.Run ""
+Debug.Print Err.Number
+Err.Clear
+sh.Exec "C:\Windows"
+Debug.Print Err.Number
+Err.Clear
+sh.Run "\\nonexistent-host-qide\share\a.exe"
+Debug.Print Err.Number
+Err.Clear
+fso.GetFile "C:\nonexistent-xyz\a.txt"
+Debug.Print Err.Number
+Err.Clear
+fso.OpenTextFile "C:\nonexistent-xyz\a.txt"
+Debug.Print Err.Number
+"#;
+    assert_eq!(
+        output(source),
+        ["-2147024894", "5", "-2147024891", "-2147024843", "53", "76"]
+    );
 }
 
 #[test]
@@ -1395,6 +1719,8 @@ fn member_names_accept_keywords_and_multi_level_paths() {
         "Sub Main()\n    rs.Fields(\"id\").Value = 1\nEnd Sub",
         "Sub Main()\n    Debug.Print f.Type\nEnd Sub",
         "Sub Main()\n    With f\n        .Type = 1\n    End With\nEnd Sub",
+        "Sub Main()\n    With rs\n        .Fields(\"id\").Value = 1\n    End With\nEnd Sub",
+        "Sub Main()\n    With f\n        Set .Child = obj\n    End With\nEnd Sub",
     ] {
         assert!(
             crate::interpreter::parse(source).is_ok(),

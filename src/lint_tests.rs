@@ -4,7 +4,11 @@ use crate::lint::analyze;
 
 #[test]
 fn valid_program_has_no_issue() {
-    assert!(analyze("Dim x As Long\nx = 1\nMsgBox x\n").issues.is_empty());
+    assert!(
+        analyze("Dim x As Long\nx = 1\nMsgBox x\n")
+            .issues
+            .is_empty()
+    );
 }
 
 #[test]

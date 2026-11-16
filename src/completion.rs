@@ -6,8 +6,8 @@
 
 use anyhow::Result;
 use std::cell::RefCell;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -186,11 +186,7 @@ pub fn suggestions_with_symbols(query: &str, symbols: &[SymbolItem]) -> Vec<Comp
     for name in DATA_TYPES {
         let key = name.to_lowercase();
         if key.starts_with(&query) && !declared.contains(&key) {
-            items.push(item(
-                name,
-                CompletionItemKind::TYPE_PARAMETER,
-                "数据类型",
-            ));
+            items.push(item(name, CompletionItemKind::TYPE_PARAMETER, "数据类型"));
         }
     }
 
@@ -291,7 +287,9 @@ fn find_base_kind(source: &str, base: &str) -> Option<BaseKind> {
         while let Some((word, rest)) = split_word(statement) {
             if matches_ignore_ascii_case(
                 word,
-                &["dim", "static", "const", "public", "private", "friend", "global"],
+                &[
+                    "dim", "static", "const", "public", "private", "friend", "global",
+                ],
             ) {
                 declared = true;
                 statement = rest.trim_start();
@@ -387,7 +385,8 @@ fn type_fields(source: &str, type_name: &str) -> Option<Vec<SymbolItem>> {
             }
             continue;
         }
-        if strip_word(line, "end").is_some_and(|rest| matches_ignore_ascii_case(rest.trim(), &["type"]))
+        if strip_word(line, "end")
+            .is_some_and(|rest| matches_ignore_ascii_case(rest.trim(), &["type"]))
         {
             break;
         }
@@ -446,7 +445,8 @@ fn class_members(source: &str, class_name: &str) -> Option<Vec<SymbolItem>> {
             }
         }
 
-        if let Some(rest) = strip_word(statement, "sub").or_else(|| strip_word(statement, "function"))
+        if let Some(rest) =
+            strip_word(statement, "sub").or_else(|| strip_word(statement, "function"))
         {
             if let Some(name) = first_identifier(rest) {
                 items.push(method_item(name, "方法"));

@@ -10,7 +10,9 @@
 
 #![cfg(windows)]
 
-use crate::interpreter::dialog::platform::{Template, build_input_template, build_message_template};
+use crate::interpreter::dialog::platform::{
+    Template, build_input_template, build_message_template,
+};
 
 /// 把 4 字节承载的模板还原成 16 位单位，方便查找文字。
 fn units(template: &Template) -> Vec<u16> {
@@ -28,7 +30,9 @@ fn units(template: &Template) -> Vec<u16> {
 
 fn contains_text(template: &Template, text: &str) -> bool {
     let wanted: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    units(template).windows(wanted.len()).any(|window| window == wanted)
+    units(template)
+        .windows(wanted.len())
+        .any(|window| window == wanted)
 }
 
 #[test]
@@ -61,10 +65,7 @@ fn every_item_starts_on_a_dword_boundary() {
         assert_eq!(offset % 4, 0, "控件头部要按 4 字节对齐：{offset}");
     }
     assert!(
-        template
-            .items
-            .windows(2)
-            .all(|pair| pair[0] < pair[1]),
+        template.items.windows(2).all(|pair| pair[0] < pair[1]),
         "控件偏移应当递增"
     );
 }
@@ -143,7 +144,9 @@ mod win {
 fn dialog_is_visible_and_returns_the_typed_text() {
     use std::time::Duration;
 
-    let _guard = DIALOG_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _guard = DIALOG_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let closer = std::thread::spawn(|| {
         std::thread::sleep(Duration::from_millis(500));
         let hwnd = win::find_dialog("自检标题");
@@ -154,7 +157,8 @@ fn dialog_is_visible_and_returns_the_typed_text() {
     });
 
     let interrupt = std::sync::atomic::AtomicBool::new(false);
-    let result = crate::interpreter::dialog::input_box("请输入名称", "自检标题", "默认", &interrupt);
+    let result =
+        crate::interpreter::dialog::input_box("请输入名称", "自检标题", "默认", &interrupt);
     closer.join().expect("关闭线程不应 panic");
     assert_eq!(result.as_deref(), Ok("默认"));
 }
@@ -167,7 +171,9 @@ fn dialog_closes_when_the_script_is_stopped() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    let _guard = DIALOG_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _guard = DIALOG_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let interrupt = Arc::new(AtomicBool::new(false));
     let stopper = {
         let interrupt = interrupt.clone();
@@ -195,7 +201,9 @@ fn message_box_returns_the_clicked_button() {
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
-    let _guard = DIALOG_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _guard = DIALOG_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let closer = std::thread::spawn(|| {
         std::thread::sleep(Duration::from_millis(500));
         let hwnd = win::find_dialog("自检询问");
@@ -217,7 +225,9 @@ fn close_dialogs_closes_a_waiting_message_box() {
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
-    let _guard = DIALOG_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _guard = DIALOG_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let interrupt = std::sync::Arc::new(AtomicBool::new(false));
     let message = std::thread::spawn(move || {
         crate::interpreter::dialog::message_box("内容", "自检消息", 0, &interrupt)
@@ -247,13 +257,13 @@ fn script_message_box_shows_and_stop_ends_the_script() {
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
-    let _guard = DIALOG_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _guard = DIALOG_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let interrupt = Arc::new(AtomicBool::new(false));
     let script = {
         let interrupt = interrupt.clone();
-        std::thread::spawn(move || {
-            crate::interpreter::run("MsgBox \"你好\"", |_| {}, &interrupt)
-        })
+        std::thread::spawn(move || crate::interpreter::run("MsgBox \"你好\"", |_| {}, &interrupt))
     };
 
     let mut found = false;

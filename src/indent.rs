@@ -44,6 +44,36 @@ pub fn closes_block(line: &str) -> bool {
     decrease_regex().is_match(line.trim_end())
 }
 
+/// 去掉行尾注释，只留代码部分（`"` 里的 `'` 不算注释，`""` 是转义）。
+///
+/// 编辑器只在「代码」上下文里套缩进规则，光标停在注释里时整条规则都不生效，
+/// 所以「行尾带注释的 `If ... Then`」要自己再判一次（见 [`opens_block_ignoring_comment`]）。
+pub fn strip_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    let mut in_string = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                if in_string && index + 1 < bytes.len() && bytes[index + 1] == b'"' {
+                    index += 2;
+                    continue;
+                }
+                in_string = !in_string;
+                index += 1;
+            }
+            b'\'' if !in_string => return &line[..index],
+            _ => index += 1,
+        }
+    }
+    line
+}
+
+/// 行尾带注释时，按注释之前的代码判断是否开块。
+pub fn opens_block_ignoring_comment(line: &str) -> bool {
+    increase_regex().is_match(strip_comment(line).trim_end())
+}
+
 /// 编辑器要用的语言配置：块级缩进规则 + 默认的括号配对。
 pub fn language_config() -> LanguageConfig {
     LanguageConfig::default().indentation_rules(IndentationRules::new(

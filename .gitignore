@@ -1,1 +1,4 @@
 /target
+# Python 工具的字节码缓存（`tools/` 下的脚本会在本目录生成 __pycache__）
+__pycache__/
+*.pyc

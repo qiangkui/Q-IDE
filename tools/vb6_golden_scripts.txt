@@ -1031,3 +1031,119 @@ v = IsNull(Null)
 Debug.Print v
 v = IsNumeric(Null)
 Debug.Print v
+
+=== omitted_arguments
+Dim m1 As String, m2 As String, m3 As String
+m1 = QideMissing(1, "y")
+m2 = QideMissing(, "x")
+m3 = QideMiddle(1, , 3)
+Debug.Print m1
+Debug.Print m2
+Debug.Print m3
+
+=== nothing_semantics
+Dim o As Object, v As Variant, e As Variant
+Debug.Print VarType(o), TypeName(o), IsObject(o), IsEmpty(o), IsNull(o)
+Debug.Print o Is Nothing
+Set v = Nothing
+Debug.Print VarType(v), TypeName(v), IsObject(v), IsEmpty(v), IsNull(v)
+Debug.Print v Is Nothing
+Debug.Print ObjPtr(o)
+On Error Resume Next
+Err.Clear
+Debug.Print o.Foo
+Debug.Print Err.Number
+Err.Clear
+If Nothing Then
+End If
+Debug.Print Err.Number
+Err.Clear
+Debug.Print e Is Nothing
+Debug.Print Err.Number
+
+=== file_statements
+Dim h As Integer, s As String
+On Error Resume Next
+Kill "golden_a.txt"
+Kill "golden_b.txt"
+Kill "golden_c.txt"
+Err.Clear
+h = FreeFile
+Open "golden_a.txt" For Output As #h
+Print #h, "one"
+Print #h, "two"
+Close #h
+Debug.Print FileLen("golden_a.txt")
+Debug.Print GetAttr("golden_a.txt") And (vbReadOnly Or vbHidden Or vbSystem Or vbArchive)
+h = FreeFile
+Open "golden_a.txt" For Input As #h
+Debug.Print EOF(h)
+Line Input #h, s
+Debug.Print s
+Debug.Print EOF(h)
+Line Input #h, s
+Debug.Print s
+Debug.Print EOF(h)
+Close #h
+FileCopy "golden_a.txt", "golden_b.txt"
+Debug.Print FileLen("golden_b.txt")
+Debug.Print Dir("golden_b.txt")
+Name "golden_b.txt" As "golden_c.txt"
+Debug.Print Dir("golden_c.txt")
+Debug.Print IsDate(FileDateTime("golden_a.txt"))
+Debug.Print Abs(DateDiff("s", FileDateTime("golden_a.txt"), Now)) < 120
+Kill "golden_a.txt"
+Kill "golden_c.txt"
+Debug.Print Len(Dir("golden_a.txt"))
+Debug.Print Err.Number
+
+=== file_attr_input
+Dim h As Integer, s As String
+On Error Resume Next
+Kill "ga.txt"
+Kill "ga.dat"
+Err.Clear
+h = FreeFile
+Open "ga.txt" For Output As #h
+Print #h, "abcdef"
+Close #h
+h = FreeFile
+Open "ga.txt" For Append As #h
+Debug.Print FileAttr(h, 1)
+Close #h
+h = FreeFile
+Open "ga.txt" For Input As #h
+Debug.Print FileAttr(h, 1)
+Debug.Print "[" & Input(3, #h) & "]"
+Debug.Print "[" & Input(1, #h) & "]"
+Err.Clear
+s = Input(100, #h)
+Debug.Print Len(s)
+Debug.Print Err.Number
+Close #h
+h = FreeFile
+Open "ga.dat" For Binary As #h
+Debug.Print FileAttr(h, 1)
+Err.Clear
+s = Input(1, #h)
+Debug.Print Len(s)
+Debug.Print Err.Number
+Close #h
+h = FreeFile
+Open "ga.dat" For Random As #h
+Debug.Print FileAttr(h, 1)
+Close #h
+Err.Clear
+Debug.Print FileAttr(99, 1)
+Debug.Print Err.Number
+Err.Clear
+Debug.Print FileAttr(h, 2)
+Debug.Print Err.Number
+Err.Clear
+h = FreeFile
+Open "ga.dat" For Output As #h
+s = Input(1, #h)
+Debug.Print Err.Number
+Close #h
+Kill "ga.txt"
+Kill "ga.dat"

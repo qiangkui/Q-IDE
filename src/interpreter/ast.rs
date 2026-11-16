@@ -257,6 +257,11 @@ pub enum Expr {
     WithMember {
         path: Vec<String>,
     },
+    /// 省略的实参：`F a, , c` / `F(a, , c)` 里那个空位。
+    ///
+    /// 只有可选形参才允许（运行时按「调用时省略」绑定，`IsMissing` 为真）；
+    /// 内置函数与 COM 调用把它当 `Empty`。
+    OmittedArg,
     /// `name:=value`：COM Automation 调用的命名实参。
     NamedArg {
         name: String,
@@ -402,10 +407,16 @@ pub enum Stmt {
         set_op: bool,
         line: usize,
     },
-    /// `With` 块内的 `.X = 1`。
+    /// `With` 块内的 `.X = 1` / `.X(1) = 5` / `.X(1).Y = 5`。
     AssignWithMember {
         path: Vec<String>,
+        /// `.X(1)` 的实参；空表示普通成员赋值。
+        indices: Vec<Expr>,
+        /// `.X(1).Y` 里括号之后的成员路径。
+        member_path: Vec<String>,
         value: Expr,
+        /// `Set .X = 对象`：走 `Property Set`。
+        set_op: bool,
         line: usize,
     },
     /// `With` 块内的 `.Method args` / `.Method(args)`。
@@ -425,6 +436,15 @@ pub enum Stmt {
         args: Vec<Expr>,
         /// `Call Foo(ByVal value)`：实参位置对应的显式按值传递标记。
         by_value_args: Vec<bool>,
+        line: usize,
+    },
+    /// 单独成句的表达式，结果丢掉。
+    ///
+    /// VB6 的语句语法只接受**过程调用**（`obj.M(实参).属性` 会先执行调用、再读属性），
+    /// 纯变量/字段读取（`p.X`）在 VB6 里是「缺少子程序、函数或属性」；
+    /// QIDE 这两种都接受（宽一点不影响现有脚本），这里只覆盖「实参后面还跟着成员」的路径。
+    Eval {
+        expr: Expr,
         line: usize,
     },
     /// `Print` / `Debug.Print`。

@@ -332,10 +332,7 @@ impl ThemeDraft {
             match parse_color(text) {
                 Some(color) => colors.push(color),
                 None => {
-                    return Err(format!(
-                        "“{}”要写成 #RRGGBB 或 #RRGGBBAA",
-                        spec.label
-                    ));
+                    return Err(format!("“{}”要写成 #RRGGBB 或 #RRGGBBAA", spec.label));
                 }
             }
         }
@@ -461,7 +458,9 @@ impl ThemeStore {
     pub fn to_text(&self) -> String {
         let mut out = String::new();
         out.push_str("# Q-IDE 自定义主题文件，与可执行文件放在同一目录\n");
-        out.push_str("# 每个主题从 theme=名称 开始；base=dark|light 决定未列出的颜色取自哪套内置配色\n");
+        out.push_str(
+            "# 每个主题从 theme=名称 开始；base=dark|light 决定未列出的颜色取自哪套内置配色\n",
+        );
         out.push_str("# 颜色写成 #RRGGBB 或 #RRGGBBAA（末尾两位是透明度，00 为完全透明）\n");
         out.push_str("# 示例：\n");
         out.push_str("# theme=深蓝\n");
@@ -530,10 +529,7 @@ impl Global for GlobalStore {}
 
 /// 按名字取一份自定义主题（主题库尚未初始化或名字不存在时返回 `None`）。
 pub fn find(cx: &App, name: &str) -> Option<CustomTheme> {
-    ThemeStore::try_entity(cx)?
-        .read(cx)
-        .find(name)
-        .cloned()
+    ThemeStore::try_entity(cx)?.read(cx).find(name).cloned()
 }
 
 /// `dark` / `light` 留给内置主题，自定义主题不能占用。

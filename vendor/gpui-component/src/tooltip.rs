@@ -117,7 +117,8 @@ impl Render for Tooltip {
                 .font_family(cx.theme().font_family.clone())
                 .m_3()
                 .bg(cx.theme().tokens.popover)
-                .text_color(cx.theme().popover_foreground)
+                // 悬浮提示的文字与界面上其它次要文字同一档：小号 + 浅灰。
+                .text_color(cx.theme().muted_foreground)
                 .bg(cx.theme().tokens.popover)
                 .border_1()
                 .border_color(cx.theme().border)
@@ -126,7 +127,7 @@ impl Render for Tooltip {
                 .justify_between()
                 .py_0p5()
                 .px_2()
-                .text_sm()
+                .text_xs()
                 .gap_3()
                 .refine_style(&self.style)
                 .map(|this| {

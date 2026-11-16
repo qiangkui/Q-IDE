@@ -193,7 +193,10 @@ pub fn file_context(path: &str, content: &str) -> String {
     if total > CONTEXT_LIMIT {
         let head: String = content.chars().take(CONTEXT_LIMIT).collect();
         // 尽量停在整行边界上，实在没有换行才按字符截。
-        let cut = head.rfind('\n').map(|index| index + 1).unwrap_or(head.len());
+        let cut = head
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(head.len());
         text.push_str(&head[..cut]);
         let shown = head[..cut].chars().count();
         text.push_str(&format!(
@@ -657,12 +660,9 @@ mod http {
         if !(200..300).contains(&status) {
             // 失败时接口回的是普通 JSON，整段读回来再解析错误说明。
             let body = read_all(handle.raw())?;
-            return Err(super::parse_reply(
-                status,
-                &String::from_utf8_lossy(&body),
-            )
-            .err()
-            .unwrap_or_else(|| format!("请求失败（HTTP {status}）")));
+            return Err(super::parse_reply(status, &String::from_utf8_lossy(&body))
+                .err()
+                .unwrap_or_else(|| format!("请求失败（HTTP {status}）")));
         }
 
         let mut decoder = SseDecoder::new();
@@ -692,9 +692,7 @@ mod http {
             for event in decoder.push(&buffer[..read as usize]) {
                 match event {
                     SseEvent::Delta(text) => on_event(super::StreamItem::Delta(text)),
-                    SseEvent::ToolCalls(calls) => {
-                        on_event(super::StreamItem::ToolCalls(calls))
-                    }
+                    SseEvent::ToolCalls(calls) => on_event(super::StreamItem::ToolCalls(calls)),
                     SseEvent::Done => break 'read,
                     SseEvent::Error(message) => return Err(message),
                 }
@@ -709,9 +707,7 @@ mod http {
             for event in decoder.finish() {
                 match event {
                     SseEvent::Delta(text) => on_event(super::StreamItem::Delta(text)),
-                    SseEvent::ToolCalls(calls) => {
-                        on_event(super::StreamItem::ToolCalls(calls))
-                    }
+                    SseEvent::ToolCalls(calls) => on_event(super::StreamItem::ToolCalls(calls)),
                     SseEvent::Done | SseEvent::Error(_) => break,
                 }
             }

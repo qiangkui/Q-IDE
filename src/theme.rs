@@ -194,7 +194,11 @@ pub fn active(cx: &App) -> ActivePalette {
     }
     let choice = cx
         .try_global::<crate::settings::SettingsStore>()
-        .map(|_| crate::settings::SettingsStore::snapshot(cx).appearance.theme)
+        .map(|_| {
+            crate::settings::SettingsStore::snapshot(cx)
+                .appearance
+                .theme
+        })
         .unwrap_or(ThemeChoice::Dark);
     resolve(&choice, cx)
 }
@@ -277,6 +281,8 @@ pub fn apply(active: ActivePalette, cx: &mut App) {
         // （#252526）几乎一样，选中项分辨不出来，这里换成更亮一档的灰色。
         theme.colors.sidebar_accent = Hsla::from(rgb(palette.nav_hover));
         theme.tokens.sidebar_accent = Hsla::from(rgb(palette.nav_selected)).into();
+        // 组件里的次要文字（悬浮提示、占位符、说明文字）统一成应用自己的浅灰。
+        theme.colors.muted_foreground = Hsla::from(rgb(palette.muted_text));
         // 补全菜单使用 MenuItemElement，其选中/悬停背景取 accent 而非 list_active。
         theme.accent = Hsla::from(rgb(palette.menu_item_active));
         Arc::make_mut(&mut theme.highlight_theme)
@@ -288,6 +294,8 @@ pub fn apply(active: ActivePalette, cx: &mut App) {
 
 /// 按当前设置重新解析并应用主题（自定义主题内容被修改后调用）。
 pub fn apply_from_settings(cx: &mut App) {
-    let choice = crate::settings::SettingsStore::snapshot(cx).appearance.theme;
+    let choice = crate::settings::SettingsStore::snapshot(cx)
+        .appearance
+        .theme;
     apply(resolve(&choice, cx), cx);
 }

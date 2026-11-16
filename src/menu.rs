@@ -29,6 +29,8 @@ pub struct MenuState {
     pub has_files: bool,
     pub has_active: bool,
     pub dark_theme: bool,
+    /// 「出错时中断」当前是否开启（运行菜单据此画勾）。
+    pub break_on_error: bool,
 }
 
 /// 渲染整个菜单栏。
@@ -49,7 +51,7 @@ pub fn render(
         .child(select_menu(cx, palette, handle.clone(), state))
         .child(view_menu(cx, palette, state))
         .child(go_menu(cx, palette, handle.clone()))
-        .child(run_menu(cx, palette, handle.clone()))
+        .child(run_menu(cx, palette, handle.clone(), state))
         .child(help_menu(cx, palette, handle))
         .into_any_element()
 }
@@ -102,14 +104,14 @@ fn menu_row(
         } else {
             palette.menu_text
         }))
-            .child(div().w(px(14.0)).flex_shrink_0().when(checked, |this| {
-                this.child(
-                    Icon::new(IconName::Check)
-                        .xsmall()
-                        .text_color(rgb(palette.menu_text)),
-                )
-            }))
-            .child(div().min_w_0().truncate().child(label));
+        .child(div().w(px(14.0)).flex_shrink_0().when(checked, |this| {
+            this.child(
+                Icon::new(IconName::Check)
+                    .xsmall()
+                    .text_color(rgb(palette.menu_text)),
+            )
+        }))
+        .child(div().min_w_0().truncate().child(label));
 
     if !disabled {
         row = row
@@ -228,7 +230,9 @@ fn file_menu(
         })
     };
     let new_file = app_action(&handle, |this, window, cx| this.new_file(window, cx));
-    let open_files = app_action(&handle, |this, window, cx| this.open_files_dialog(window, cx));
+    let open_files = app_action(&handle, |this, window, cx| {
+        this.open_files_dialog(window, cx)
+    });
     let save_file = app_action(&handle, |this, _, cx| this.save_file(cx));
     let save_file_as = app_action(&handle, |this, window, cx| this.save_file_as(window, cx));
     let save_all = app_action(&handle, |this, _, cx| this.save_all_files(cx));
@@ -248,8 +252,9 @@ fn file_menu(
         .take(RECENT_IN_MENU)
         .map(|path| {
             let opened = path.clone();
-            let action =
-                app_action(&handle, move |this, window, cx| this.open_file(&opened, window, cx));
+            let action = app_action(&handle, move |this, window, cx| {
+                this.open_file(&opened, window, cx)
+            });
             (short_path(path), action)
         })
         .collect();
@@ -436,7 +441,9 @@ fn edit_menu(
         this.toggle_active_comment(window, cx)
     });
     let next_tab = app_action(&handle, |this, window, cx| this.cycle_tab(true, window, cx));
-    let previous_tab = app_action(&handle, |this, window, cx| this.cycle_tab(false, window, cx));
+    let previous_tab = app_action(&handle, |this, window, cx| {
+        this.cycle_tab(false, window, cx)
+    });
     // 缩进走编辑器内置动作（`Tab` / `Shift+Tab` 的默认绑定）。
     let indent = editor_action(&handle, || Box::new(Indent));
     let outdent = editor_action(&handle, || Box::new(Outdent));
@@ -720,23 +727,40 @@ fn view_menu(cx: &App, palette: Palette, state: MenuState) -> impl IntoElement {
 }
 
 /// “运行”菜单：这个 IDE 只运行 VB 脚本，其它语言的文件会提示无法运行。
-fn run_menu(cx: &App, palette: Palette, handle: WeakEntity<CodeWindow>) -> impl IntoElement {
+fn run_menu(
+    cx: &App,
+    palette: Palette,
+    handle: WeakEntity<CodeWindow>,
+    state: MenuState,
+) -> impl IntoElement {
     let run = app_action(&handle, |this, _, cx| this.run_script(cx));
     let stop_script = app_action(&handle, |this, _, cx| this.stop_script(cx));
     let check_syntax = app_action(&handle, |this, _, cx| this.check_syntax(cx));
-    let run_arguments = app_action(&handle, |this, window, cx| this.edit_run_arguments(window, cx));
+    let run_arguments = app_action(&handle, |this, window, cx| {
+        this.edit_run_arguments(window, cx)
+    });
     let debug_run = app_action(&handle, |this, _, cx| this.start_debug(cx));
     let debug_pause = app_action(&handle, |this, _, cx| this.debug_pause(cx));
     let debug_resume = app_action(&handle, |this, _, cx| this.debug_resume(cx));
     let debug_step = app_action(&handle, |this, _, cx| this.debug_step(cx));
+    // 注意：这里不能 `handle.upgrade().read(cx)`——菜单是在 `CodeWindow::render` 里拼的，
+    // 那一刻实体正被更新，读它会 panic（"already being updated"）。状态由 `MenuState` 带进来。
+    let break_on_error = state.break_on_error;
+    let toggle_break_on_error = app_action(&handle, |this, _, cx| this.toggle_break_on_error(cx));
+    let debug_step_over = app_action(&handle, |this, _, cx| this.debug_step_over(cx));
+    let debug_step_out = app_action(&handle, |this, _, cx| this.debug_step_out(cx));
     let toggle_breakpoint = app_action(&handle, |this, _, cx| this.toggle_breakpoint(cx));
-    let set_breakpoint_condition =
-        app_action(&handle, |this, window, cx| {
-            this.set_breakpoint_condition_dialog(window, cx)
-        });
+    let set_breakpoint_condition = app_action(&handle, |this, window, cx| {
+        this.set_breakpoint_condition_dialog(window, cx)
+    });
     let run_to_cursor = app_action(&handle, |this, _, cx| this.run_to_cursor(cx));
     let clear_breakpoints = app_action(&handle, |this, _, cx| this.clear_all_breakpoints(cx));
-    let add_watch = app_action(&handle, |this, window, cx| this.add_watch_dialog(window, cx));
+    let add_watch = app_action(&handle, |this, window, cx| {
+        this.add_watch_dialog(window, cx)
+    });
+    let set_variable = app_action(&handle, |this, window, cx| {
+        this.set_variable_dialog(window, cx)
+    });
     let clear_watches = app_action(&handle, |this, _, cx| this.clear_watches(cx));
 
     menu_popover(cx, palette, "menu-run", "运行(R)", move |state_menu| {
@@ -819,6 +843,42 @@ fn run_menu(cx: &App, palette: Palette, handle: WeakEntity<CodeWindow>) -> impl 
             menu_row(
                 palette,
                 state_menu,
+                "break-on-error-vb-script",
+                "出错时中断",
+                break_on_error,
+                false,
+                Some(toggle_break_on_error.clone()),
+            ),
+            menu_row(
+                palette,
+                state_menu,
+                "debug-step-over-vb-script",
+                "单步跳过（Shift+F10）",
+                false,
+                false,
+                Some(debug_step_over.clone()),
+            ),
+            menu_row(
+                palette,
+                state_menu,
+                "debug-step-out-vb-script",
+                "跳出过程（Ctrl+Shift+F10）",
+                false,
+                false,
+                Some(debug_step_out.clone()),
+            ),
+            menu_row(
+                palette,
+                state_menu,
+                "set-variable-vb-script",
+                "设置变量值…",
+                false,
+                false,
+                Some(set_variable.clone()),
+            ),
+            menu_row(
+                palette,
+                state_menu,
                 "toggle-vb-breakpoint",
                 "切换断点（F9）",
                 false,
@@ -876,11 +936,14 @@ fn run_menu(cx: &App, palette: Palette, handle: WeakEntity<CodeWindow>) -> impl 
 
 /// “转到”菜单：转到定义 / 查找引用 / 转到行 / 转到文件 / 命令面板。
 fn go_menu(cx: &App, palette: Palette, handle: WeakEntity<CodeWindow>) -> impl IntoElement {
-    let goto_definition =
-        app_action(&handle, |this, window, cx| this.go_to_definition(window, cx));
+    let goto_definition = app_action(&handle, |this, window, cx| {
+        this.go_to_definition(window, cx)
+    });
     let find_references = app_action(&handle, |this, _, cx| this.find_references(cx));
     let goto_line = app_action(&handle, |this, window, cx| this.goto_dialog(window, cx));
-    let goto_file = app_action(&handle, |this, window, cx| this.goto_file_dialog(window, cx));
+    let goto_file = app_action(&handle, |this, window, cx| {
+        this.goto_file_dialog(window, cx)
+    });
     let show_commands = app_action(&handle, |this, window, cx| {
         this.command_palette_dialog(window, cx)
     });

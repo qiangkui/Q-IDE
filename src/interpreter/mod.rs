@@ -19,8 +19,8 @@
 //! ```
 //!
 //! COM Automation 支持 `CreateObject`、活动对象/新对象/moniker `GetObject`、属性与
-//! 位置/命名参数调用、标量/字符串 ByRef 和一维 Variant 数组封送；
-//! 多维/强类型数组、记录封送与 COM 事件尚不支持。
+//! 位置/命名参数调用、链式成员、标量/字符串 `ByRef`、任意维数与强类型 `SAFEARRAY` 封送、
+//! `For Each` 活枚举器与 `WithEvents` 事件；仍不支持 UDT 记录封送（VB6 自己的标准模块也做不到）。
 //! Win32 调用支持 `ByRef` / `ByVal` 结构体（字段为整型/浮点/`String * n`/标量或 UDT 数组；
 //! `ByVal` 按 x64 ABI：≤ 8 字节进寄存器，更大的传临时副本指针）、最多 64 个整数与
 //! `Single`/`Double`/`Date` 混合的标量参数，返回值可为整数或 `Single`/`Double`/`Date`；
@@ -111,7 +111,8 @@
 //! `FileDateTime`、`CurDir`/`ChDir`、`MkDir`/`RmDir`、`FileCopy`、`Name … As`（改名）、
 //! `Kill`（支持通配符），这些失败时按 VB 填 `Err.Number`（53/76/70/58/75）。
 //! 另有 `Environ`、`IsEmpty`/`IsNull`/`IsObject`/`IsDate`、`StrReverse`/`StrComp`/`Filter`、
-//! `AscW`/`ChrW`、`Randomize`、`DoEvents`（宿主是 GUI 程序，只让出时间片，不派发消息）。
+//! `AscW`/`ChrW`、`Randomize`、`DoEvents`（宿主是 GUI 程序，不派发本进程消息，但会把排队的
+//! COM 事件当场执行完，与 VB6 的消息循环一致）。
 //! `Is` 是对象同一性运算符（`If obj Is Nothing`、`a Is b`，非对象操作数报错误号 424）；
 //! `Option Compare Text` 让字符串的 `=`/`<`/`>`、`Select Case`、`StrComp`/`Filter` 的默认比较
 //! 都忽略大小写（默认 `Binary`，与 VB 一致）。
@@ -124,6 +125,7 @@ pub mod dialog;
 pub mod error;
 pub mod ffi;
 pub mod filelock;
+pub mod finance;
 pub mod hasher;
 pub mod include;
 pub mod lexer;
@@ -2523,7 +2525,8 @@ Close #1
         );
         assert_eq!(output(&source), Vec::<String>::new());
         let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(text, "abcde\nfgh\nabcdefgh\n");
+        // `Width` 强制换行与 `Print #` 的常规换行都是 CRLF（本机 VB6 实测）。
+        assert_eq!(text, "abcde\r\nfgh\r\nabcdefgh\r\n");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2546,7 +2549,7 @@ Debug.Print "e",
         );
         assert_eq!(output(&source), ["a  b", "c             d", "e"]);
         let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(text, "a   b\nx10  y");
+        assert_eq!(text, "a   b\r\nx10  y");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2582,7 +2585,7 @@ Close #1
         );
         assert_eq!(output(&source), Vec::<String>::new());
         let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(text, format!("ab{}c\n", " ".repeat(12)));
+        assert_eq!(text, format!("ab{}c\r\n", " ".repeat(12)));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2964,9 +2967,10 @@ Debug.Print Len(CurDir()) > 0
             copy = copy.display(),
             renamed = renamed.display(),
         );
+        // "hello" + CRLF = 7 字节（`Print #` 的行尾是 CRLF，本机 VB6 实测）。
         assert_eq!(
             output(&source),
-            ["6", "6", "6", "True", "True", "True", "True"]
+            ["7", "7", "7", "True", "True", "True", "True"]
         );
         assert!(!folder.exists());
     }

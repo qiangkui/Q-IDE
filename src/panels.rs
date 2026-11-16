@@ -18,10 +18,12 @@ use gpui_kit::component::input::{
 };
 use gpui_kit::component::tree::TreeState;
 use gpui_kit::component::*;
-use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::prelude::{
+    FluentBuilder as _, InteractiveElement as _, StatefulInteractiveElement as _,
+};
 use gpui_kit::*;
 
-use crate::app::CodeWindow;
+use crate::app::{CodeWindow, ExplorerCancelSelection, ExplorerDeleteSelected, ExplorerSelectAll};
 use crate::editor_pane::{
     self, ContextMenuItem, EditorContextMenu, EditorPaneProps, MenuCallback, OpenContextMenuAction,
     TabAction, TabMenuAction,
@@ -479,12 +481,25 @@ pub fn explorer_menu_entries(is_folder: bool, is_root: bool) -> Vec<(&'static st
     entries
 }
 
+/// 把焦点交给资源管理器面板（进入选择模式或开始框选时调用）。
+///
+/// 只有焦点在面板的 `Explorer` 键上下文里时，`Ctrl+A` / `Delete` / `Esc` 才会走面板的
+/// 动作处理，而不是编辑器的同名快捷键。
+fn focus_panel(panel: &WeakEntity<ExplorerPanel>, window: &mut Window, cx: &mut App) {
+    if let Some(entity) = panel.upgrade() {
+        let focus = entity.read(cx).focus.clone();
+        window.focus(&focus, cx);
+    }
+}
+
 pub struct ExplorerPanel {
     app: WeakEntity<CodeWindow>,
     tree: Entity<TreeState>,
     is_empty: bool,
     /// 多选状态：点条目左侧圆点后进入选择模式。
     selection: explorer::ExplorerSelection,
+    /// 框选（rubber band）：在树的空白处按住左键拖动。
+    band: explorer::BandDrag,
     /// 右键菜单当前指向的条目：菜单打开期间高亮这一行。
     context_path: Option<String>,
     /// 树条目右键菜单（复用编辑器面板的自绘菜单外观）。
@@ -505,6 +520,7 @@ impl ExplorerPanel {
             tree,
             is_empty,
             selection: explorer::ExplorerSelection::default(),
+            band: explorer::BandDrag::default(),
             context_path: None,
             menu: None,
             group: None,
@@ -580,7 +596,110 @@ impl ExplorerPanel {
         cx.notify();
     }
 
+    /// 在树的空白处按下左键：开始框选。
+    fn band_begin(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.band.begin(position);
+        cx.notify();
+    }
+
+    /// 框选时指针移动；左键已经松开（松手事件没送进来）就当作结束。
+    fn band_moved(&mut self, position: Point<Pixels>, pressed: bool, cx: &mut Context<Self>) {
+        if !self.band.is_active() {
+            return;
+        }
+        if !pressed {
+            self.band_end(cx);
+            return;
+        }
+        if self.band.move_to(position) {
+            cx.notify();
+        }
+    }
+
+    /// 框选时指针经过某一行：记下这一行。
+    fn band_hover(&mut self, index: usize, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.band.is_active() {
+            return;
+        }
+        let moved = self.band.move_to(position);
+        let covered = self.band.cover(index);
+        if moved || covered {
+            cx.notify();
+        }
+    }
+
+    /// 框选结束：选中扫过下标之间的全部可见行（跳过根目录与「空文件夹」占位行）。
+    fn band_end(&mut self, cx: &mut Context<Self>) {
+        let Some(indices) = self.band.finish() else {
+            return;
+        };
+        let paths: Vec<String> = match explorer::band_range(&indices) {
+            Some((low, high)) => {
+                let tree = self.tree.read(cx);
+                (low..=high)
+                    .filter_map(|index| tree.entry(index))
+                    .filter(|entry| !entry.is_root())
+                    .map(|entry| entry.item().id.to_string())
+                    .filter(|id| !explorer::is_empty_folder_placeholder(id))
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        if paths.is_empty() {
+            // 空白处拖了一个什么都没框到的框：和 Windows 资源管理器一样清空选择。
+            self.selection.clear();
+            if self.tree.read(cx).selected_index().is_some() {
+                self.tree
+                    .update(cx, |tree, cx| tree.set_selected_index(None, cx));
+            }
+        } else {
+            let was_active = self.selection.is_active();
+            let anchor = paths[0].clone();
+            self.selection.set_paths(paths, &anchor);
+            if !was_active {
+                // 进入选择模式时清掉树自己的单选高亮，避免和本轮多选混在一起。
+                self.tree
+                    .update(cx, |tree, cx| tree.set_selected_index(None, cx));
+            }
+        }
+        cx.notify();
+    }
+
+    /// `Ctrl+A`：选中树里当前可见的全部条目（跳过根项目录与「空文件夹」占位行）。
+    fn select_all(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let paths: Vec<String> = {
+            let tree = self.tree.read(cx);
+            let mut paths = Vec::new();
+            let mut index = 0usize;
+            while let Some(entry) = tree.entry(index) {
+                index += 1;
+                if entry.is_root() {
+                    continue;
+                }
+                let id = entry.item().id.to_string();
+                if explorer::is_empty_folder_placeholder(&id) {
+                    continue;
+                }
+                paths.push(id);
+            }
+            paths
+        };
+        if paths.is_empty() {
+            return;
+        }
+        let was_active = self.selection.is_active();
+        let anchor = paths[0].clone();
+        self.selection.set_paths(paths, &anchor);
+        if !was_active {
+            // 进入选择模式时清掉树自己的单选高亮，避免和本轮多选混在一起。
+            self.tree
+                .update(cx, |tree, cx| tree.set_selected_index(None, cx));
+        }
+        cx.notify();
+    }
+
     fn cancel_selection(&mut self, cx: &mut Context<Self>) {
+        self.band.cancel();
         self.selection.clear();
         cx.notify();
     }
@@ -916,18 +1035,20 @@ impl Render for ExplorerPanel {
         let on_move: explorer::ExplorerMoveAction = {
             let app = self.app.clone();
             let panel = cx.entity().downgrade();
-            Rc::new(move |source, target, _window, cx| {
-                let new_path = Path::new(source)
-                    .file_name()
-                    .map(|name| Path::new(target).join(name).to_string_lossy().into_owned());
-                let _ = app.update(cx, |this, cx| this.move_path(source, target, cx));
-                // 移动失败时源路径还在，选中集合不要跟着改。
-                let moved = !Path::new(source).exists();
-                if moved && let Some(new_path) = new_path {
-                    let _ = panel.update(cx, |panel, cx| {
-                        panel.selection.rewrite(source, &new_path);
-                        cx.notify();
-                    });
+            Rc::new(move |sources, target, _window, cx| {
+                for source in sources {
+                    let new_path = Path::new(source)
+                        .file_name()
+                        .map(|name| Path::new(target).join(name).to_string_lossy().into_owned());
+                    let _ = app.update(cx, |this, cx| this.move_path(source, target, cx));
+                    // 移动失败时源路径还在，选中集合不要跟着改。
+                    let moved = !Path::new(source).exists();
+                    if moved && let Some(new_path) = new_path {
+                        let _ = panel.update(cx, |panel, cx| {
+                            panel.selection.rewrite(source, &new_path);
+                            cx.notify();
+                        });
+                    }
                 }
             })
         };
@@ -940,13 +1061,16 @@ impl Render for ExplorerPanel {
         };
         let on_select: explorer::ExplorerSelectAction = {
             let panel = cx.entity().downgrade();
-            Rc::new(move |path, _window, cx| {
+            Rc::new(move |path, window, cx| {
+                // 焦点留在资源管理器面板里，`Ctrl+A` / `Delete` / `Esc` 才有上下文。
+                focus_panel(&panel, window, cx);
                 let _ = panel.update(cx, |panel, cx| panel.select_path(path, cx));
             })
         };
         let on_modifier_select: explorer::ExplorerModifierSelectAction = {
             let panel = cx.entity().downgrade();
-            Rc::new(move |path, shift, _window, cx| {
+            Rc::new(move |path, shift, window, cx| {
+                focus_panel(&panel, window, cx);
                 let _ = panel.update(cx, |panel, cx| panel.select_path_with_key(path, shift, cx));
             })
         };
@@ -969,6 +1093,32 @@ impl Render for ExplorerPanel {
                 let _ = panel.update(cx, |panel, cx| panel.cancel_selection(cx));
             })
         };
+        let on_band_begin: explorer::BandBeginAction = {
+            let panel = cx.entity().downgrade();
+            Rc::new(move |position, window, cx| {
+                focus_panel(&panel, window, cx);
+                let _ = panel.update(cx, |panel, cx| panel.band_begin(position, cx));
+            })
+        };
+        let on_band_move: explorer::BandMoveAction = {
+            let panel = cx.entity().downgrade();
+            Rc::new(move |position, pressed, cx| {
+                let _ = panel.update(cx, |panel, cx| panel.band_moved(position, pressed, cx));
+            })
+        };
+        let on_band_hover: explorer::BandHoverAction = {
+            let panel = cx.entity().downgrade();
+            Rc::new(move |index, position, cx| {
+                let _ = panel.update(cx, |panel, cx| panel.band_hover(index, position, cx));
+            })
+        };
+        let on_band_end: explorer::BandEndAction = {
+            let panel = cx.entity().downgrade();
+            Rc::new(move |cx| {
+                let _ = panel.update(cx, |panel, cx| panel.band_end(cx));
+            })
+        };
+        let band = self.band.is_active().then(|| self.band.clone());
         let menu = self.menu.clone();
 
         let panel_id = PanelId::from(cx.entity().entity_id());
@@ -984,39 +1134,57 @@ impl Render for ExplorerPanel {
             }) as explorer::DragStartAction)
         };
 
-        let panel_element =
-            div()
-                .size_full()
-                .p(px(ui_theme::PANEL_GAP / 2.0))
-                .child(explorer::render(
-                    &self.tree,
-                    None,
-                    Palette::for_theme(cx),
-                    ExplorerActions {
-                        open_file,
-                        add_folder,
-                        remove_root,
-                        toggle_folder,
-                        close_panel,
-                        new_file,
-                        new_folder,
-                        refresh,
-                        on_context_menu,
-                        on_move,
-                        on_item_drag,
-                        selection: self.selection.clone(),
-                        context_path: self.context_path.clone(),
-                        on_select,
-                        on_modifier_select,
-                        on_row_click,
-                        delete_selected,
-                        cancel_selection,
-                        is_empty: self.is_empty,
-                    },
-                    true,
-                    drag,
-                    drag_start,
-                ));
+        let panel_element = div()
+            .size_full()
+            .p(px(ui_theme::PANEL_GAP / 2.0))
+            // 选择模式的快捷键（`Ctrl+A` / `Delete` / `Esc`）只在焦点停在面板里时生效。
+            .track_focus(&self.focus)
+            .key_context("Explorer")
+            .on_action(
+                cx.listener(|this, _: &ExplorerSelectAll, window, cx| this.select_all(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &ExplorerDeleteSelected, window, cx| {
+                this.delete_selected(window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &ExplorerCancelSelection, _window, cx| {
+                    this.cancel_selection(cx)
+                }),
+            )
+            .child(explorer::render(
+                &self.tree,
+                None,
+                Palette::for_theme(cx),
+                ExplorerActions {
+                    open_file,
+                    add_folder,
+                    remove_root,
+                    toggle_folder,
+                    close_panel,
+                    new_file,
+                    new_folder,
+                    refresh,
+                    on_context_menu,
+                    on_move,
+                    on_item_drag,
+                    selection: self.selection.clone(),
+                    context_path: self.context_path.clone(),
+                    on_select,
+                    on_modifier_select,
+                    on_row_click,
+                    delete_selected,
+                    cancel_selection,
+                    band,
+                    on_band_begin,
+                    on_band_move,
+                    on_band_hover,
+                    on_band_end,
+                    is_empty: self.is_empty,
+                },
+                true,
+                drag,
+                drag_start,
+            ));
 
         // 菜单放在带 overflow_hidden 的面板外面，靠近边缘时不会被裁掉。
         match menu {
@@ -1092,6 +1260,11 @@ impl OutlinePanel {
         // 从「没有监视」变成「有监视」时自动展开这一节，否则用户看不到刚加的行。
         if self.watches.is_empty() && !watches.is_empty() {
             self.collapsed_sections.remove(&OutlineSection::Watch);
+        }
+        // 刚进入暂停时展开「调用栈」，否则那几层藏在折叠的分区里看不见。
+        let was_paused = self.debug.as_ref().is_some_and(|debug| debug.paused);
+        if !was_paused && debug.as_ref().is_some_and(|debug| debug.paused) {
+            self.collapsed_sections.remove(&OutlineSection::CallStack);
         }
         self.model = model;
         self.vb_supported = vb_supported;
@@ -1177,7 +1350,6 @@ impl Focusable for OutlinePanel {
 
 impl Render for OutlinePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let app = self.app.clone();
         let panel = cx.entity();
         let toggle_section: outline::ToggleSectionAction = {
             let panel = panel.clone();
@@ -1204,9 +1376,26 @@ impl Render for OutlinePanel {
             SettingsStore::update(cx, |settings| settings.appearance.set_outline(false));
         }) as outline::ClosePanelAction;
         let go_to_line = {
+            let app = self.app.clone();
             Rc::new(move |line: usize, window: &mut Window, cx: &mut App| {
                 let _ = app.update(cx, |this, cx| this.go_to_line(line, window, cx));
             }) as outline::GoToLineAction
+        };
+        let edit_variable: outline::EditVariableAction = {
+            let app = self.app.clone();
+            Rc::new(
+                move |name: &str, current: &str, window: &mut Window, cx: &mut App| {
+                    let _ = app.update(cx, |this, cx| {
+                        this.edit_variable_dialog(name, current, window, cx)
+                    });
+                },
+            )
+        };
+        let select_frame: outline::SelectFrameAction = {
+            let app = self.app.clone();
+            Rc::new(move |frame: usize, _window: &mut Window, cx: &mut App| {
+                let _ = app.update(cx, |this, cx| this.debug_select_frame(frame, cx));
+            })
         };
 
         let panel_id = PanelId::from(cx.entity().entity_id());
@@ -1258,6 +1447,8 @@ impl Render for OutlinePanel {
                         paused: debug.paused,
                         snapshot: debug.snapshot.as_ref(),
                     }),
+                    edit_variable,
+                    select_frame,
                     watches: &self.watches,
                     breakpoints: &self.breakpoints,
                     filter: &filter,
@@ -1283,7 +1474,13 @@ pub struct SearchPanel {
     replace: Entity<InputState>,
     case_sensitive: bool,
     whole_word: bool,
+    /// 把关键字当正则表达式。
+    regex: bool,
     results: SearchResults,
+    /// 结果里每条命中是否勾选（「替换选中」只动勾上的），与 `results.hits` 一一对应。
+    selected: Vec<bool>,
+    /// 上一次替换的原始内容（可以撤销一次）。
+    undo: Option<search::ReplaceUndo>,
     /// 上次搜索用的条件：输入框文字一变，旧结果就作废。
     searched_query: SearchQuery,
     /// 是否已经搜过：区分「还没搜」与「搜了没有结果」。
@@ -1314,7 +1511,10 @@ impl SearchPanel {
             replace,
             case_sensitive: false,
             whole_word: false,
+            regex: false,
             results: SearchResults::default(),
+            selected: Vec::new(),
+            undo: None,
             searched_query: SearchQuery::default(),
             searched: false,
             scope: None,
@@ -1341,6 +1541,7 @@ impl SearchPanel {
         let mut query = SearchQuery::new(self.query.read(cx).value().to_string());
         query.case_sensitive = self.case_sensitive;
         query.whole_word = self.whole_word;
+        query.regex = self.regex;
         query
     }
 
@@ -1413,6 +1614,8 @@ impl SearchPanel {
                     panel.searching = false;
                     panel.progress = None;
                     panel.results = results;
+                    // 新结果默认全部勾选（「替换选中」不勾也能直接点）。
+                    panel.selected = vec![true; panel.results.hits.len()];
                 }
                 cx.notify();
             });
@@ -1454,6 +1657,7 @@ impl SearchPanel {
         match option {
             search::SearchOption::CaseSensitive => self.case_sensitive = !self.case_sensitive,
             search::SearchOption::WholeWord => self.whole_word = !self.whole_word,
+            search::SearchOption::Regex => self.regex = !self.regex,
         }
         // 已经搜过就按新选项重搜一次，否则用户还得再按回车。
         if self.searched {
@@ -1479,11 +1683,94 @@ impl SearchPanel {
                 paths.push(hit.path.clone());
             }
         }
+        // 替换前留一份原文，替换之后可以一键撤销。
+        self.undo = Some(search::snapshot_files(&paths));
         let outcome = search::replace_in_files(&paths, &query, &replacement);
         if let Some(app) = self.app.upgrade() {
             app.update(cx, |this, cx| this.after_replace(&outcome, window, cx));
         }
         self.run(cx);
+    }
+
+    /// 只替换**勾选**的命中（一行一条命中，勾上就把这一行里的匹配都换掉）。
+    fn replace_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.searched_query.clone();
+        if query.is_empty() || self.results.is_empty() {
+            return;
+        }
+        let hits: Vec<search::SearchHit> = self
+            .results
+            .hits
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.selected.get(*index).copied().unwrap_or(false))
+            .map(|(_, hit)| hit.clone())
+            .collect();
+        if hits.is_empty() {
+            if let Some(app) = self.app.upgrade() {
+                app.update(cx, |this, cx| {
+                    this.output().warning(cx, "没有勾选任何命中");
+                });
+            }
+            return;
+        }
+        let mut paths: Vec<String> = Vec::new();
+        for hit in &hits {
+            if !paths.contains(&hit.path) {
+                paths.push(hit.path.clone());
+            }
+        }
+        self.undo = Some(search::snapshot_files(&paths));
+        let replacement = self.replace.read(cx).value().to_string();
+        let outcome = search::replace_selected(&hits, &query, &replacement);
+        if let Some(app) = self.app.upgrade() {
+            app.update(cx, |this, cx| this.after_replace(&outcome, window, cx));
+        }
+        self.run(cx);
+    }
+
+    /// 撤销上一次替换（把替换前记下的原文逐字节写回）。
+    fn undo_replace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(undo) = self.undo.take() else {
+            return;
+        };
+        let (restored, failures) = search::undo_replace(&undo);
+        let outcome = search::ReplaceOutcome {
+            changed: undo.paths().into_iter().map(|path| (path, 0)).collect(),
+            replacements: 0,
+            skipped: 0,
+            failures,
+        };
+        if let Some(app) = self.app.upgrade() {
+            app.update(cx, |this, cx| {
+                this.after_replace(&outcome, window, cx);
+                if restored > 0 {
+                    this.output()
+                        .success(cx, format!("已撤销刚才的替换（{restored} 个文件）"));
+                }
+            });
+        }
+        self.run(cx);
+    }
+
+    /// 勾选/取消勾选一条命中。
+    fn toggle_hit(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(selected) = self.selected.get_mut(index) {
+            *selected = !*selected;
+            cx.notify();
+        }
+    }
+
+    /// 某个文件分组：全勾着就全不勾，否则全勾（双击文件标题或用标题左侧的勾选框）。
+    fn toggle_file(&mut self, path: &str, cx: &mut Context<Self>) {
+        search::toggle_file_selection(&self.results.hits, &mut self.selected, path);
+        cx.notify();
+    }
+
+    /// 全选 / 全不选。
+    fn set_all_selected(&mut self, selected: bool, cx: &mut Context<Self>) {
+        self.selected = vec![selected; self.results.hits.len()];
+        cx.notify();
     }
 }
 
@@ -1580,6 +1867,36 @@ impl Render for SearchPanel {
             let panel = panel.clone();
             Rc::new(move |window: &mut Window, cx: &mut App| {
                 panel.update(cx, |panel, cx| panel.replace_all(window, cx));
+            })
+        };
+        let replace_selected: search::RunSearchAction = {
+            let panel = panel.clone();
+            Rc::new(move |window: &mut Window, cx: &mut App| {
+                panel.update(cx, |panel, cx| panel.replace_selected(window, cx));
+            })
+        };
+        let undo_replace: search::RunSearchAction = {
+            let panel = panel.clone();
+            Rc::new(move |window: &mut Window, cx: &mut App| {
+                panel.update(cx, |panel, cx| panel.undo_replace(window, cx));
+            })
+        };
+        let toggle_hit: search::ToggleHitAction = {
+            let panel = panel.clone();
+            Rc::new(move |index: usize, _window, cx: &mut App| {
+                panel.update(cx, |panel, cx| panel.toggle_hit(index, cx));
+            })
+        };
+        let toggle_file: search::ToggleFileAction = {
+            let panel = panel.clone();
+            Rc::new(move |path: &str, _window, cx: &mut App| {
+                panel.update(cx, |panel, cx| panel.toggle_file(path, cx));
+            })
+        };
+        let select_all: search::SelectAllAction = {
+            let panel = panel.clone();
+            Rc::new(move |selected: bool, _window, cx: &mut App| {
+                panel.update(cx, |panel, cx| panel.set_all_selected(selected, cx));
             })
         };
         let close_panel = Rc::new(move |_: &mut Window, cx: &mut App| {
@@ -1679,6 +1996,13 @@ impl Render for SearchPanel {
                     toggle_option,
                     run_search,
                     run_replace,
+                    replace_selected,
+                    undo_replace,
+                    toggle_hit,
+                    select_all,
+                    toggle_file,
+                    selected: &self.selected,
+                    undo_available: self.undo.as_ref().is_some_and(|undo| !undo.is_empty()),
                     choose_scope,
                     clear_scope,
                     close_panel,
@@ -1960,11 +2284,13 @@ impl Render for OutputPanel {
                                                 .appearance(false),
                                         ),
                                     )
+                                    // 右侧这些按钮只画图标：含义全靠悬停提示。
                                     .child(
                                         Button::new("output-header-only-errors")
                                             .ghost()
                                             .xsmall()
-                                            .label("只看错误")
+                                            .icon(IconName::TriangleAlert)
+                                            .tooltip("只看错误与警告")
                                             .selected(self.only_errors)
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.only_errors = !this.only_errors;
@@ -1977,10 +2303,10 @@ impl Render for OutputPanel {
                                             .ghost()
                                             .xsmall()
                                             .icon(IconName::Copy)
-                                            .label(if has_selection {
+                                            .tooltip(if has_selection {
                                                 "复制选区"
                                             } else {
-                                                "复制"
+                                                "复制全部输出"
                                             })
                                             .disabled(empty)
                                             .on_click(on_copy),
@@ -1990,7 +2316,7 @@ impl Render for OutputPanel {
                                             .ghost()
                                             .xsmall()
                                             .icon(IconName::Delete)
-                                            .label("清空")
+                                            .tooltip("清空输出")
                                             .on_click(on_clear),
                                     )
                                 })
@@ -2008,7 +2334,7 @@ impl Render for OutputPanel {
                                             .ghost()
                                             .xsmall()
                                             .icon(IconName::Delete)
-                                            .label("清空")
+                                            .tooltip("清空终端")
                                             .on_click(on_clear_terminal),
                                     )
                                 })

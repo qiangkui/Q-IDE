@@ -155,6 +155,13 @@ impl CodeWindow {
                 "暂停位置：第 {} 行，过程 {}",
                 snapshot.line, snapshot.procedure
             ));
+            if snapshot.frame + 1 < snapshot.call_stack.len() {
+                lines.push(format!(
+                    "（界面在看第 {} 层调用栈，变量与行号来自该层；实际停住的是第 {} 层）",
+                    snapshot.frame + 1,
+                    snapshot.call_stack.len()
+                ));
+            }
             if !snapshot.call_stack.is_empty() {
                 lines.push(format!(
                     "调用栈：{}",

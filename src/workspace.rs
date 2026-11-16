@@ -1,4 +1,4 @@
-﻿//! 标签页模型与语言推断：资源管理器直接展示磁盘目录，工程里不再内置示例文件。
+//! 标签页模型与语言推断：资源管理器直接展示磁盘目录，工程里不再内置示例文件。
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -199,4 +199,3 @@ pub fn language_for_path(path: &std::path::Path) -> &'static str {
         _ => "text",
     }
 }
-

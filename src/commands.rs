@@ -192,6 +192,26 @@ pub const COMMANDS: &[Command] = &[
         shortcut: "F10",
     },
     Command {
+        id: "run.break-on-error",
+        label: "出错时中断",
+        shortcut: "",
+    },
+    Command {
+        id: "run.step-over",
+        label: "单步跳过（逐过程）",
+        shortcut: "Shift+F10",
+    },
+    Command {
+        id: "run.step-out",
+        label: "跳出过程",
+        shortcut: "Ctrl+Shift+F10",
+    },
+    Command {
+        id: "run.set-variable",
+        label: "设置变量值…",
+        shortcut: "",
+    },
+    Command {
         id: "run.to-cursor",
         label: "运行到光标处",
         shortcut: "Ctrl+F10",

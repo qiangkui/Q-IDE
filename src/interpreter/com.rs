@@ -22,8 +22,11 @@ impl ComFailure {
 #[cfg(windows)]
 mod windows {
     use super::{ComFailure, Value};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::ffi::c_void;
     use std::ptr::{self, NonNull};
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex};
 
@@ -94,6 +97,14 @@ mod windows {
     const DISP_E_PARAMCOUNT: u32 = 0x8002_000E;
     /// `DISP_E_TYPEMISMATCH`：参数类型不匹配（VB6 报 13）。
     const DISP_E_TYPEMISMATCH: u32 = 0x8002_0005;
+    /// `E_INVALIDARG`：VB6 在 `EXCEPINFO.scode` 里拿到它时报 5（本机实测 `WScript.Shell.Run ""`）。
+    const E_INVALIDARG: u32 = 0x8007_0057;
+    /// `REGDB_E_CLASSNOTAVAILABLE`：`new:` moniker 找不到类（VB6 报 429）。
+    const REGDB_E_CLASSNOTAVAILABLE: u32 = 0x8004_0154;
+    /// `CO_E_CLASSSTRING`：`new:` moniker 里的类名不是合法 ProgID（VB6 也报 429）。
+    const CO_E_CLASSSTRING: u32 = 0x8004_01F3;
+    /// `vbObjectError` 所在的高位：服务器自己抛的 VB 错误（`0x800Axxxx`）取低 16 位就是 VB 错误号。
+    const VB_OBJECT_ERROR: u32 = 0x800A_0000;
     const LOCALE_USER_DEFAULT: u32 = 0x0400;
     const HKEY_CLASSES_ROOT: isize = -2147483648_isize;
     const KEY_READ: u32 = 0x2_0019;
@@ -644,14 +655,28 @@ mod windows {
 
     pub struct ComObject {
         dispatch: NonNull<IDispatch>,
+        /// 成员名（小写）→ dispid。`GetIDsOfNames` 每次都是跨 COM 的调用，
+        /// 属性访问密集的脚本（反复读同一个成员、`For Each` 里读属性）能省掉大部分。
+        dispids: Rc<RefCell<HashMap<String, i32>>>,
+    }
+
+    impl ComObject {
+        fn wrap(dispatch: NonNull<IDispatch>) -> Self {
+            Self {
+                dispatch,
+                dispids: Rc::new(RefCell::new(HashMap::new())),
+            }
+        }
     }
 
     impl Clone for ComObject {
         fn clone(&self) -> Self {
             // SAFETY: `dispatch` 是此包装器持有的有效 IDispatch 引用。
             unsafe { ((*(*self.dispatch.as_ptr()).vtable).add_ref)(self.dispatch.as_ptr()) };
+            // 同一个 `IDispatch` 的 dispid 相同，克隆共享缓存。
             Self {
                 dispatch: self.dispatch,
+                dispids: Rc::clone(&self.dispids),
             }
         }
     }
@@ -678,7 +703,7 @@ mod windows {
     impl ComObject {
         unsafe fn from_owned(dispatch: *mut IDispatch) -> Result<Self, String> {
             NonNull::new(dispatch)
-                .map(|dispatch| Self { dispatch })
+                .map(Self::wrap)
                 .ok_or_else(|| "COM 返回了空对象".to_string())
         }
 
@@ -700,7 +725,7 @@ mod windows {
 
         /// 把事件实参里保存的 `IDispatch` 指针（已 `AddRef`）重新包成对象。
         pub fn from_raw_owned(pointer: usize) -> Option<Self> {
-            NonNull::new(pointer as *mut IDispatch).map(|dispatch| Self { dispatch })
+            NonNull::new(pointer as *mut IDispatch).map(Self::wrap)
         }
 
         /// `TypeName` 用的类型名。
@@ -818,6 +843,10 @@ mod windows {
         }
 
         fn dispid(&self, name: &str) -> Result<i32, String> {
+            let key = name.to_ascii_lowercase();
+            if let Some(dispid) = self.dispids.borrow().get(&key) {
+                return Ok(*dispid);
+            }
             let mut wide: Vec<u16> = name.encode_utf16().collect();
             wide.push(0);
             let mut name_ptr = wide.as_mut_ptr();
@@ -839,6 +868,7 @@ mod windows {
                     result as u32
                 ));
             }
+            self.dispids.borrow_mut().insert(key, dispid);
             Ok(dispid)
         }
 
@@ -1103,7 +1133,7 @@ mod windows {
                 };
                 // `DISP_E_EXCEPTION` 的真正错误号在 `EXCEPINFO.scode` 里（`d.Add` 重复键是 457）。
                 let exception_number = if status as u32 == DISP_E_EXCEPTION {
-                    i64::from(exception.scode & 0xFFFF)
+                    exception_error_number(exception.scode)
                 } else {
                     0
                 };
@@ -1166,6 +1196,10 @@ mod windows {
                 ));
             }
             let dispid = dispids.remove(0);
+            // 命名参数的 dispid 只对这一条调用有用，成员名则值得缓存。
+            self.dispids
+                .borrow_mut()
+                .insert(name.to_ascii_lowercase(), dispid);
             Ok((dispid, dispids))
         }
     }
@@ -1185,6 +1219,8 @@ mod windows {
             let mut variant = Variant::default();
             match value {
                 Value::Empty => {}
+                // `Nothing` 传给 COM 是 `VT_DISPATCH` + 空指针（Automation 里的 null 接口引用）。
+                Value::Nothing => variant.vt = 9,
                 Value::Null => variant.vt = 1,
                 Value::Bool(value) => {
                     variant.vt = 11;
@@ -1235,6 +1271,16 @@ mod windows {
                     };
                 }
                 Value::Array(array) => return Self::from_array(array),
+                // UDT 没有类型库，做不到 `VT_RECORD` 封送；VB6 里把标准模块的 UDT 传给
+                // 晚期绑定调用同样是编译错误（「只允许定义在公共对象模块中的用户定义类型…」，
+                // 本机实测），所以这里报明确的原因，而不是笼统的「不支持」。
+                Value::Record(_) => {
+                    return Err(format!(
+                        "不能把用户定义类型 `{}` 作为 COM 参数：VB6 只允许公共对象模块里的 UDT \
+                         与 Variant 互转，QIDE 的 UDT 没有类型库、无法按 `VT_RECORD` 封送",
+                        value.type_name()
+                    ));
+                }
                 _ => return Err(format!("不支持把 {} 作为 COM 参数", value.type_name())),
             }
             Ok(Self(variant))
@@ -1321,6 +1367,10 @@ mod windows {
                         .map(Value::Int)
                         .map_err(|_| "COM 返回的 UInt64 超出解释器整数范围".into()),
                     9 => {
+                        // 空接口指针就是 VB 里的 `Nothing`（`Is Nothing` 为 True）。
+                        if self.0.data.dispatch_val.is_null() {
+                            return Ok(Value::Nothing);
+                        }
                         let object = ComObject::from_borrowed(self.0.data.dispatch_val)?;
                         Ok(Value::ComObject(object))
                     }
@@ -1747,14 +1797,33 @@ mod windows {
         unsafe { ComObject::from_owned(dispatch as *mut IDispatch) }
     }
 
-    pub fn get_object(pathname: &str, class: Option<&str>) -> Result<ComObject, String> {
-        if let Some(class) = class
-            && std::path::Path::new(pathname).is_file()
-        {
-            return get_object_from_file(pathname, class);
+    /// `GetObject(pathname[, class])`。
+    ///
+    /// VB6 的语义（本机实测）：**单参数时 pathname 一律按路径/moniker 处理**，
+    /// 找不到文件报 432，路径不像路径时交给 moniker 解析（失败按原 HRESULT 报，
+    /// `new:` 找不到类报 429）；`GetObject(, "ProgID")` 才是「取活动对象」，
+    /// `GetObject("", "ProgID")` 是「新建实例」。
+    ///
+    /// `pathname` 是脚本里写的原文（相对路径按脚本目录解析后的结果另由 `resolved` 给出），
+    /// 只用它判断失败号：原文像文件路径就报 432，否则按 moniker 的 HRESULT 报。
+    pub fn get_object(
+        pathname: &str,
+        resolved: &str,
+        class: Option<&str>,
+    ) -> Result<ComObject, ComFailure> {
+        if let Some(class) = class {
+            // 先解析类名（缺类报 429），再加载文件（文件不对报 432）——VB6 实测的顺序。
+            let clsid = class_id(class).map_err(|message| ComFailure::new(message, 429))?;
+            if !std::path::Path::new(resolved).is_file() {
+                return Err(ComFailure::new(
+                    format!("无法从文件 `{pathname}` 获取 `{class}` 对象：文件不存在"),
+                    432,
+                ));
+            }
+            return get_object_from_file(clsid, resolved, pathname, class);
         }
 
-        let mut display_name: Vec<u16> = pathname.encode_utf16().collect();
+        let mut display_name: Vec<u16> = resolved.encode_utf16().collect();
         display_name.push(0);
         let mut dispatch = ptr::null_mut();
         // SAFETY: CoGetObject 解析 OLE moniker display name；输出按 IID_IDISPATCH 请求。
@@ -1767,22 +1836,42 @@ mod windows {
             )
         };
         if status < 0 {
-            let target = class.map_or_else(
-                || format!("`{pathname}`"),
-                |class| format!("`{pathname}`（{class}）"),
-            );
-            return Err(format!(
-                "无法通过 OLE moniker 获取对象 {target}（HRESULT 0x{:08X}）",
-                status as u32
+            return Err(ComFailure::new(
+                format!(
+                    "无法通过 OLE moniker 获取对象 `{pathname}`（HRESULT 0x{:08X}）",
+                    status as u32
+                ),
+                object_failure_number(pathname, status),
             ));
         }
         // SAFETY: CoGetObject 成功时返回由调用方持有的 IDispatch 引用。
         unsafe { ComObject::from_owned(dispatch as *mut IDispatch) }
+            .map_err(|message| ComFailure::new(message, 429))
     }
 
-    fn get_object_from_file(pathname: &str, class: &str) -> Result<ComObject, String> {
-        let clsid = class_id(class)?;
-        let mut filename: Vec<u16> = pathname.encode_utf16().collect();
+    /// 单参数 `GetObject` 失败时的错误号（本机 VB6 实测）。
+    ///
+    /// 路径类（文件存在、含路径分隔符、`file:` moniker）一律 432；
+    /// `new:` 之类 moniker 找不到类报 429；其余按原 HRESULT 当 `Long` 报
+    /// （`clsid:00000000-…` 是 -2147024770，`GetObject("hosts")` 的 moniker 语法错误是 -2147221020）。
+    fn object_failure_number(pathname: &str, status: HResult) -> i64 {
+        let file_like = pathname.starts_with("file:") || pathname.contains(['\\', '/']);
+        if file_like {
+            return 432;
+        }
+        if status as u32 == REGDB_E_CLASSNOTAVAILABLE || status as u32 == CO_E_CLASSSTRING {
+            return 429;
+        }
+        i64::from(status)
+    }
+
+    fn get_object_from_file(
+        clsid: Guid,
+        resolved: &str,
+        pathname: &str,
+        class: &str,
+    ) -> Result<ComObject, ComFailure> {
+        let mut filename: Vec<u16> = resolved.encode_utf16().collect();
         filename.push(0);
         let mut result = MultiQi {
             iid: &IID_IDISPATCH,
@@ -1807,17 +1896,70 @@ mod windows {
                 // SAFETY: A non-null interface returned in MULTI_QI carries an owned reference.
                 unsafe { ((*(*result.interface).vtable).release)(result.interface) };
             }
-            return Err(format!(
-                "无法从文件 `{pathname}` 获取 `{class}` 对象（HRESULT 0x{:08X}）",
-                if status < 0 {
-                    status as u32
-                } else {
-                    result.status as u32
-                }
+            // 文件读不进来（不存在、不是 OLE 文档）在 VB6 里都是 432。
+            return Err(ComFailure::new(
+                format!(
+                    "无法从文件 `{pathname}` 获取 `{class}` 对象（HRESULT 0x{:08X}）",
+                    if status < 0 {
+                        status as u32
+                    } else {
+                        result.status as u32
+                    }
+                ),
+                432,
             ));
         }
         // SAFETY: CoGetInstanceFromFile returned the requested IDispatch reference.
         unsafe { ComObject::from_owned(result.interface as *mut IDispatch) }
+            .map_err(|message| ComFailure::new(message, 432))
+    }
+
+    /// `EXCEPINFO.scode` → VB6 的 `Err.Number`（本机 VB6 实测，不是「一律取低 16 位」）。
+    ///
+    /// - `0x800Axxxx`（`vbObjectError` 系列，服务器自己抛的 VB 错误）取低 16 位：
+    ///   `Scripting.FileSystemObject` 的 `0x800A0035` 报 53、`0x800A004C` 报 76、`0x800A0044` 报 68；
+    /// - `E_INVALIDARG`（`0x80070057`）报 5（`WScript.Shell.Run ""`），`Dictionary` 之类也走这条；
+    /// - 其余系统包装码**原样当 `Long` 报**（含负号）：`Run "no-such.exe"` 的
+    ///   `HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)` 是 -2147024894，`Exec "C:\Windows"` 的
+    ///   `ERROR_ACCESS_DENIED` 是 -2147024891，UNC 路径不存在的 `ERROR_BAD_NETPATH` 是 -2147024843。
+    fn exception_error_number(scode: HResult) -> i64 {
+        let raw = scode as u32;
+        if raw & 0xFFFF_0000 == VB_OBJECT_ERROR {
+            return i64::from(raw & 0xFFFF);
+        }
+        if raw == E_INVALIDARG {
+            return 5;
+        }
+        i64::from(scode)
+    }
+
+    #[cfg(test)]
+    mod number_tests {
+        use super::exception_error_number;
+
+        #[test]
+        fn exception_scode_maps_the_way_vb6_does() {
+            // 服务器自带的 VB 错误号：取低 16 位。
+            assert_eq!(exception_error_number(0x800A_0035u32 as i32), 53);
+            assert_eq!(exception_error_number(0x800A_004Cu32 as i32), 76);
+            assert_eq!(exception_error_number(0x800A_0044u32 as i32), 68);
+            assert_eq!(exception_error_number(0x800A_0BBB_u32 as i32), 3003);
+            // 标准 Automation 参数错误：VB6 报 5。
+            assert_eq!(exception_error_number(0x8007_0057u32 as i32), 5);
+            // 其余系统包装码原样报（负数）。
+            assert_eq!(
+                exception_error_number(0x8007_0002u32 as i32),
+                -2_147_024_894
+            );
+            assert_eq!(
+                exception_error_number(0x8007_0005u32 as i32),
+                -2_147_024_891
+            );
+            assert_eq!(
+                exception_error_number(0x8007_0035u32 as i32),
+                -2_147_024_843
+            );
+        }
     }
 
     /// `For Each` 用的 COM 集合枚举器（`_NewEnum` 拿到的 `IEnumVARIANT`）。
@@ -2582,6 +2724,44 @@ mod windows {
             );
         }
 
+        /// `GetIDsOfNames` 的结果按对象缓存（成员名小写），克隆出来的包装器共享缓存。
+        #[test]
+        fn dispid_lookups_are_cached_per_object() {
+            let Ok(_guard) = initialize() else {
+                return;
+            };
+            let Some(dictionary) = dictionary() else {
+                return;
+            };
+            assert!(
+                dictionary.dispids.borrow().is_empty(),
+                "新对象还没有查过任何成员"
+            );
+            assert_eq!(
+                call1(&dictionary, "Exists", "k")
+                    .ok()
+                    .map(|value| value.to_display()),
+                Some("False".into())
+            );
+            assert!(
+                dictionary.dispids.borrow().contains_key("exists"),
+                "查过的成员名要进缓存"
+            );
+            // 第二次走缓存，结果不变。
+            assert_eq!(
+                call1(&dictionary, "Exists", "k")
+                    .ok()
+                    .map(|value| value.to_display()),
+                Some("False".into())
+            );
+            let cloned = dictionary.clone();
+            assert_eq!(
+                cloned.dispids.borrow().len(),
+                dictionary.dispids.borrow().len(),
+                "克隆共享同一份 dispid 缓存"
+            );
+        }
+
         #[test]
         fn dictionary_failures_carry_vb6_error_numbers() {
             let Ok(_guard) = initialize() else {
@@ -2838,8 +3018,8 @@ mod windows {
         Err("COM 自动化仅支持 Windows".into())
     }
 
-    pub fn get_object(_: &str, _: Option<&str>) -> Result<Object, String> {
-        Err("COM 自动化仅支持 Windows".into())
+    pub fn get_object(_: &str, _: &str, _: Option<&str>) -> Result<Object, ComFailure> {
+        Err(ComFailure::new("COM 自动化仅支持 Windows".into(), 429))
     }
 }
 
@@ -2875,14 +3055,18 @@ pub fn get_active_object(prog_id: &str) -> Result<ComObject, String> {
     }
 }
 
-pub fn get_object(pathname: &str, class: Option<&str>) -> Result<ComObject, String> {
+pub fn get_object(
+    pathname: &str,
+    resolved: &str,
+    class: Option<&str>,
+) -> Result<ComObject, ComFailure> {
     #[cfg(windows)]
     {
-        windows::get_object(pathname, class)
+        windows::get_object(pathname, resolved, class)
     }
     #[cfg(not(windows))]
     {
-        let _ = (pathname, class);
-        Err("COM 自动化仅支持 Windows".into())
+        let _ = (pathname, resolved, class);
+        Err(ComFailure::new("COM 自动化仅支持 Windows".into(), 429))
     }
 }

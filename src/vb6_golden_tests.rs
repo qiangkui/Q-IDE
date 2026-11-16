@@ -9,9 +9,12 @@ use crate::interpreter::{RunOptions, run};
 
 /// QIDE 有意与 VB6 不同、或受实现限制的用例（原因见 `docs/脚本语言.md`）。
 ///
-/// 以 `*` 结尾的条目按前缀匹配（前缀部分用例太多时用）。目前**没有**条目：日期显示、
-/// `DateSerial` 归一化、`DatePart` 都已按 VB6 实测对齐（`DatePart` 的年末两天偏差见
-/// `docs/脚本语言.md` 第 13 条，那种日期不进清单）。
+/// 以 `*` 结尾的条目按前缀匹配（前缀部分用例太多时用）。日期显示、`DateSerial` 归一化、
+/// `DatePart` 都已按 VB6 实测对齐（`DatePart` 的年末两天偏差见 `docs/脚本语言.md` 第 13 条，
+/// 那种日期不进清单）。
+///
+/// 目前是**空的**：三角函数极点/零点附近那几个末位不稳的用例已经挪到
+/// `tools/vb6_golden_approx.txt`（`APPROX_CASES`，按相对误差比对），这里只留机制。
 const KNOWN_DIFFERENCES: &[&str] = &[];
 
 fn evaluate(expression: &str) -> Result<String, String> {
@@ -57,6 +60,45 @@ fn is_known_difference(expression: &str) -> bool {
         })
 }
 
+/// 浮点末位不稳的用例（`tools/vb6_golden_approx.txt`）：按相对误差比对。
+///
+/// VB6 是 x87 长双精度（`IRR`/`Rate` 还是迭代解），这些值逐位比对永远过不了；
+/// 判据是 `|QIDE - VB6| <= 容差 * max(|VB6|, 1)`。
+#[test]
+fn approximate_expressions_match_vb6_golden() {
+    let mut failures = Vec::new();
+    for (expression, expected, tolerance) in crate::vb6_golden_data::APPROX_CASES {
+        let actual = match evaluate(expression) {
+            Ok(actual) => actual,
+            Err(error) => {
+                failures.push(format!(
+                    "{expression}\n  期望 {expected:?}\n  实际报错 {error}"
+                ));
+                continue;
+            }
+        };
+        let (Ok(wanted), Ok(got)) = (expected.parse::<f64>(), actual.parse::<f64>()) else {
+            failures.push(format!(
+                "{expression}\n  期望 {expected:?}\n  实际 {actual:?}（不是数值，无法按容差比对）"
+            ));
+            continue;
+        };
+        let limit = tolerance * wanted.abs().max(1.0);
+        let difference = (got - wanted).abs();
+        if difference.is_nan() || difference > limit {
+            failures.push(format!(
+                "{expression}\n  期望 {wanted}（容差 {tolerance:e}）\n  实际 {got}（差 {difference:.3e}）"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "近似用例与 VB6 差得太多（{} 条）：\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
 /// 比较脚本用例输出前先折叠空白：VB6 的 `Print` 给数值留符号位并补尾随空格，
 /// QIDE 直接输出数值文本（见 `docs/脚本语言.md`），两者的**换行与内容**仍逐行比对。
 fn normalize_print(text: &str) -> String {
@@ -76,6 +118,11 @@ const SCRIPT_KNOWN_DIFFERENCES: &[&str] = &[];
 #[test]
 fn scripts_match_vb6_golden() {
     let mut failures = Vec::new();
+    let script_dir = std::env::temp_dir().join(format!(
+        "qide-golden-scripts-{}-{}",
+        std::process::id(),
+        crate::vb6_golden_data::SCRIPT_CASES.len()
+    ));
     for (name, options, body, expected) in crate::vb6_golden_data::SCRIPT_CASES {
         if SCRIPT_KNOWN_DIFFERENCES.contains(name) {
             continue;
@@ -87,8 +134,13 @@ fn scripts_match_vb6_golden() {
         );
         let mut lines = Vec::new();
         let interrupt = AtomicBool::new(false);
+        // 每段脚本都在自己的临时目录里跑：文件类用例（`Open` / `FileCopy` / `Name`）只碰相对路径，
+        // 免得把测试生成的文件写进仓库根目录。
+        let _ = std::fs::remove_dir_all(&script_dir);
+        std::fs::create_dir_all(&script_dir).expect("创建脚本用例的临时目录");
         let options = crate::interpreter::RunOptions {
             allow_ui: false,
+            script_path: Some(script_dir.join("golden-script.vb")),
             ..RunOptions::default()
         };
         match crate::interpreter::run_with(
@@ -106,6 +158,7 @@ fn scripts_match_vb6_golden() {
             Err(error) => failures.push(format!("[{name}]\n  期望:\n{expected}\n  报错: {error}")),
         }
     }
+    let _ = std::fs::remove_dir_all(&script_dir);
     assert!(
         failures.is_empty(),
         "脚本用例与 VB6 不一致（{} 段）：\n{}",

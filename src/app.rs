@@ -90,6 +90,8 @@ actions!(
         DebugPause,
         DebugResume,
         DebugStep,
+        DebugStepOver,
+        DebugStepOut,
         ToggleBreakpoint,
         RunToCursor,
         ClearBreakpoints,
@@ -111,7 +113,10 @@ actions!(
         PreviousTab,
         ShowCommands,
         ReopenClosedFile,
-        ShowShortcuts
+        ShowShortcuts,
+        ExplorerSelectAll,
+        ExplorerDeleteSelected,
+        ExplorerCancelSelection
     ]
 );
 
@@ -128,6 +133,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("f9", ToggleBreakpoint, None),
         KeyBinding::new("ctrl-f5", DebugRun, None),
         KeyBinding::new("f10", DebugStep, None),
+        KeyBinding::new("shift-f10", DebugStepOver, None),
+        KeyBinding::new("ctrl-shift-f10", DebugStepOut, None),
         KeyBinding::new("f11", DebugResume, None),
         // 运行到光标处 / 清除所有断点。
         KeyBinding::new("ctrl-f10", RunToCursor, None),
@@ -183,6 +190,11 @@ pub fn init(cx: &mut App) {
             ShowCompletions,
             Some("Input && mode == editor"),
         ),
+        // 资源管理器选择模式：只在焦点停在资源管理器面板里时生效，
+        // 不会和编辑器的 `Ctrl+A` / `Delete` 冲突。
+        KeyBinding::new("ctrl-a", ExplorerSelectAll, Some("Explorer")),
+        KeyBinding::new("delete", ExplorerDeleteSelected, Some("Explorer")),
+        KeyBinding::new("escape", ExplorerCancelSelection, Some("Explorer")),
     ]);
 
     install_vb_indent_rules(cx);
@@ -282,6 +294,8 @@ pub struct CodeWindow {
     debug: Option<DebugSession>,
     /// 监视表达式（持久化在布局文件里）。
     watches: Vec<String>,
+    /// 「出错时中断」：调试会话遇到未处理的错误时先停下（不持久化，跟当前窗口走）。
+    break_on_error: bool,
     /// 与 `watches` 一一对应：最近一次求值状态。
     watch_states: Vec<WatchState>,
     /// 上一次应用到编辑器的高亮语言，避免重复刷新语法树。
@@ -356,6 +370,8 @@ struct DebugSession {
     watch_queue: VecDeque<usize>,
     /// 已经发出、等结果的求值请求：`(请求 id, 监视下标)`。
     watch_request: Option<(u64, usize)>,
+    /// 已经发出、等结果的「设置变量值」请求 id。
+    assign_request: Option<u64>,
 }
 
 impl CodeWindow {
@@ -504,6 +520,7 @@ impl CodeWindow {
             script_args: layout.script_args.clone(),
             watches: layout.watches.clone(),
             watch_states: Vec::new(),
+            break_on_error: false,
             breakpoint_marks: Vec::new(),
             paused_line_marks: Vec::new(),
             bracket_marks: Vec::new(),

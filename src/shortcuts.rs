@@ -100,6 +100,21 @@ const TAB_ENTRIES: &[Entry] = &[
     },
 ];
 
+const EXPLORER_ENTRIES: &[Entry] = &[
+    Entry {
+        keys: "Ctrl+A",
+        action: "全选资源管理器条目（进入选择模式）",
+    },
+    Entry {
+        keys: "Delete",
+        action: "删除选中的资源管理器条目",
+    },
+    Entry {
+        keys: "Esc",
+        action: "退出资源管理器选择模式",
+    },
+];
+
 const GOTO_ENTRIES: &[Entry] = &[
     Entry {
         keys: "Ctrl+P",
@@ -164,6 +179,14 @@ const RUN_ENTRIES: &[Entry] = &[
         action: "单步调试",
     },
     Entry {
+        keys: "Shift+F10",
+        action: "单步跳过（逐过程）",
+    },
+    Entry {
+        keys: "Ctrl+Shift+F10",
+        action: "跳出过程",
+    },
+    Entry {
         keys: "Ctrl+F10",
         action: "运行到光标处",
     },
@@ -215,8 +238,16 @@ const MOUSE_ENTRIES: &[Entry] = &[
         action: "进入选择模式：点条目切换选中，标题栏只保留删除与退出选择",
     },
     Entry {
+        keys: "Ctrl+单击 / Shift+单击资源管理器条目",
+        action: "切换选中 / 从上次点过的条目选一段范围",
+    },
+    Entry {
+        keys: "资源管理器空白处拖动",
+        action: "框选：扫过的行一起选中，没框到任何行时清空选择",
+    },
+    Entry {
         keys: "拖动条目到文件夹",
-        action: "移动文件（不能拖进自己或子目录，目标同名会拒绝）",
+        action: "移动文件（选择模式下整批一起搬；不能拖进自己或子目录，目标同名会拒绝）",
     },
     Entry {
         keys: "拖动条目到标签栏",
@@ -229,6 +260,14 @@ const MOUSE_ENTRIES: &[Entry] = &[
     Entry {
         keys: "拖动面板标题栏",
         action: "停靠到左/右侧或底部，布局会被保存",
+    },
+    Entry {
+        keys: "双击代码大纲里的「值：…」",
+        action: "脚本暂停时修改这个变量的值",
+    },
+    Entry {
+        keys: "单击代码大纲「调用栈」里的一层",
+        action: "切到那一层看它的变量（编辑器高亮跟着跳）",
     },
 ];
 
@@ -245,6 +284,10 @@ pub const SECTIONS: &[Section] = &[
     Section {
         title: "标签",
         entries: TAB_ENTRIES,
+    },
+    Section {
+        title: "资源管理器",
+        entries: EXPLORER_ENTRIES,
     },
     Section {
         title: "跳转",
